@@ -1,0 +1,19 @@
+--- before/check_dashboard.py
++++ check_dashboard.py
+@@ -8,6 +8,7 @@
+ import wyckoff_structure
+ import intraday
+ import board_opportunity
++import radar_opportunity
+ 
+ html = Path('dashboard.html').read_text(encoding='utf-8')
+ start = html.index('var DATA = ') + len('var DATA = ')
+@@ -22,6 +23,8 @@
+ rows = snap['stocks']
+ saved = json.loads(config.SNAPSHOT_JSON.read_text(encoding='utf-8'))
+ board_opportunity.validate(snap)
++radar_opportunity.validate(snap)
++assert saved['radar_opportunity']==snap['radar_opportunity']
+ assert saved['board_opportunity_model'] == snap['board_opportunity_model']
+ assert all(b['opportunity'] == next(x['opportunity'] for x in saved['board_catalog'] if x['id']==b['id']) for b in snap['board_catalog'])
+ assert saved['generated_at'] == snap['generated_at'], '页面与快照时间不一致'

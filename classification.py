@@ -1,0 +1,52 @@
+"""同花顺个股 F10 与概念详情成员图交叉核对。
+
+个股归属以该股 F10 为先；没有 F10 时保留详情成员作待核验标签。
+行业始终单列，不把交易板别或概念当行业。
+"""
+import datafeed as df
+import scan_cache
+
+
+def reconcile(theme_map, profiles, catalog, codes=None):
+    return scan_cache.cached('classification', 'current_pool',
+        [scan_cache.rules('classification.py', 'datafeed.py', 'config.py'), theme_map, profiles, catalog,
+         sorted(codes) if codes is not None else None],
+        lambda: _reconcile(theme_map, profiles, catalog, codes))
+
+
+def _reconcile(theme_map, profiles, catalog, codes=None):
+    result = {}
+    stats = {"f10_confirmed": 0, "member_pending": 0,
+             "concept_disagreements": 0, "industry_missing": 0}
+    for code in (set(theme_map) | set(profiles)) if codes is None else set(codes):
+        item = theme_map.get(code) or {"themes": [], "themes_em": [], "industry": []}
+        profile = profiles.get(code) or {}
+        raw = profile.get("concepts") or []
+        f10 = df.canonicalize_ths_concepts(raw, catalog) if raw else []
+        thematic = list(dict.fromkeys(n for n in f10 if df._theme_ok(n)))
+        member = list(item.get("themes") or [])
+        member_only = [n for n in member if n not in thematic] if raw else []
+        f10_only = [n for n in thematic if n not in member] if raw else []
+        industry = list(reversed(profile.get("industry") or []))
+        if not industry:
+            industry = list(item.get("industry") or [])
+            stats["industry_missing"] += 1
+        if raw:
+            stats["f10_confirmed"] += 1
+            stats["concept_disagreements"] += bool(member_only or f10_only)
+        else:
+            stats["member_pending"] += 1
+        # 浏览归属合并同花顺 F10 与详情成员；评分仍使用原来的 F10 优先口径。
+        browse_themes = list(dict.fromkeys((thematic if raw else []) + member))
+        result[code] = dict(item, themes=thematic if raw else member,
+                            browse_themes=browse_themes,
+                            industry=industry,
+                            f10_concepts=f10,
+                            member_themes=member,
+                            member_only_themes=member_only,
+                            f10_only_themes=f10_only,
+                            theme_basis="同花顺个股F10" if raw else "同花顺详情成员待F10核对",
+                            theme_checked_at=profile.get("fetched_at"),
+                            industry_basis="同花顺个股F10申万行业" if profile.get("industry")
+                                           else "同花顺行业成员待F10核对")
+    return result, stats

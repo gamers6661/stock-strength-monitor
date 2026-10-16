@@ -1,0 +1,17 @@
+--- before/make_dashboard.py
++++ after/make_dashboard.py
+@@ -75,11 +75,14 @@
+     import attack_model
+     import board_opportunity
+     import radar_opportunity
++    import market_strength
+     snap['runtime_contract'] = dict(code_close_refresh_version=scoring.CLOSE_REFRESH_VERSION,
+                                    code_fund_reference_version=price_only.VERSION,
+                                    code_attack_model_version=attack_model.LIVE_VERSION,
+                                    code_board_opportunity_version=board_opportunity.VERSION)
+     snap['runtime_contract']['code_radar_opportunity_version']=radar_opportunity.VERSION
++    snap['runtime_contract']['code_market_strength_version']=market_strength.VERSION
++    snap['runtime_contract']['code_market_strength_hash']=market_strength.IMPLEMENTATION_HASH
+     attach_klines(snap)
+     import board_trend
+     if not snap.get('board_opportunity_model'):

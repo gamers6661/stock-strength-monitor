@@ -1,0 +1,351 @@
+--- serve.py before
++++ serve.py after
+@@ -42,6 +42,7 @@
+ import board_center
+ import board_quote
+ import weekly_members
++import fund_history
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -87,7 +88,8 @@
+          "code_consolidation_version": trend_consolidation.VERSION,
+          "code_structure_version": wyckoff_structure.VERSION,
+          "code_session_context_version": session_context.VERSION,
+-         "code_intraday_rule_version": config.INTRADAY_RULE_VERSION}
++         "code_intraday_rule_version": config.INTRADAY_RULE_VERSION,
++         "code_close_refresh_version": scoring.CLOSE_REFRESH_VERSION}
+ 
+ # 看板「刷新数据」按钮触发的主动刷新状态
+ # cooldown 是必须的：连点会连续打东财/腾讯接口，触发风控后整段被封 20 分钟以上
+@@ -105,10 +107,49 @@
+ 
+ # init_worker 与 refresh_loop 可能同时触发全量扫描，用锁串行化
+ _SCAN_LOCK = threading.Lock()
++_CLOSE_FUNDS_DAYS = set()
++CLOSE_FUNDS = dict(running=False, asof=None, result=None, error=None)
++
++
++def start_close_fund_refresh(snapshot):
++    """先让正式榜单可见，再串行补采辅助资金；每个完成日只调度一次。"""
++    day = (snapshot.get('strength_model') or {}).get('asof')
++    if (snapshot.get('session') != '已收盘' or day != datetime.now().date().isoformat()
++            or not str(snapshot.get('close_daily_verified_at') or '').startswith(day)
++            or day in _CLOSE_FUNDS_DAYS):
++        return
++    _CLOSE_FUNDS_DAYS.add(day)
++    codes = [s['code'] for s in (snapshot.get('stocks') or []) + (snapshot.get('coverage_catalog') or [])]
++    def work():
++        try:
++            with _SCAN_LOCK:
++                CLOSE_FUNDS.update(running=True, asof=day, result=None, error=None)
++                formal = scoring.formal_histories(codes)
++                calendar = strength.trading_calendar({c: strength.completed(v) for c, v in formal.items()})
++                if not calendar or calendar[-1] != day:
++                    return
++                print(f'[CLOSE] 正式榜单已发布，后台补采 {day} 辅助资金')
++                result = fund_history.refresh(codes, calendar, deadline=180)
++                CLOSE_FUNDS['result'] = result
++                if result.get('updated') and datetime.now().date().isoformat() == day:
++                    INIT.update(scan_active=True, scan_started_at=datetime.now().isoformat(timespec='seconds'), scan_mode='quick')
++                    try:
++                        scoring.run(mode='quick')
++                        publish_outputs()
++                    finally:
++                        INIT.update(scan_active=False, scan_started_at=None, scan_mode=None)
++                print(f'[CLOSE] 辅助资金补采完成：成功 {result.get("updated", 0)}，缺口 {result.get("failed", 0)}')
++        except Exception as exc:
++            CLOSE_FUNDS['error'] = str(exc)
++            print(f'[CLOSE] 辅助资金补采失败，已发布榜单保留：{exc}')
++        finally:
++            CLOSE_FUNDS['running'] = False
++    threading.Thread(target=work, daemon=True).start()
+ 
+ 
+ def publish_outputs():
+     """后台每次完成扫描后同步发布看板和文字日报。"""
++    snapshot = None
+     try:
+         page = make_dashboard.build()
+         if page is None or not page.exists():
+@@ -121,6 +162,9 @@
+                 "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
+                 "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
+                 "snapshot_daily_asof": (snapshot.get("strength_model") or {}).get("asof"),
++                "snapshot_close_board_asof": (snapshot.get('close_strong_board') or {}).get('asof'),
++                "snapshot_close_refresh_version": snapshot.get('close_refresh_version'),
++                "snapshot_close_daily_verified_at": snapshot.get('close_daily_verified_at'),
+                 "snapshot_board_trend_version": (snapshot.get("board_trend_model") or {}).get("version"),
+                 "snapshot_board_catalog_version": snapshot.get('board_catalog_version'),
+                 "snapshot_board_index_ready": (snapshot.get("board_trend_model") or {}).get("ready"),
+@@ -157,6 +201,8 @@
+         INIT["last_publish_at"] = datetime.now().isoformat(timespec="seconds")
+         INIT["last_publish_ok"] = True
+         INIT["last_publish_error"] = None
++        if snapshot:
++            start_close_fund_refresh(snapshot)
+     except Exception as e:
+         INIT["last_publish_at"] = datetime.now().isoformat(timespec="seconds")
+         INIT["last_publish_ok"] = False
+@@ -213,16 +259,27 @@
+     return (9 * 60 + 15 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60 + 5)
+ 
+ 
+-def pick_mode():
+-    """扫描模式：收盘后（15:05-15:40）跑全量确保当日 K 线落库，其余时段增量"""
+-    hm = datetime.now().hour * 60 + datetime.now().minute
+-    if datetime.now().weekday() < 5 and 15 * 60 + 5 <= hm <= 15 * 60 + 40:
+-        return "full"
++def close_review_done(now):
++    day = now.date().isoformat()
++    return (SNAPSHOT_META.get('snapshot_daily_asof') == day
++            and SNAPSHOT_META.get('snapshot_close_board_asof') == day
++            and str(SNAPSHOT_META.get('snapshot_close_daily_verified_at') or '').startswith(day)
++            and SNAPSHOT_META.get('snapshot_close_refresh_version') == scoring.CLOSE_REFRESH_VERSION)
++
++
++def pick_mode(now=None):
++    """收盘正式榜未完成时更新一次；完成后不重复拉全量历史。"""
++    now = now or datetime.now()
++    hm = now.hour * 60 + now.minute
++    if now.weekday() < 5 and 15 * 60 + 5 <= hm < 16 * 60 and not close_review_done(now):
++        return "close"
+     return "quick"
+ 
+ 
+ def boundary_capture_done(now, boundary):
+     """各阶段报价按逐股源时间判断；定点参考价只保存一次。"""
++    if boundary == 'close_review':
++        return close_review_done(now)
+     if boundary in ("auction_start", "auction_mid"):
+         latest = str(SNAPSHOT_META.get("snapshot_auction_latest_quote_at") or "")
+         cutoff = "09:15" if boundary == "auction_start" else "09:20"
+@@ -259,7 +316,8 @@
+                     "morning_open" if 9 * 60 + 30 <= minute < 9 * 60 + 40 else
+                     "midday" if 11 * 60 + 30 <= minute < 13 * 60 else
+                     "afternoon_open" if 13 * 60 <= minute < 13 * 60 + 10 else
+-                    "close" if 15 * 60 <= minute < 15 * 60 + 40 else None)
++                    "close" if 15 * 60 <= minute < 15 * 60 + 5 else
++                    "close_review" if 15 * 60 + 5 <= minute < 16 * 60 else None)
+         morning = boundary in ("auction_start", "auction_mid", "auction_final", "morning_open")
+         if (now.weekday() < 5 and boundary and (morning or boundary_trading_evidence(now))
+                 and not boundary_capture_done(now, boundary)):
+@@ -271,16 +329,17 @@
+                 last_attempt[key] = time.monotonic()
+                 if _SCAN_LOCK.acquire(blocking=False):
+                     attempts[key] = attempts.get(key, 0) + 1
++                    mode = 'close' if boundary == 'close_review' else 'quick'
+                     INIT.update(scan_active=True,
+                                 scan_started_at=datetime.now().isoformat(timespec="seconds"),
+-                                scan_mode="quick")
++                                scan_mode=mode)
+                     try:
+                         label = {"auction_start": "09:15 集合竞价", "auction_mid": "09:20 集合竞价",
+                                  "auction_final": "09:25 竞价结束", "morning_open": "09:30 正式开盘",
+                                  "midday": "11:30 午间", "afternoon_open": "13:00 午后开盘",
+-                                 "close": "15:00 收盘"}[boundary]
++                                 "close": "15:00 收盘", "close_review": "15:05 正式收盘复盘"}[boundary]
+                         print(f"[BOUNDARY] {datetime.now():%H:%M:%S} 获取 {label}价格 ...")
+-                        scoring.run(mode="quick", boundary=boundary)
++                        scoring.run(mode=mode, boundary='close' if boundary == 'close_review' else boundary)
+                         publish_outputs()
+                         INIT["phase"] = "ready"
+                         INIT["needs_model_refresh"] = False
+@@ -381,7 +440,8 @@
+                     or (close_confirmation.get("model_version") == intraday.VERSION
+                         and close_confirmation.get("rule_version") == config.INTRADAY_RULE_VERSION)
+                 )
+-                matches = (snapshot.get("factor_model_version") == strength.VERSION
++                matches = (snapshot.get('close_refresh_version') == scoring.CLOSE_REFRESH_VERSION
++                           and snapshot.get("factor_model_version") == strength.VERSION
+                            and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
+                            and snapshot.get('board_catalog_version') == board_center.VERSION
+                            and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+@@ -555,6 +615,7 @@
+             body = json.dumps(
+                 {**STATE, **INIT, **SNAPSHOT_META,
+                  'member_refresh': weekly_members.status(),
++                 'close_funds': dict(CLOSE_FUNDS),
+                  'code_board_quote_version': board_quote.VERSION,
+                  "data_version": data_version(),
+                  "refresh": {**REFRESH,
+--- scoring.py before
++++ scoring.py after
+@@ -1,9 +1,10 @@
+ # -*- coding: utf-8 -*-
+ """打分编排层 —— 组装板块榜 / 个股榜 / 异动告警 / 数据快照
+ 
+-两种运行模式：
++运行模式：
+   full  : 全量重建（股票池 + 全部K线 + 板块 + 资金流），收盘后跑，约3-5分钟
+   quick : 增量（读K线缓存 + 实时行情覆盖当日bar + 板块 + 资金流），盘中每5分钟
++  close : 正式收盘日线更新，先发布榜单，再由服务后台补采辅助资金
+ """
+ import json
+ import math
+@@ -32,6 +33,8 @@
+ import strength
+ import theme_assist
+ import radar
++
++CLOSE_REFRESH_VERSION = '收盘优先发布1'
+ 
+ 
+ class DataNotReady(RuntimeError):
+@@ -679,6 +682,20 @@
+ # ─────────────────────────────────────────────────────
+ # K线获取（缓存 + 实时覆盖）
+ # ─────────────────────────────────────────────────────
++def validate_close_daily(klines, quotes, now):
++    """正式榜发布前检查真实日线日期、OHLC和活跃股票覆盖，不采用报价合成K。"""
++    if now.hour * 60 + now.minute < 15 * 60 + 5:
++        raise DataNotReady('15:05前不能把当日日线判定为正式收盘')
++    target = now.strftime('%Y-%m-%d')
++    active_codes = [c for c, q in quotes.items()
++                    if num(q.get('amount_wan')) > 0 or num(q.get('volume_shou')) > 0]
++    ready = sum(bool(klines.get(c)) and klines[c][-1]['date'] == target
++                and strength.valid_bars(klines[c][-1:]) for c in active_codes)
++    if not active_codes or ready < len(active_codes) * 0.8:
++        raise DataNotReady(f'正式收盘日线仅覆盖 {ready}/{len(active_codes)} 只，保留上一份收盘榜并稍后重试')
++    return ready
++
++
+ def load_klines(conn, codes, quotes, refresh=False, progress=True):
+     """读缓存K线；缺失的补拉；盘中用实时行情覆盖/追加当日bar
+ 
+@@ -780,7 +797,9 @@
+         q = quotes.get(c) or {}
+         ts = str(q.get("ts") or "")
+         qdate = intraday.quote_day(q.get("quote_at") or ts, datetime.now())
+-        if ks and qdate and q.get("price", 0) > 0:
++        # 收盘后只用正式落库日线，报价不能替代正式完成K或覆盖复权价格。
++        after_close = datetime.now().hour * 60 + datetime.now().minute >= 15 * 60
++        if ks and qdate and q.get("price", 0) > 0 and not after_close:
+             # 数据库里的历史K线成交量已经统一为「股」，而腾讯实时行情
+             # volume_shou 的单位是「手」。盘中追加/覆盖时必须走同一套
+             # 板别换算，否则量价因子会被系统性压低 100 倍。
+@@ -931,7 +950,8 @@
+     t_start = time.time()
+     scan_started_at = datetime.now()
+     snap = {"scan_started_at": scan_started_at.isoformat(sep=" ", timespec="seconds"),
+-            "generated_at": scan_started_at.strftime("%Y-%m-%d %H:%M:%S"), "mode": mode}
++            "generated_at": scan_started_at.strftime("%Y-%m-%d %H:%M:%S"), "mode": mode,
++            "close_refresh_version": CLOSE_REFRESH_VERSION}
+     previous_snapshot = {}
+     try:
+         previous_snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+@@ -942,6 +962,9 @@
+                                if previous_boundaries.get("date") == scan_started_at.strftime("%Y-%m-%d")
+                                else {"date": scan_started_at.strftime("%Y-%m-%d")})
+     snap["session"] = df.session_label()
++    prior_verified = str(previous_snapshot.get('close_daily_verified_at') or '')
++    if prior_verified.startswith(scan_started_at.strftime('%Y-%m-%d')) and previous_snapshot.get('close_refresh_version') == CLOSE_REFRESH_VERSION:
++        snap['close_daily_verified_at'] = prior_verified
+     print(f"[RUN] 数据阶段：{snap['session']}")
+     if snap["session"] in ("集合竞价", "竞价结束"):
+         return _auction_snapshot(previous_snapshot, mode, scan_started_at, boundary)
+@@ -1039,7 +1062,7 @@
+     fund_meta = {"source": "不可用", "stale": False, "coverage": 0}
+     try:
+         ff_all, fund_meta = df.fetch_em_fundflow_all_resilient(
+-            prefer_cache=(mode == "quick"))
++            prefer_cache=(mode in ("quick", "close")))
+         if fund_meta.get("stale"):
+             raise RuntimeError("东财只有过期缓存")
+     except Exception as e:
+@@ -1077,7 +1100,7 @@
+     conn = df.db()
+     boards, board_ctx = build_board_board(
+         conn, theme_map=theme_map, theme_groups=theme_groups,
+-        refresh=False, progress=progress, prefer_cache=(mode == "quick"))
++        refresh=False, progress=progress, prefer_cache=(mode in ("quick", "close")))
+     snap["boards"] = boards
+     snap["theme_rank"] = rank_themes(theme_groups)
+     # 题材→组内上涨占比 索引，供看板给个股题材标签上色（自洽口径，不跨源匹配）
+@@ -1093,7 +1116,10 @@
+ 
+     # 6. K线
+     codes = list(quotes.keys())
+-    klines = load_klines(conn, codes, quotes, refresh=(mode == "full"), progress=progress)
++    klines = load_klines(conn, codes, quotes, refresh=(mode in ("full", "close")), progress=progress)
++    if mode == "close":
++        validate_close_daily(klines, quotes, scan_started_at)
++        snap['close_daily_verified_at'] = datetime.now().isoformat(sep=' ', timespec='seconds')
+ 
+     # 7. 个股因子（V3：先过 Risk Gate，再分别计算短线启动与波段模型）
+     #
+@@ -1208,7 +1234,8 @@
+     formal_calendar=strength.trading_calendar({c:strength.completed(v) for c,v in formal.items()})
+     if formal_calendar:
+         snap['history_reference']=history_reference.ensure(formal,formal_calendar[-1])
+-        snap['fund_history']=fund_history.refresh(list(pool),formal_calendar,deadline=180 if mode=='full' else 90)
++        # 日线资格不依赖历史资金；盘后先发布，网络补采由服务在发布后完成。
++        snap['fund_history']=fund_history.cached_status(list(pool),formal_calendar) if snap['session']=='已收盘' else fund_history.refresh(list(pool),formal_calendar,deadline=180 if mode=='full' else 90)
+     try:
+         stocks, model = strength.build(stocks, klines, industry_lookup)
+     except ValueError as e:
+@@ -1231,7 +1258,7 @@
+     snap["emotion_candidates"] = emotion_extra
+     snap["axis_counts"] = dict(Counter(s["axis_group"] for s in stocks))
+     snap["fund_confirmation"] = fund_confirmation.attach(stocks, strength.trading_calendar(
+-        {c: strength.completed(v) for c, v in klines.items()}))
++        {c: strength.completed(v) for c, v in klines.items()}), fetch=snap['session']!='已收盘')
+     print(f"[RUN] 历史资金覆盖 {snap['fund_confirmation']['covered']}/{len(stocks)} 只")
+     snap["strength_model"] = model
+     snap["risk_gate"]["passed"] = len(stocks)
+--- fund_history.py before
++++ fund_history.py after
+@@ -20,6 +20,16 @@
+ 
+ def number(value):
+     return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value)
++
++def cached_status(codes, calendar):
++    """盘后先读已有缓存；缺失目标日不计入完整覆盖，也不发网络请求。"""
++    cache = load(); dates = calendar[-20:]
++    complete = sum(len(dates) == 20 and all(d in {
++        r['date'] for r in (cache.get(c) or {}).get('rows', [])
++        if number(r.get('main_net'))} for d in dates) for c in codes)
++    return dict(requested=0, updated=0, failed=0, complete20=complete,
++                total=len(codes), asof=calendar[-1] if calendar else None,
++                deferred=True, seconds=0)
+ 
+ def refresh(codes,calendar,workers=8,deadline=180):
+     if not calendar:return dict(requested=0,updated=0,failed=0)
+--- dashboard_template.html before
++++ dashboard_template.html after
+@@ -1422,8 +1422,8 @@
+   var btns=[].slice.call(el.querySelectorAll('button')), sl=el.querySelector('.sl');
+   function move(b){ if(!b||!sl)return; sl.style.width=b.offsetWidth+'px';
+     sl.style.transform='translateX('+(b.offsetLeft-3)+'px)'; }
+-  var act=el.querySelector('button.on')||btns[0];
+-  requestAnimationFrame(function(){move(act);});
++  // 首帧执行前时段判断可能已切换选项，滑块必须读取当时的选中按钮。
++  requestAnimationFrame(function(){move(el.querySelector('button.on')||btns[0]);});
+   el.addEventListener('click',function(e){
+     var b=e.target.closest('button'); if(!b||!el.contains(b))return;
+     btns.forEach(function(x){x.classList.remove('on');});
+--- check_live_service.py before
++++ check_live_service.py after
+@@ -15,6 +15,7 @@
+ import board_center
+ import board_quote
+ import weekly_members
++import scoring
+ from datetime import datetime
+ 
+ 
+@@ -34,6 +35,13 @@
+     assert status["phase"] == "ready" and status["last_scan_ok"], "服务未就绪或上次扫描失败"
+     assert status["code_model_version"] == strength.VERSION
+     assert status["code_strength_version"] == stock_strength.VERSION
++    assert status.get('code_close_refresh_version') == scoring.CLOSE_REFRESH_VERSION, '服务尚未载入新版收盘更新流程，需要重启'
++    assert snapshot.get('close_refresh_version') == served.get('close_refresh_version') == scoring.CLOSE_REFRESH_VERSION, '收盘更新流程与实际页面快照不一致'
++    if served.get('close_daily_verified_at'):
++        day = served['close_daily_verified_at'][:10]
++        assert served['strength_model']['asof'] == served['close_strong_board']['asof'] == day
++        assert status.get('snapshot_close_daily_verified_at') == served['close_daily_verified_at']
++        assert not served['close_strong_board'].get('today_pending')
+     assert status["code_board_trend_version"] == board_trend.VERSION
+     assert status['code_board_catalog_version'] == board_center.VERSION
+     assert status['snapshot_board_catalog_version'] == snapshot['board_catalog_version'] == served['board_catalog_version'] == board_center.VERSION

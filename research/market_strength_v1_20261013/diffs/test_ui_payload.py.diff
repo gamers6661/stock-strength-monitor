@@ -1,0 +1,26 @@
+--- before/test_ui_payload.py
++++ after/test_ui_payload.py
+@@ -95,16 +95,13 @@
+                 self.assertEqual(empty[0],parsed[0])
+ 
+ 
+-    def test_current_category_does_not_include_expired_or_unconfirmed_labels(self):
+-        import subprocess
+-        script="""const fs=require('fs'),vm=require('vm');
+-        const ctx={DATA:{radar_opportunity:{lists:{current:['600001','600002']},by_code:{
+-          '600001':{code:'600001',current:true,labels:['持续进攻'],opportunity_kinds:['突破启动','持续进攻']},
+-          '600002':{code:'600002',current:true,labels:['突破启动'],opportunity_kinds:['突破启动']}}}}};
+-        vm.createContext(ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);
+-        ctx.RADAR_KIND='突破启动';console.log(JSON.stringify(ctx.radarOpportunityRows('current').map(r=>r.code)));"""
+-        actual=subprocess.run(['node','-e',script],cwd=config.ROOT,capture_output=True,text=True,check=True)
+-        self.assertEqual(json.loads(actual.stdout),['600002'])
++    def test_current_scope_uses_backend_focus_not_event_confirmation(self):
++        from test_market_strength import fixture,run
++        from test_market_strength_integration import render
++        f=fixture();q=f[1];code=next(iter(q));q[code].update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
++        run(f);result=render(f[0])
++        self.assertEqual(result['ids'],f[0]['market_strength']['stocks']['focus'])
++        self.assertIn(code,result['ids'])
+ 
+ if __name__ == '__main__':
+     unittest.main()

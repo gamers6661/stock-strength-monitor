@@ -1,0 +1,10 @@
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -969,6 +969,7 @@
+  #ms-stock-host .ms-research-table{min-width:1010px}
+  .ms-direction-browser>summary span{display:none}
+ }
++.ma-stage-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:14px 0}.ma-stage-section{margin:18px 0;padding:20px}.ma-state{display:inline-block;padding:5px 10px;border-radius:8px;font-size:12px}.ma-active{background:#eaf1ff;color:#31689c}.ma-inactive{background:#f6efe9;color:#9c6545}.ma-trend-table{min-width:950px}.ma-trend-table td{vertical-align:top}.ma-trend-detail pre{font-size:11px;max-height:480px;overflow:auto}.ma-trend-detail .ms-mini-metrics{margin:12px 0}@media(max-width:800px){.ma-stage-grid{grid-template-columns:1fr}.ma-stage-section{padding:12px}.ma-trend-table{min-width:920px}}
+ </style>
+ </head>
+ <body>

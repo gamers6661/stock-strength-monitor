@@ -1,0 +1,13 @@
+--- make_dashboard.py.before
++++ make_dashboard.py
+@@ -88,7 +88,9 @@
+     if not snap.get('board_opportunity_model'):
+         board_trend.attach(snap, fetch=False)
+     tpl = TPL.read_text(encoding="utf-8")
+-    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8'))
++    import board_chart
++    snap = board_chart.attach(snap)
++    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
+     if PLACEHOLDER not in tpl:
+         print("[ERR] 模板缺少数据占位符")
+         return None

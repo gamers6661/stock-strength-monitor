@@ -1,0 +1,17 @@
+--- before/dashboard_template.html
++++ dashboard_template.html
+@@ -1221,11 +1221,11 @@
+   ? s.display_boards : ((s&&s.boards)||[]);}
+ function displayConcepts(s){return (s&&s.concepts&&s.concepts.length)
+   ? s.concepts : displayBoards(s);}
+-function fmt(v,d){var x=Number(v);if(!isFinite(x))return '—';return x.toFixed(d===undefined?2:d);}
+-function sgn(v,d){var x=Number(v);if(!isFinite(x))return '—';d=d===undefined?2:d;
++function fmt(v,d){if(v==null||v==='')return '—';var x=Number(v);if(!isFinite(x))return '—';return x.toFixed(d===undefined?2:d);}
++function sgn(v,d){if(v==null||v==='')return '—';var x=Number(v);if(!isFinite(x))return '—';d=d===undefined?2:d;
+   return (x>0?'+':'')+x.toFixed(d);}
+ function cls(v){var x=Number(v);return x>0?'up':(x<0?'down':'flat');}
+-function pct(v,d){return sgn(v,d)+'%';}
++function pct(v,d){var value=sgn(v,d);return value==='—'?value:value+'%';}
+ /* 成交额格式化：入参单位是万元（腾讯行情/我方估算都用万元）。
+    原实现把"万元÷1e4=亿元"的结果又拿去和 1e4 比，于是阈值等于"≥1万亿元"、
+    永远走不到亿元分支 —— 9.58 亿的成交额被显示成「9.6万」，

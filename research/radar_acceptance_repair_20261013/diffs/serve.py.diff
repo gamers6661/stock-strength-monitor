@@ -1,0 +1,21 @@
+--- before/serve.py
++++ serve.py
+@@ -91,6 +91,7 @@
+          "code_board_opportunity_version": board_opportunity.VERSION,
+          "code_radar_opportunity_version": radar_opportunity.VERSION,
+          "code_radar_opportunity_hash": radar_opportunity.IMPLEMENTATION_HASH,
++         "code_radar_repair_version": radar_opportunity.REPAIR_VERSION,
+          "code_strength_version": stock_strength.VERSION,
+          "code_intraday_model_version": intraday.VERSION,
+          "code_attack_model_version": attack_model.LIVE_VERSION,
+@@ -146,6 +147,10 @@
+                 "snapshot_radar_opportunity_version": (snapshot.get('radar_opportunity') or {}).get('version'),
+                 "snapshot_radar_opportunity_counts": (snapshot.get('radar_opportunity') or {}).get('counts'),
+                 "snapshot_radar_opportunity_hash": (snapshot.get('radar_opportunity') or {}).get('implementation_hash'),
++                "snapshot_radar_repair_version": (snapshot.get('radar_opportunity') or {}).get('repair_version'),
++                "snapshot_radar_close_day": ((snapshot.get('radar_opportunity') or {}).get('last_close_review') or {}).get('day'),
++                "snapshot_radar_close_events": ((snapshot.get('radar_opportunity') or {}).get('last_close_review') or {}).get('event_counts'),
++                "snapshot_radar_close_stocks": ((snapshot.get('radar_opportunity') or {}).get('last_close_review') or {}).get('stock_counts'),
+                 "snapshot_board_index_ready": (snapshot.get("board_trend_model") or {}).get("ready"),
+                 "snapshot_consolidation_version": (snapshot.get('trend_consolidation') or {}).get('version'),
+                 "snapshot_consolidation_count": (snapshot.get('trend_consolidation') or {}).get('count'),

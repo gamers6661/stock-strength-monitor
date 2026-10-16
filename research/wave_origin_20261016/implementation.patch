@@ -1,0 +1,235 @@
+--- before/config.py
++++ after/config.py
+@@ -32,7 +32,7 @@
+     'broken_repair_pct': 3., 'broken_close_position': .7,
+ }
+ MA_TREND = {
+-    'version': 'ma-trend-2026-10-16.3',
++    'version': 'ma-trend-2026-10-16.4',
+     'origin_days': 5, 'origin_base_days': 5,
+     'impulse_day_pct': 4., 'impulse_two_day_pct': 6., 'impulse_rise_atr': 1.2,
+     'volume_ratio': 1.8, 'close_position': .75,
+@@ -52,6 +52,7 @@
+     'limit_recovery_candidate_enabled': True,
+     'limit_recovery_candidate_days': 5,
+     'limit_recovery_follow_days': 1,
++    'limit_reclaim_rebuild_enabled': True,
+     'board_min_members': 6, 'board_min_coverage': 80.,
+ }
+ MARKET_STRENGTH = {
+--- before/ma_trend.py
++++ after/ma_trend.py
+@@ -305,18 +305,37 @@
+ 
+ 
+ def recent_reclaim_anchor(bars,i,features,last_exit,signal):
+-    """Attribute an existing strong entry to a recent observed start, never qualify it early."""
+-    if not last_exit or features.get('limit_pct')!=10:return None
++    """Confirm a recent MA5 reclaim through a strong entry or another sealed close."""
++    if features.get('limit_pct')!=10:return None
+     if not all(features['ma'][n][i]>features['ma'][n][i-1] and bars[i]['close']>=features['ma'][n][i] for n in (5,10)):return None
++    rebuild=not signal
++    if not last_exit and not rebuild:return None
++    if rebuild:
++        if not P['limit_reclaim_rebuild_enabled']:return None
++        change=100*(bars[i]['close']/bars[i-1]['close']-1)
++        if abs(change-10)>P['limit_return_tolerance_pp'] or abs(bars[i]['close']-bars[i]['high'])>1e-8:return None
++        signal=dict(kind='后续完成日涨停确认',date=bars[i]['date'],price=bars[i]['close'],
++            day_return_pct=change,limit_pct=10,basis='再次收盘封板，MA5及MA10已转升')
+     for start in range(max(21,i-P['origin_days']+1),i):
+         b=bars[start];change=100*(b['close']/bars[start-1]['close']-1)
+-        if (b['date']<=last_exit['date'] or abs(change-10)>P['limit_return_tolerance_pp']
++        if (last_exit and b['date']<=last_exit['date'] or abs(change-10)>P['limit_return_tolerance_pp']
+                 or abs(b['close']-b['high'])>1e-8 or b['close']<features['ma'][5][start]
+                 or bars[start-1]['close']>=features['ma'][5][start-1]):continue
++        if not last_exit and bars[start-1]['close']>=features['ma'][10][start-1]:continue
+         if bars[i]['close']<=b['close'] or any(bars[j]['close']<features['ma'][5][j] for j in range(start+1,i+1)):continue
+-        proof=dict(kind='涨停起涨后强势确认',date=bars[i]['date'],event_date=b['date'],
++        kind='涨停重建均线后确认' if rebuild else '涨停起涨后强势确认'
++        proof=dict(kind=kind,date=bars[i]['date'],event_date=b['date'],
+             close=bars[i]['close'],event_close=b['close'],ma5=features['ma'][5][i],ma10=features['ma'][10][i],
+             independent_signal=copy.deepcopy(signal),basis='仅在既有强势入口成立后关联起涨日，不回填此前入选资格')
++        if rebuild:
++            proof.update(previous_exit=last_exit['date'] if last_exit else None,window_sessions=i-start+1,
++                reset_date=last_exit['date'] if last_exit else bars[start-1]['date'],
++                reset_basis='旧波段已退出' if last_exit else '尚无有效阶段，起涨前完成日失守MA10',
++                event_previous_close=bars[start-1]['close'],event_previous_ma10=features['ma'][10][start-1],
++                ma5_held=True,ma5_previous=features['ma'][5][i-1],ma10_previous=features['ma'][10][i-1],
++                event_return_pct=change,confirmation_return_pct=signal['day_return_pct'],
++                event_sealed=True,confirmation_sealed=True,
++                basis='涨停收回MA5；5日内再次封板并收复转升的MA5及MA10，期间完成日守住MA5；'+('旧波段已退出' if last_exit else '起涨前完成日已失守MA10'))
+         return confirmed_price_origin(bars,start,features,proof['kind'],proof)
+     return None
+ 
+@@ -382,7 +401,7 @@
+             last_confirmation=dict(copy.deepcopy(follow),date=bars[i]['date'])
+             recovery.update(active=False,state='强势入口已确认',ended_at=bars[i]['date'],reason='涨停收复后完成日沿MA5继续推进确认')
+             transitions.append(dict(date=bars[i]['date'],from_stage=None,to_stage=5,reason='涨停收复后推进确认',event_date=follow['date']))
+-        if signal and not active:signal=recent_reclaim_anchor(bars,i,features,last_exit,signal) or signal
++        if not active:signal=recent_reclaim_anchor(bars,i,features,last_exit,signal) or signal
+         if signal:
+             roots.append(signal)
+             if active:last_confirmation=copy.deepcopy(signal)
+@@ -586,7 +605,7 @@
+         for k in ('price','prior_high','breakout_price','atr','base_low','advance_start_close'):
+             if number(value.get(k)):value[k]*=factor
+         proof=value.get('confirmation') or {}
+-        for k in ('close','previous_close','event_close','ma5','ma10','ma5_previous','ma10_previous'):
++        for k in ('close','previous_close','event_close','ma5','ma10','ma5_previous','ma10_previous','event_previous_close','event_previous_ma10'):
+             if number(proof.get(k)):proof[k]*=factor
+         if proof.get('independent_signal'):scale_origin(proof['independent_signal'])
+     def scale_platform(value):
+@@ -1080,7 +1099,7 @@
+             proof=m['origin'].get('confirmation') or {}
+             assert m['origin']['volume_ratio'] is not None or proof
+             if proof:
+-                assert proof['kind'] in ('涨停收复后推进确认','涨停起涨后强势确认','MA20整理后再启动')
++                assert proof['kind'] in ('涨停收复后推进确认','涨停起涨后强势确认','涨停重建均线后确认','MA20整理后再启动')
+                 assert proof['event_date']==m['origin']['date']<=proof['date']<=m['asof']
+                 assert proof['close']>=proof['ma5'] and proof['close']>=proof['ma10']
+                 if proof['kind']=='涨停收复后推进确认':
+@@ -1088,6 +1107,15 @@
+                     assert proof['close']>max(proof['previous_close'],proof['event_close']) and proof['ma10_held']
+                     assert proof['ma5']>proof['ma5_previous'] and proof['ma10']>proof['ma10_previous']
+                 if proof['kind']=='涨停起涨后强势确认':assert proof['independent_signal']['date']==proof['date']
++                if proof['kind']=='涨停重建均线后确认':
++                    assert proof['reset_date']<proof['event_date']<proof['date']
++                    if proof['previous_exit']:assert proof['previous_exit']<proof['event_date']
++                    else:assert proof['event_previous_close']<proof['event_previous_ma10']
++                    assert 2<=proof['window_sessions']<=P['origin_days'] and proof['ma5_held']
++                    assert proof['event_sealed'] and proof['confirmation_sealed']
++                    assert abs(proof['event_return_pct']-10)<=P['limit_return_tolerance_pp']
++                    assert abs(proof['confirmation_return_pct']-10)<=P['limit_return_tolerance_pp']
++                    assert proof['ma5']>proof['ma5_previous'] and proof['ma10']>proof['ma10_previous']
+                 if proof['kind']=='MA20整理后再启动':
+                     assert proof['prior_stage']==20 and proof['prior_origin']<=proof['event_date']
+                     assert proof['prior_rise_pct']>=P['ma20_rise_pct'] and proof['prior_rise_atr']>=P['ma20_rise_atr']
+--- before/stock_rank_ui.js
++++ after/stock_rank_ui.js
+@@ -1,5 +1,7 @@
+ /* Complete member ranks and shared explanations. Numeric ranks come from backend. */
+ var MS_EXPLANATIONS={
++ '涨停重建均线后确认':'当前无有效阶段，旧波段已退出，或首次起涨前已完成日失守MA10。从MA5下方涨停收回MA5后，5个交易日内再次收盘涨停，站上已经转升的MA5及MA10，期间完成日守住MA5，才确认新波段。起涨事件日与实际确认日分开，不把首板回填为已入选。该入口至少包含两次封板，不要求首板时均线已转向。',
++ '后续完成日涨停确认':'起涨事件之后又一个完成日收盘封住涨停，同时收复上行的MA5及MA10；起涨以来完成日没有失守MA5。与首板一起形成至少两次封板的强势证据。',
+  '有效样本观察':'展示全部真实日线，能形成完整周期的均线正常计算；尚未凑足周期的指标留空，不补造历史或价格。',
+  '停牌观察':'同批其他股票有当日成交，本股单独重试后仍未获取到当日成交，按缺失规则推定停牌，保留最后有效阶段，复牌后继续。',
+  'MA10跟踪':'涨停收复候选以MA10为防守位继续观察，尚未确认正式均线趋势。连续15个交易分钟未收回、正式收盘失守或明显破位时失效；午休不计时。',
+--- before/ma_trend_ui.js
++++ after/ma_trend_ui.js
+@@ -87,7 +87,7 @@
+  var e=mtHistorical(m)?{stage:m.stage,date:m.exit_at,reason:m.reason,origin:m.origin,platform:m.platform,support:m.support_price}:[m.last_phase,m.last_exit].filter(Boolean).sort(function(a,b){return String(b.date||'').localeCompare(String(a.date||''));})[0];
+  if(!e)return '';var o=e.origin||{},p=e.platform||{},label={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'}[e.stage]||'过往阶段';
+  e=Object.assign({},e,{transitions:(m.transitions||[]).filter(function(t){return mtHistorical(m)||String(t.at||t.date||'').slice(0,10)<(m.origin||{}).date;})});
+- return '<details class="card ma-stage-history" data-ma-history style="margin-top:20px"><summary>过往均线阶段记录 · '+esc(label)+'</summary><div style="padding-top:12px;display:grid;gap:8px"><p class="ms-muted">已结束记录，仅供回看，不参与当前阶段筛选与标签。</p><p><b>'+esc(label)+'</b> · 结束 '+esc(e.date||m.exit_at||'—')+'</p><p>该轮启动 '+esc(o.date||'—')+' · 防守价 '+mtValue(e.support,3)+'</p><p>'+esc(e.reason||'')+'</p>'+(p.start?'<p>该轮整理 '+esc(p.start)+' · 固定底部 '+mtValue(p.low,3)+'</p>':'')+'<details><summary>完整过往依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e,null,2))+'</pre></details></div></details>';
++ return '<details class="card ma-stage-history" data-ma-history style="margin-top:20px"><summary>过往均线阶段记录 · '+esc(label)+'</summary><div style="padding-top:12px;display:grid;gap:8px"><p class="ms-muted">已结束记录，仅供回看，不参与当前阶段筛选与标签。</p><p><b>'+esc(label)+'</b> · 结束 '+esc(e.date||m.exit_at||'—')+'</p><p>该轮启动 '+esc(o.date||'—')+((o.confirmation||{}).date?' · 启动确认 '+esc(o.confirmation.date):'')+' · 防守价 '+mtValue(e.support,3)+'</p><p>'+esc(e.reason||'')+'</p>'+(p.start?'<p>该轮整理 '+esc(p.start)+' · 固定底部 '+mtValue(p.low,3)+'</p>':'')+'<details><summary>完整过往依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e,null,2))+'</pre></details></div></details>';
+ }
+ function mtMoveHistoryToEnd(host){var history=host&&host.querySelector('[data-ma-history]');if(history)host.appendChild(history);}
+ function mtOverview(){var meta=mtModel(),breadth=DATA.breadth||{},temperature=DATA.market_emotion||{},host=document.getElementById('ms-overview-host');
+--- before/test_ma_rebuild_origin.py
++++ after/test_ma_rebuild_origin.py
+@@ -0,0 +1,105 @@
++"""Delayed MA turns must not hide a strong new wave or date it at an older exit."""
++import copy,csv,io,json,subprocess,unittest
++from datetime import timedelta
++import ma_trend as T
++from test_ma_trend import sample,run
++from test_ma_lifecycle_confirmation import append_closes
++from test_market_strength_integration import render
++
++def rebuild_fixture(first_wave=True):
++    f=sample();bars=next(iter(f[3].values()))
++    values=[105.,115.5,127.05,122.,120.,120.,125.,111.,104.,111.,104.,105.,99.,95.,104.5,114.95,126.445]
++    start=len(bars)-len(values)
++    for j,price in enumerate(values):
++        opening=bars[start+j-1]['close']
++        bars[start+j].update(open=opening,close=price,high=max(opening,price)+.2,low=min(opening,price)-.2,
++            volume=250. if first_wave and j==0 else 40.)
++    for b in bars[-3:]:b['high']=b['close']
++    return f
++
++class RebuildOrigin(unittest.TestCase):
++    def test_first_limit_can_precede_both_ma_turns_and_confirmation_stays_later(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));event=len(bars)-3
++        self.assertLess(T.average(bars,event,5),T.average(bars,event-1,5))
++        self.assertLess(bars[event]['close'],T.average(bars,event,10))
++        self.assertIsNone(T.origin(bars,len(bars)-1,limit_pct=10))
++        for end in (event+1,event+2):self.assertIsNone(T.daily(bars[:end],f[4],10)['stage'])
++        d=T.daily(bars,f[4],10);o=d['origin'];p=o['confirmation']
++        self.assertEqual(d['stage'],5);self.assertEqual(o['kind'],'涨停重建均线后确认')
++        self.assertEqual(o['date'],bars[event]['date']);self.assertEqual(p['date'],bars[-1]['date'])
++        self.assertEqual(d['last_confirmation']['date'],bars[-1]['date'])
++        self.assertLess(p['previous_exit'],o['date']);self.assertLess(o['volume_ratio'],T.P['volume_ratio'])
++
++    def test_first_observed_wave_does_not_need_a_fabricated_prior_qualified_exit(self):
++        f=rebuild_fixture(False);bars=next(iter(f[3].values()));d=T.daily(bars,f[4],10)
++        self.assertEqual(d['stage'],5);p=d['origin']['confirmation']
++        self.assertIsNone(p['previous_exit']);self.assertIsNone(d['last_exit'])
++        self.assertLess(p['event_previous_close'],p['event_previous_ma10'])
++
++    def test_history_window_changes_do_not_move_an_observed_recent_start(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));event=bars[-3]['date']
++        for count in (30,45,len(bars)):
++            d=T.daily(bars[-count:],f[4],10)
++            self.assertEqual(d['stage'],5,count);self.assertEqual(d['origin']['date'],event,count)
++            self.assertEqual(d['origin']['confirmation']['date'],bars[-1]['date'],count)
++
++    def test_single_limit_then_ordinary_low_volume_bounce_does_not_use_new_channel(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()))
++        bars[-2].update(close=110.,high=110.2);bars[-1].update(open=110.,close=121.,high=121.2)
++        self.assertIsNone(T.daily(bars,f[4],10)['stage'])
++
++    def test_second_seal_without_ma10_turning_up_is_not_confirmation(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));bars[-11].update(close=130.,high=130.2)
++        self.assertLess(T.average(bars,len(bars)-1,10),T.average(bars,len(bars)-2,10))
++        self.assertIsNone(T.daily(bars,f[4],10)['stage'])
++
++    def test_expired_event_cannot_be_reused_for_a_late_second_limit(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));del bars[-2:]
++        bars,dates=append_closes(f,[110.]*5+[121.])
++        bars[-1]['high']=121.
++        self.assertIsNone(T.daily(bars,dates,10)['stage'])
++
++    def test_ma5_failure_invalidates_the_old_start(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));event=bars[-3]['date']
++        bars[-2].update(close=90.,low=89.8,high=105.)
++        bars[-1].update(open=90.,close=99.,high=99.,low=89.8)
++        d=T.daily(bars,f[4],10)
++        self.assertNotEqual((d.get('origin') or {}).get('date'),event)
++
++    def test_unknown_limit_regime_and_unsealed_event_are_excluded(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()))
++        self.assertIsNone(T.daily(bars,f[4],None)['stage'])
++        bars[-3]['high']+=.5;bars[-2]['high']+=.5
++        self.assertIsNone(T.daily(bars,f[4],10)['stage'])
++
++    def test_continuing_wave_keeps_its_start_after_more_limits(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));o=T.daily(bars,f[4],10)['origin']
++        bars,dates=append_closes(f,[139.0895]);bars[-1]['high']=bars[-1]['close']
++        d=T.daily(bars,dates,10)
++        self.assertEqual(d['origin']['date'],o['date'])
++        self.assertEqual(d['origin']['confirmation']['date'],o['confirmation']['date'])
++        self.assertEqual(d['last_confirmation']['date'],bars[-1]['date'])
++
++    def test_archived_wave_and_export_keep_the_new_start_without_current_membership(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));setup=T.daily(bars,f[4],10);root=setup['origin']
++        # Use a real model container and assert the archive, not current labels.
++        f=sample();m=run(f);m.update(status='已退出',eligible=False,stage=5,origin=root,
++            last_exit=dict(stage=5,date='2026-10-14',origin=root,reason='本轮支撑失守',platform={},support=120.))
++        out=render(f[0],"document.getElementById('proof').innerHTML=mtTable(DATA.stocks)+mtHistoryDetail(DATA.stocks[0].ma_trend);")['els']['proof']['innerHTML']
++        table,archive=out.split('data-ma-history',1)
++        self.assertNotIn(root['date'],table);self.assertIn(root['date'],archive)
++        self.assertIn('当前未入观察',table)
++        payload=json.dumps(dict(rows=f[0]['stocks'],data=f[0],contexts=dict(view='radar')),ensure_ascii=False)
++        result=subprocess.run(['node','csv_export.js'],input=payload,capture_output=True,text=True,encoding='utf8',check=True)
++        row=next(csv.DictReader(io.StringIO(result.stdout.lstrip('\ufeff'))))
++        self.assertFalse(row['起点日期']);self.assertEqual(json.loads(row['完整均线依据'])['origin']['date'],root['date'])
++
++    def test_rebuild_proof_scales_prices_but_preserves_returns_and_dates(self):
++        f=rebuild_fixture();bars=next(iter(f[3].values()));d=T.daily(bars,f[4],10)
++        scaled=T.scale_setup(d,2.)['origin']['confirmation'];p=d['origin']['confirmation']
++        for key in ('close','event_close','event_previous_close','event_previous_ma10','ma5_previous','ma10_previous'):
++            self.assertEqual(scaled[key],p[key]*2.)
++        self.assertEqual(scaled['confirmation_return_pct'],p['confirmation_return_pct'])
++        self.assertEqual(scaled['date'],p['date'])
++
++if __name__=='__main__':unittest.main()

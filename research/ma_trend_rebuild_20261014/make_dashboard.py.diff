@@ -1,0 +1,28 @@
+--- before/make_dashboard.py
++++ after/make_dashboard.py
+@@ -76,6 +76,7 @@
+     import board_opportunity
+     import radar_opportunity
+     import market_strength
++    import ma_trend
+     snap['runtime_contract'] = dict(code_close_refresh_version=scoring.CLOSE_REFRESH_VERSION,
+                                    code_fund_reference_version=price_only.VERSION,
+                                    code_attack_model_version=attack_model.LIVE_VERSION,
+@@ -83,6 +84,8 @@
+     snap['runtime_contract']['code_radar_opportunity_version']=radar_opportunity.VERSION
+     snap['runtime_contract']['code_market_strength_version']=market_strength.VERSION
+     snap['runtime_contract']['code_market_strength_hash']=market_strength.IMPLEMENTATION_HASH
++    snap['runtime_contract']['code_ma_trend_version']=ma_trend.VERSION
++    snap['runtime_contract']['code_ma_trend_hash']=ma_trend.IMPLEMENTATION_HASH
+     attach_klines(snap)
+     import board_trend
+     if not snap.get('board_opportunity_model'):
+@@ -90,7 +93,7 @@
+     tpl = TPL.read_text(encoding="utf-8")
+     import board_chart
+     snap = board_chart.attach(snap)
+-    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
++    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'ma_trend_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
+     if PLACEHOLDER not in tpl:
+         print("[ERR] 模板缺少数据占位符")
+         return None

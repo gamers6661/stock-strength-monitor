@@ -1,0 +1,551 @@
+"""同花顺指数完成日线观察。新增板块筛选，不参与任何个股评分。"""
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
+import math
+import re
+import sqlite3
+import time
+
+import config
+import datafeed
+import scan_cache
+
+VERSION = "板块实时趋势3"
+WINDOW = 22  # 当前/前一天的 MA20 斜率以及20个含跳空TR。
+KEYS = ("date", "open", "close", "high", "low", "volume", "amount")
+RULES = dict(startup_days=3, shallow_atr=.3, deep_wick_atr=.5,
+             failure_atr=1., break_buffer_days=2, reclaim_days=2,
+             ma20_arm_days=2, startup_failure_atr=.5)
+
+
+def replay(bars, calendar):
+    """按完成交易日顺序重放；只读取当时及以前的K，缺口切断旧趋势。
+
+    MA10缓冲的ATR、首次失守日均属于该次回踩，单日收回不能重置。
+    MA20只有在本段观察连续两次站上后才成为最终退出线。
+    """
+    by_date = {b['date']: b for b in bars if valid(b)}
+    run, startup, episode, previous = [], [], None, None
+    weak_latched, last_exit, last_reason = False, None, None
+    history_start = None
+    out = None
+    for day_index, day in enumerate(calendar):
+        bar = by_date.get(day)
+        if bar is None:
+            run, startup, episode, previous = [], [], None, None
+            weak_latched, last_exit, last_reason = False, None, None
+            history_start = None
+            continue
+        run.append(bar)
+        if len(run) < 21:
+            continue
+        if history_start is None:
+            history_start = day
+        cs = [k['close'] for k in run[-21:]]
+        ma = {n: sum(cs[-n:])/n for n in (5, 10, 20)}
+        prev = {n: sum(cs[-n-1:-1])/n for n in (5, 10, 20)}
+        ks = run[-21:]
+        atr = sum(max(ks[j]['high']-ks[j]['low'], abs(ks[j]['high']-ks[j-1]['close']),
+                      abs(ks[j]['low']-ks[j-1]['close'])) for j in range(1, 21))/20
+        close, low = bar['close'], bar['low']
+        strong = close >= ma[5] and close >= ma[10] and ma[5] > ma[10] \
+            and ma[5] > prev[5] and ma[10] > prev[10]
+        qualifies5 = close >= ma[5] and ma[5] > prev[5]
+        startup = (startup + [(day, close)])[-RULES['startup_days']:] if qualifies5 else []
+        start_signal = len(startup) == RULES['startup_days'] and close > startup[0][1]
+        was_online = bool(previous and previous['trend_online'])
+        old_strong = bool(episode and episode['has_strong'])
+        repair_confirmed, exited = False, False
+        touch = old_strong and low <= ma[10] <= bar['high'] and close >= ma[10]
+        if episode is None and (strong or start_signal):
+            episode = dict(start=day, has_strong=strong, armed20=False, above20_run=0,
+                           below5_run=0, startup_atr=atr, pullback=None, downgraded=False)
+            weak_latched = False
+        if episode:
+            episode['above20_run'] = episode['above20_run']+1 if close >= ma[20] else 0
+            if episode['above20_run'] >= RULES['ma20_arm_days']:
+                episode['armed20'] = True
+            if episode['armed20'] and close < ma[20]:
+                last_reason, exited = '收盘跌破已建立的20日支撑', True
+            elif not episode['has_strong']:
+                episode['below5_run'] = episode['below5_run']+1 if close < ma[5] else 0
+                if (episode['below5_run'] >= 2 or
+                        close < ma[5]-RULES['startup_failure_atr']*episode['startup_atr']):
+                    last_reason, exited = '沿5日线启动条件失效', True
+            if not exited:
+                if strong:
+                    episode['has_strong'] = True
+                p = episode['pullback']
+                # 新入场当日不能称为既有趋势回踩；上日ATR必须可用。
+                trigger = old_strong and (touch or close < ma[5] or close < ma[10])
+                if p is None and trigger and previous and previous['atr20'] > 0:
+                    p = dict(start=day, atr=previous['atr20'], atr_asof=previous['asof'],
+                             first_break=None, first_break_index=None, reclaim_run=0)
+                    episode['pullback'] = p
+                if p:
+                    gap = (ma[10]-close)/p['atr']
+                    if close < ma[10]:
+                        p['reclaim_run'] = 0
+                        if p['first_break'] is None:
+                            p['first_break'], p['first_break_index'] = day, day_index
+                        elapsed = day_index-p['first_break_index']+1
+                        failed = gap > RULES['failure_atr'] or elapsed > RULES['break_buffer_days']
+                        if failed:
+                            last_reason = '10日支撑失效：'+('跌破超过1ATR' if gap > RULES['failure_atr'] else '第三个交易日仍未收复')
+                            if episode['armed20']:
+                                episode['downgraded'] = True
+                            else:
+                                exited = True
+                    else:
+                        p['reclaim_run'] += 1
+                        if strong or p['reclaim_run'] >= RULES['reclaim_days']:
+                            repair_confirmed = bool(p['first_break'] or episode['downgraded'])
+                            episode['pullback'] = None
+                            episode['downgraded'] = False
+                            # 当天触线仍展示位置标签，但已完成修复，不延续失守计时。
+            if exited:
+                last_exit, weak_latched = day, True
+                episode, startup = None, []
+        p = episode['pullback'] if episode else None
+        gap = (ma[10]-close)/p['atr'] if p else None
+        below_days = day_index-p['first_break_index']+1 if p and p['first_break_index'] is not None else 0
+        downgraded = bool(episode and episode['downgraded'])
+        strong_now = bool(episode and strong and not downgraded)
+        pullback = bool(episode and episode['has_strong'] and not downgraded and (p or touch or repair_confirmed))
+        kind = None
+        if episode and (p or touch):
+            wick_atr = p['atr'] if p else previous['atr20']
+            if close < ma[10]:
+                kind = '浅破待收复' if gap <= RULES['shallow_atr'] else '深回踩警戒'
+            elif p and p['first_break']:
+                kind = '回踩修复'
+            elif touch:
+                kind = '深探收回' if ma[10]-low > RULES['deep_wick_atr']*wick_atr else '触及MA10收回'
+            else:
+                kind = '趋势回踩'
+        if repair_confirmed:
+            kind = '修复已确认'
+        state = ('趋势转弱' if weak_latched and not episode else
+                 '20日支撑观察' if downgraded else
+                 '强势推进' if strong_now else
+                 kind if pullback else
+                 '启动观察' if episode and not episode['has_strong'] else
+                 '趋势保持' if episode else '暂未入选')
+        out = dict(asof=day, close=close, low=low, ma5=ma[5], ma10=ma[10], ma20=ma[20],
+                   ma5_prev=prev[5], ma10_prev=prev[10], ma20_prev=prev[20], atr20=atr,
+                   advance_signal=strong, strong_advance=strong_now,
+                   trend_online=bool(episode and episode['has_strong'] and not downgraded),
+                   previous_online=was_online, initial_strength=bool(episode and strong and not old_strong),
+                   startup=bool(episode and not episode['has_strong']), observing=bool(episode),
+                   priority_observation=bool(episode and not downgraded),
+                   support_observation=downgraded, weak=bool(weak_latched and not episode),
+                   weakening=bool(downgraded or weak_latched and not episode),
+                   pullback=pullback, pullback_kind=kind, repair_confirmed=repair_confirmed,
+                   state=state, episode_start=episode['start'] if episode else None,
+                   ma20_support_established=bool(episode and episode['armed20']),
+                   stage='20日支撑已建立' if episode and episode['armed20'] else '恢复阶段',
+                   pullback_start=p['start'] if p else None, pullback_atr=p['atr'] if p else None,
+                   pullback_atr_asof=p['atr_asof'] if p else None,
+                   first_ma10_break=p['first_break'] if p else None, ma10_break_days=below_days,
+                   buffer_days_left=max(0, RULES['break_buffer_days']-below_days) if p and below_days else None,
+                   reclaim_days=p['reclaim_run'] if p else 0, ma10_gap_fixed_atr=gap,
+                   exit_date=last_exit, risk_reason=last_reason if downgraded or weak_latched and not episode else None,
+                   replay_start=history_start)
+        previous = out
+    return out
+
+
+def connect(path=None):
+    conn = sqlite3.connect(path or config.KLINE_DB, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS board_kline(
+        board TEXT,date TEXT,open REAL,close REAL,high REAL,low REAL,
+        volume REAL,amount REAL,PRIMARY KEY(board,date))""")
+    # 与原始日线分开记录逐根来源，旧无来源记录不进入判断。
+    conn.execute("""CREATE TABLE IF NOT EXISTS board_bar_source(
+        board TEXT,date TEXT,source TEXT,priority INTEGER,observed_at TEXT,
+        PRIMARY KEY(board,date))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS board_fetch_state(
+        board TEXT PRIMARY KEY,name TEXT,target TEXT,checked REAL,error TEXT)""")
+    conn.commit()
+    return conn
+
+
+def valid(bar):
+    try:
+        datetime.strptime(bar["date"], "%Y-%m-%d")
+        values = [float(bar[k]) for k in KEYS[1:]]
+        return (all(math.isfinite(v) for v in values)
+                and min(values[:4]) > 0 and min(values[4:]) >= 0
+                and bar["low"] <= min(bar["open"], bar["close"])
+                <= max(bar["open"], bar["close"]) <= bar["high"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def save(code, bars, source="last.js", path=None):
+    """按代码/日期增量合并；年度源优先，旧响应无法删除较新的日期。"""
+    priority = 1 if source == "last.js" else 2
+    now = datetime.now().isoformat(timespec="seconds")
+    today = now[:10]
+    closed = datetime.now().hour * 60 + datetime.now().minute >= 15 * 60 + 5
+    with connect(path) as conn:
+        for bar in bars:
+            if not valid(bar) or bar["date"] > today or (bar["date"] == today and not closed):
+                continue
+            previous = conn.execute("SELECT priority FROM board_bar_source WHERE board=? AND date=?",
+                                    (str(code), bar["date"])).fetchone()
+            if previous and previous[0] > priority:
+                continue
+            conn.execute("INSERT OR REPLACE INTO board_kline VALUES(?,?,?,?,?,?,?,?)",
+                         (str(code), *(bar[k] for k in KEYS)))
+            conn.execute("INSERT OR REPLACE INTO board_bar_source VALUES(?,?,?,?,?)",
+                         (str(code), bar["date"], source, priority, now))
+    conn.close()
+
+
+def load(code, path=None):
+    with connect(path) as conn:
+        rows = conn.execute("""SELECT b.date,b.open,b.close,b.high,b.low,b.volume,b.amount
+            FROM board_kline b JOIN board_bar_source s ON b.board=s.board AND b.date=s.date
+            WHERE b.board=? ORDER BY b.date""", (str(code),)).fetchall()
+    conn.close()
+    return [dict(zip(KEYS, row)) for row in rows]
+
+
+def calendar_from_db(asof, path=None, snapshot=None):
+    with sqlite3.connect(path or config.KLINE_DB, timeout=30) as conn:
+        counts = conn.execute("SELECT date,COUNT(*) FROM kline WHERE date<=? GROUP BY date ORDER BY date", (asof,)).fetchall()
+    conn.close()
+    threshold = max((n for _, n in counts), default=0) * .5
+    calendar = [d for d, n in counts if n >= threshold]
+    # quick收盘使用有效收市报价补出的完成K在内存中；模型已核验的信号日
+    # 可能尚未写入股票历史库。沿用模型日期，不凭自然日推算交易日。
+    rows = (snapshot or {}).get("stocks") or []
+    if rows and sum(s.get("signal_date") == asof for s in rows) >= len(rows)*.6:
+        calendar = sorted(set(calendar + [asof]))
+    return calendar
+
+
+def calculate(bars, calendar, asof):
+    return scan_cache.cached('board_replay', str(bars[0] if bars else ''),
+        [scan_cache.rules('board_trend.py', 'config.py'), bars, calendar, asof, RULES],
+        lambda: _calculate(bars, calendar, asof))
+
+
+def _calculate(bars, calendar, asof):
+    calendar = sorted(set(d for d in calendar if d <= asof))
+    # 重复日期、非交易日、未完成当日均不允许污染窗口。
+    by_date = {b["date"]: b for b in bars if valid(b) and b["date"] in calendar}
+    wanted = calendar[-WINDOW:]
+    dates = sorted(by_date)
+    result = dict(version=VERSION, asof=dates[-1] if dates else None,
+                  expected_asof=asof, usable_bars=len(dates), ready=False,
+                  state="待核验", trend_online=None, initial_strength=None,
+                  weakening=None, pullback=None)
+    if not calendar or calendar[-1] != asof or len(wanted) < WINDOW:
+        result["reason"] = "共同交易日历不足22日或未对齐"
+        return result
+    missing = [d for d in wanted if d not in by_date]
+    if missing:
+        result.update(reason="最新完成日线缺失" if asof in missing else "历史窗口有缺口",
+                      missing_dates=missing)
+        return result
+    closes = [by_date[d]['close'] for d in wanted]
+    result.update(replay(list(by_date.values()), calendar))
+    atr, ma10 = result['atr20'], result['ma10']
+    result.update(ready=True, reason=None,
+                  ma10_distance_atr=(closes[-1]-ma10)/atr if atr > 0 else None,
+                  ma10_distance_pct=(closes[-1]/ma10-1)*100,
+                  ret1=(closes[-1]/closes[-2]-1)*100,
+                  ret5=(closes[-1]/closes[-6]-1)*100,
+                  ret20=(closes[-1]/closes[-21]-1)*100)
+    return result
+
+
+def parse_year(code, year):
+    url = f"http://d.10jqka.com.cn/v6/line/bk_{code}/01/{year}.js"
+    raw = datafeed.http_get(url, headers={"Referer": "http://q.10jqka.com.cn/"},
+                            encoding="gbk", timeout=8, retry=0)
+    match = re.search(r"\((.*)\)\s*;?\s*$", raw.strip(), re.S)
+    obj = json.loads(match.group(1)) if match else {}
+    rows = []
+    for item in (obj.get("data") or "").split(";"):
+        p = item.split(",")
+        if len(p) < 7:
+            continue
+        try:
+            d = p[0]
+            d = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d
+            bar = dict(zip(KEYS, [d, float(p[1]), float(p[4]), float(p[2]), float(p[3]),
+                                 float(p[5] or 0), float(p[6] or 0)]))
+            if valid(bar) and d.startswith(str(year)):
+                rows.append(bar)
+        except ValueError:
+            continue
+    return obj.get("name"), rows
+
+
+def observe(code, name, calendar, asof, fetch=True, path=None):
+    bars = load(code, path)
+    result = calculate(bars, calendar, asof)
+    if result["ready"] or not fetch or result.get("reason") == "共同交易日历不足22日或未对齐":
+        return result
+    with connect(path) as conn:
+        last = conn.execute("SELECT name,target,checked,error FROM board_fetch_state WHERE board=?", (str(code),)).fetchone()
+    conn.close()
+    # 失败/缺口也记录，避免每轮重复补拉。下一次5分钟扫描可重试。
+    if last and last[0] == name and last[1] == asof and time.time()-last[2] < 300:
+        result["fetch_error"] = last[3]
+        return result
+    error = None
+    try:
+        if not bars:
+            returned, rows = datafeed.fetch_ths_board_kline(code)
+            if returned != name:
+                raise ValueError(f"指数名称未对齐：{returned!r} / {name!r}")
+            save(code, rows, path=path)
+        if not calculate(load(code, path), calendar, asof)["ready"]:
+            # 跨年窗口先补前一年，再补当年。年度接口无name时以已核验目录代码绑定。
+            years = sorted(set(d[:4] for d in calendar[-WINDOW:]))
+            for year in years:
+                returned, rows = parse_year(code, year)
+                if returned and returned != name:
+                    raise ValueError(f"年度指数名称未对齐：{returned!r} / {name!r}")
+                save(code, rows, source=year+".js", path=path)
+    except Exception as exc:
+        error = str(exc)
+    with connect(path) as conn:
+        conn.execute("INSERT OR REPLACE INTO board_fetch_state VALUES(?,?,?,?,?)",
+                     (str(code), name, asof, time.time(), error))
+    conn.close()
+    result = calculate(load(code, path), calendar, asof)
+    result["fetch_error"] = error
+    return result
+
+
+def identities():
+    """只使用同花顺目录的精确同名映射；行业不映射到上位行业。"""
+    result = {}
+    try:
+        for code, name in datafeed.scan_ths_boards().items():
+            if datafeed._theme_ok(name):
+                result["theme:"+name] = str(code)
+    except (OSError, ValueError, RuntimeError):
+        pass
+    try:
+        blob = json.loads(config.THS_INDUSTRY_CACHE.read_text(encoding="utf-8"))
+        for code, name in (blob.get("detail") or {}).items():
+            # thshy目录中的881xxx同时是本源行业指数代码。
+            if re.fullmatch(r"881\d{3}", str(code)):
+                result["industry:"+name] = str(code)
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def current_observation(daily, bars, calendar, quote, now, session, previous=None):
+    """完成日线作背景，当前报价作判断；不写入完成K、不累计盘中确认天数。"""
+    import board_quote
+    pending = dict(ready=False, state='指数待更新', mode='current',
+                   quote_at=quote.get('quote_at'), history_asof=daily.get('asof'))
+    if not daily.get('ready'):
+        return dict(pending, reason=daily.get('reason') or '指数历史尚未对齐')
+    error = board_quote.freshness(quote, now, session)
+    if error:
+        return dict(pending, reason=error)
+    if quote.get('code') != daily.get('code') or quote.get('name') != daily.get('name'):
+        return dict(pending, reason='报价代码或名称与历史指数不一致')
+    day = quote['date']
+    days = [d for d in calendar if d < day]
+    history = {b['date']: b for b in bars if valid(b) and b['date'] in days}
+    base = calculate(list(history.values()), days, days[-1]) if days else {}
+    if not base.get('ready') or daily['asof'] not in (days[-1], day):
+        return dict(pending, reason='报价前一完成交易日窗口未对齐')
+    # 同代码、同源原始指数，昨收仅允许原值小数精度差，不能靠百分比近似证明可比。
+    if abs(quote['previous_close']-base['close']) > .01:
+        return dict(pending, reason='指数报价昨收与前一完成日收盘不一致')
+    cs = [history[d]['close'] for d in days[-22:]]
+    price = quote['price']
+    prior = previous or {}
+    same_observation = (prior.get('ready') and prior.get('mode') == 'current'
+        and prior.get('version') == VERSION and prior.get('code') == daily['code']
+        and prior.get('asof') == day and prior.get('history_asof') == daily['asof']
+        and prior.get('quote_at', '') <= quote['quote_at'])
+    seen_strong = bool(same_observation and prior.get('intraday_has_strong'))
+    ma = {n: sum((cs+[price])[-n:])/n for n in (5, 10, 20)}
+    strong = price >= ma[5] and price >= ma[10] and ma[5] > ma[10] \
+        and ma[5] > base['ma5'] and ma[10] > base['ma10']
+    startup = all(cs[j] >= sum(cs[j-4:j+1])/5
+                  and sum(cs[j-4:j+1])/5 > sum(cs[j-5:j])/5 for j in (len(cs)-2, len(cs)-1)) \
+        and price >= ma[5] and ma[5] > base['ma5'] and price > cs[-2]
+    atr = base.get('pullback_atr') or (prior.get('intraday_pullback_atr') if same_observation else None) or base['atr20']
+    gap = (ma[10]-price)/atr if atr > 0 else 0
+    armed = base['ma20_support_established']
+    online = base['trend_online'] or base['support_observation'] or seen_strong
+    weak, support, pullback, observing = False, False, False, False
+    reason, kind = None, None
+    if armed and price < ma[20]:
+        state, weak, reason = '趋势转弱', True, '当前指数跌破已建立的20日支撑'
+    elif strong:
+        state, observing = '强势推进', True
+    elif online:
+        observing = True
+        elapsed = base['ma10_break_days']+1 if base.get('first_ma10_break') else 1
+        if price < ma[10]:
+            if gap > RULES['failure_atr'] or elapsed > RULES['break_buffer_days']:
+                reason = '当前跌破10日线超过固定1ATR' if gap > RULES['failure_atr'] else '第三个交易日仍未收复10日线'
+                if armed:
+                    state, support = '20日支撑观察', True
+                else:
+                    state, weak, observing = '趋势转弱', True, False
+            else:
+                state = '浅破待收复' if gap <= RULES['shallow_atr'] else '深回踩警戒'
+                kind, pullback = state, True
+        elif base.get('first_ma10_break') or base['support_observation']:
+            # 本日尚未收盘，不能把多个盘中采集算成第二个完成日。
+            state, kind, pullback = '回踩修复', '修复待收盘', True
+            support = base['support_observation']
+        elif quote['sampled_low'] <= ma[10]:
+            kind = '深探收回' if (ma[10]-quote['sampled_low'])/atr > RULES['deep_wick_atr'] else '触及MA10收回'
+            state, pullback = kind, True
+        elif price < ma[5]:
+            state, kind, pullback = '趋势回踩', '趋势回踩', True
+        else:
+            state = '趋势保持'
+    elif base['startup']:
+        if price < ma[5] and ((ma[5]-price)/atr > RULES['startup_failure_atr'] or base['close'] < base['ma5']):
+            state, weak, reason = '趋势转弱', True, '当前沿5日线启动条件失效'
+        else:
+            state, observing = '启动观察', True
+    elif startup:
+        state, observing = '启动观察', True
+    elif base['weak'] and price < ma[5] and price < ma[10]:
+        state, weak, reason = '趋势转弱', True, '当前仍在5日、10日线下方'
+    else:
+        state = '修复观察' if base['weak'] and price >= ma[5] else '暂未入选'
+    confirmed = daily['asof'] == day and abs(daily['close']-price) <= .01
+    if confirmed:
+        return dict(daily, mode='current', history_asof=daily['asof'],
+                    quote_at=quote['quote_at'], source=quote['source'],
+                    price_basis=quote['price_basis'], change_pct=quote['change_pct'],
+                    confirmation='收盘确认', fetch_error=quote.get('fetch_error'))
+    result = dict(base, ready=True, mode='current', state=state, asof=day,
+        history_asof=daily['asof'], quote_at=quote['quote_at'], source=quote['source'],
+        price_basis=quote['price_basis'], close=price, low=quote['sampled_low'],
+        low_basis='分时采样最低价，仅证明已观察到的触线，不代表完整日内最低价',
+        code=daily['code'], name=daily['name'], change_pct=quote['change_pct'], ma5=ma[5], ma10=ma[10], ma20=ma[20],
+        ma5_prev=base['ma5'], ma10_prev=base['ma10'], ma20_prev=base['ma20'],
+        atr20=base['atr20'], atr_asof=base['asof'],
+        ma10_distance_atr=(price-ma[10])/base['atr20'] if base['atr20'] > 0 else None,
+        ma10_distance_pct=(price/ma[10]-1)*100,
+        ret1=quote['change_pct'], ret5=(price/cs[-5]-1)*100, ret20=(price/cs[-20]-1)*100,
+        advance_signal=strong, strong_advance=strong and not weak,
+        startup=observing and state=='启动观察', observing=observing,
+        priority_observation=observing and not support,
+        support_observation=support, weak=weak, weakening=weak or support,
+        trend_online=observing and (strong or online) and not support,
+        pullback=pullback, pullback_kind=kind, risk_reason=reason,
+        ma20_support_established=armed and observing,
+        confirmation='午间观察' if session=='午间休市' else '收盘观察' if session=='已收盘' else '竞价观察' if session in ('集合竞价','竞价结束') else '盘中观察',
+        repair_confirmed=False, repair_pending=bool(base.get('first_ma10_break') and price>=ma[10]),
+        intraday_has_strong=bool(strong or seen_strong) and not weak,
+        intraday_pullback_atr=atr if pullback else (prior.get('intraday_pullback_atr') if same_observation else None),
+        fetch_error=quote.get('fetch_error'))
+    if pullback:
+        result.update(pullback_atr=atr, pullback_atr_asof=base.get('pullback_atr_asof') or base['asof'],
+                      pullback_start=base.get('pullback_start') or day,
+                      ma10_gap_fixed_atr=gap)
+    return result
+
+
+def attach(snapshot, calendar=None, fetch=True, path=None, quote_fetch=None, previous_snapshot=None):
+    asof = (snapshot.get("strength_model") or {}).get("asof")
+    if not asof:
+        return {}
+    if calendar is None:
+        saved = (snapshot.get("board_trend_model") or {}).get("calendar") or []
+        # 第一版仅存22日，不能重建更早的回踩起点；升级时重新取完整日历。
+        same_version = (snapshot.get('board_trend_model') or {}).get('version') == VERSION
+        calendar = saved if same_version and saved and saved[-1] == asof else calendar_from_db(asof, path, snapshot)
+    else:
+        # 盘中股票计算可能只传最近160根；历史库保留更早的真实交易日，
+        # 不能让每天滚动的窗口截断一段尚未结束的回踩起点。
+        try:
+            historical = calendar_from_db(asof, path, snapshot)
+        except sqlite3.OperationalError as exc:
+            if 'no such table: kline' not in str(exc):
+                raise
+            historical = []  # 独立测试库可只提供已核验的显式日历。
+        calendar = sorted(set(calendar) | set(historical))
+    mapping = identities()
+    boards = snapshot.get("board_catalog") or []
+    candidates = [b for b in boards if b["id"] in mapping]
+
+    def work(board):
+        code = mapping[board["id"]]
+        try:
+            state = observe(code, board["name"], calendar, asof, fetch=fetch, path=path)
+        except (sqlite3.Error, ValueError, OSError) as exc:
+            state = dict(ready=False, state="待核验", reason=str(exc), expected_asof=asof)
+        state.update(code=code, name=board['name'], source="同花顺概念指数（含非主板成员）" if board["type"] == "theme"
+                     else "同花顺行业指数（与当前行业精确同名）")
+        board["index_trend"] = state
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(work, candidates))
+    import board_quote
+    quote_fetch = fetch if quote_fetch is None else quote_fetch
+    # 页面离线生成保持同一快照的报价和计算结果，不另取一批报价混入。
+    saved_model = snapshot.get('board_trend_model') or {}
+    reuse = not quote_fetch and saved_model.get('version') == VERSION and saved_model.get('captured_at')
+    if quote_fetch:
+        quotes = board_quote.fetch(mapping[b['id']] for b in candidates)
+        now = datetime.now()
+    else:
+        quotes = {}
+        try:
+            now = datetime.fromisoformat(str(snapshot.get('quote_capture_at') or snapshot.get('generated_at')))
+        except ValueError:
+            now = datetime.now()  # 缺少快照时钟时仍无报价，不能产生当日结论。
+    # 请求可跨越11:30/13:00边界；指数阶段以完成采集时的时钟为准。
+    session = datafeed.session_label(now) if quote_fetch else saved_model.get('phase') if reuse else snapshot.get('session')
+    session = session or datafeed.session_label(now)
+    previous_boards = {b['id']: b for b in (previous_snapshot or {}).get('board_catalog') or []}
+    for board in candidates:
+        if reuse and board.get('index_current') is not None:
+            continue
+        if session in ('盘前', '非交易日'):
+            board['index_current'] = dict(board['index_trend'], mode='completed', confirmation='最近收盘')
+        else:
+            code = mapping[board['id']]
+            board['index_current'] = current_observation(board['index_trend'], load(code, path),
+                calendar, quotes.get(code) or {}, now, session,
+                (previous_boards.get(board['id']) or {}).get('index_current'))
+            board['index_quote'] = quotes.get(code) or {}
+    for board in boards:
+        if board["id"] not in mapping:
+            board["index_trend"] = None
+            board['index_current'] = None
+        board["member_diffusion"] = bool(board.get("ranking_eligible") and
+                                         board.get("trend_state") == "持续扩散")
+    model = dict(version=VERSION, asof=asof, mapped=len(candidates),
+                 calendar=sorted(set(d for d in calendar if d <= asof)),
+                 ready=sum(bool((b.get("index_trend") or {}).get("ready")) for b in boards),
+                 member_only=len(boards)-len(candidates),
+                 pending=sum(not (b.get("index_trend") or {}).get("ready") for b in candidates),
+                 trend_online=sum(bool((b.get("index_trend") or {}).get("trend_online")) for b in boards),
+                 source="同花顺最新指数报价结合完成日线；本地按日期增量保存",
+                 captured_at=saved_model['captured_at'] if reuse else now.isoformat(sep=' ', timespec='seconds'),
+                 phase=session,
+                 current_ready=sum(bool((b.get('index_current') or {}).get('ready')) for b in candidates),
+                 current_pending=sum(not (b.get('index_current') or {}).get('ready') for b in candidates),
+                 judgment_basis='当前主标签及筛选使用当日有效指数报价+滚动MA5/10/20；完成日线仅作背景，盘中不累计收盘确认天数',
+                 criterion="强势推进：收盘≥MA5和MA10，MA5>MA10，MA5和MA10均较前日上升；启动观察：连续3日守MA5且MA5逐日上升、末日收盘高于首日",
+                 rules=dict(RULES),
+                 atr_basis="20个含跳空TR的简单平均；最新22日连续对齐，完整历史逐日重放",
+                 pullback_criterion="既有强势背景；回踩固定前日ATR，浅破≤0.3ATR缓冲2日，破位>1ATR或第三日仍失守则降级；连续2日守MA10或重新满足强势推进才确认修复",
+                 exit_criterion="本段观察连续2日站上MA20后才建立最终支撑，后续收盘跌破即退出；尚未建立MA20支撑时允许沿MA5启动",
+                 breadth_basis="当前有效主板成员的近3日趋势比例；非历史全市场成分回测")
+    snapshot["board_trend_model"] = model
+    return model

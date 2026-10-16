@@ -1,0 +1,43 @@
+--- test_board_latest.py.before
++++ test_board_latest.py
+@@ -216,6 +216,40 @@
+                 Q.fetch(['881281'],Path(tmp)/'q.json')
+             self.assertEqual(get.call_count,1)
+ 
++    def test_future_cache_cannot_block_valid_early_quote(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            p=Path(tmp)/'q.json'
++            future=Q.parse(self.raw('1500',140))['881281']
++            p.write_text(json.dumps({'quotes':{'881281':future}}),encoding='utf-8')
++            with patch.object(Q.datafeed,'http_get',return_value=self.raw()) as get:
++                result=Q.fetch(['881281'],p)['881281']
++            self.assertEqual(result['quote_at'],'2026-10-09 10:05:00')
++            self.assertNotIn('fetch_error',result)
++            self.assertEqual(get.call_count,1)
++
++    def test_future_response_never_replaces_good_cache(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            p=Path(tmp)/'q.json'
++            with patch.object(Q.datafeed,'http_get',return_value=self.raw()):
++                first=Q.fetch(['881281'],p)['881281']
++            with patch.object(Q.datafeed,'http_get',return_value=self.raw('1500',140)) as get:
++                result=Q.fetch(['881281'],p)['881281']
++            self.assertEqual(result['quote_at'],first['quote_at'])
++            self.assertEqual(result['fetch_error'],'指数报价时间超前')
++            self.assertEqual(get.call_count,1)
++            self.assertEqual(json.loads(p.read_text())['quotes']['881281']['quote_at'],first['quote_at'])
++
++    def test_invalid_clock_cache_is_evicted_even_on_network_failure(self):
++        for at in ('1200','0929','1500'):
++            with self.subTest(at=at), tempfile.TemporaryDirectory() as tmp:
++                p=Path(tmp)/'q.json'
++                q=Q.parse(self.raw(at,140))['881281'] if at!='0929' else dict(Q.parse(self.raw())['881281'],quote_at='2026-10-09 09:29:00')
++                p.write_text(json.dumps({'quotes':{'881281':q}}),encoding='utf-8')
++                with patch.object(Q.datafeed,'http_get',side_effect=OSError('offline')):
++                    result=Q.fetch(['881281'],p)['881281']
++                self.assertNotIn('quote_at',result)
++                self.assertEqual(json.loads(p.read_text())['quotes'],{})
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

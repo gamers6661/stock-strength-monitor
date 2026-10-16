@@ -1,0 +1,65 @@
+--- before/test_radar_acceptance.py
++++ test_radar_acceptance.py
+@@ -0,0 +1,62 @@
++import csv
++import io
++import json
++import re
++import subprocess
++import unittest
++from pathlib import Path
++
++import config
++import ui_payload
++
++
++class RadarAcceptanceTests(unittest.TestCase):
++    def run_js(self,model,action='renderRadar();'):
++        template=(config.ROOT/'dashboard_template.html').read_text(encoding='utf-8')
++        formats=template[template.index('function fmt('):template.index('/* 成交额格式化')]
++        script="""const fs=require('fs'),vm=require('vm');const els={};
++        const ctx={DATA:{radar_opportunity:MODEL,ui_generation:'same-version'},document:{getElementById(id){return els[id]||(els[id]={innerHTML:'',style:{},parentElement:{style:{}}});}},esc:v=>String(v),jsq:v=>String(v),renderDailyRadar:()=>{},radarItems:()=>[]};
++        vm.createContext(ctx);vm.runInContext(FORMATS,ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);
++        vm.runInContext(ACTION,ctx);console.log(JSON.stringify({view:ctx.RADAR_VIEW,sub:(els['rad-sub']||{}).innerHTML,body:(els['radar-opportunities']||{}).innerHTML,formats:[ctx.fmt(null),ctx.pct(null),ctx.fmt(0),ctx.pct(0)],csv:ctx.radarCloseCSVText()}));"""
++        script=script.replace('MODEL',json.dumps(model,ensure_ascii=False)).replace('FORMATS',json.dumps(formats)).replace('ACTION',json.dumps(action))
++        result=subprocess.run(['node','-e',script],cwd=config.ROOT,capture_output=True,text=True,encoding='utf-8',check=True)
++        return json.loads(result.stdout)
++
++    def model(self):
++        row=dict(code='600000',name='示例',labels=['突破启动'],status='竞价观察',R0=3,E0=None,live_attack_score=None,boards=[])
++        return dict(version='V1',phase='集合竞价',presentation=dict(default_view='follow',current_empty_message='当前非连续竞价，尚未进入确认时段'),market=dict(enabled=False,reason='竞价基准尚未启用',M0=None),by_code={'600000':row},lists=dict(current=[],limited=[],pending=[],warning=['600000'],tracking=[]))
++
++    def test_null_is_unknown_and_real_zero_still_zero(self):
++        r=self.run_js(self.model())
++        self.assertEqual(r['formats'],['—','—','0.00','0.00%'])
++        self.assertIn('尚未启用',r['sub']);self.assertNotIn('覆盖',r['sub'])
++        self.assertNotIn('<td>0.00</td>',r['body']);self.assertIn('<td>—</td>',r['body'])
++
++    def test_auction_close_default_and_explicit_view_preserved(self):
++        model=self.model();r=self.run_js(model)
++        self.assertEqual(r['view'],'follow');self.assertIn('竞价预警',r['body'])
++        r=self.run_js(model,"setRadarView('current');")
++        self.assertEqual(r['view'],'current');self.assertIn('尚未进入确认时段',r['body'])
++        model['presentation']['default_view']='close';model['phase']='已收盘'
++        self.assertEqual(self.run_js(model)['view'],'close')
++        model['presentation']['default_view']='follow'
++        self.assertEqual(self.run_js(model,"renderRadar();DATA.radar_opportunity.presentation.default_view='close';renderRadar();")['view'],'close')
++        self.assertEqual(self.run_js(model,"setRadarView('current');DATA.radar_opportunity.presentation.default_view='close';renderRadar();")['view'],'current')
++
++    def test_close_csv_and_list_use_same_dated_backend_row(self):
++        model=self.model();model['presentation']['default_view']='close'
++        row=dict(code='600000',name='示例',day='2026-10-12',labels=['突破启动','持续进攻'],event_count=2,R0=3.0,E0=4.0,M0=-1.0,events=[{'event_id':'a'},{'event_id':'b'}])
++        model['last_close_review']=dict(day='2026-10-12',version='V1',generated_at='2026-10-12 16:00:00',event_counts={'收盘确认':2},stock_counts={'收盘确认':1},stock_rows=[row],records=[])
++        r=self.run_js(model);self.assertIn('2项事件 / 1只去重股票',r['body'])
++        cells=list(csv.reader(io.StringIO(r['csv'].lstrip('\ufeff'))))
++        self.assertEqual(cells[1][0],'2026-10-12');self.assertEqual(cells[1][10],'same-version')
++        self.assertEqual(json.loads(cells[1][-1]),row)
++
++    def test_close_archive_survives_summary_and_compression(self):
++        full=dict(stocks=[],coverage_catalog=[],board_catalog=[],radar_opportunity=self.model())
++        full['radar_opportunity']['last_close_review']={'day':'2026-10-12','records':[{'code':'600000','checks':[{'actual':None,'passed':None}]}]}
++        brief=ui_payload.summary(full,'generation')
++        self.assertEqual(ui_payload.unpack(ui_payload.pack(brief))['radar_opportunity']['last_close_review'],full['radar_opportunity']['last_close_review'])
++
++
++if __name__=='__main__':unittest.main()

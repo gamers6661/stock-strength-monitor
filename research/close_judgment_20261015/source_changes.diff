@@ -1,0 +1,606 @@
+--- baseline/check_live_service.py
++++ check_live_service.py
+@@ -42,6 +42,11 @@
+         import ma_trend
+         assert status['code_ma_trend_hash']==status['snapshot_ma_trend_hash']==ma_trend.IMPLEMENTATION_HASH
+         ma_trend.validate(snapshot)
++        if snapshot.get('session')=='已收盘' and snapshot.get('close_daily_verified_at'):
++            assert snapshot['market_strength']['coverage']['trend_valid']>0, '收盘日线已就绪但趋势有效覆盖为零'
++            total=len(snapshot['stocks'])+len(snapshot.get('coverage_catalog',[]))
++            assert len(snapshot['ma_trend']['pending'])<total, '收盘日线已就绪但所有均线状态待核验'
++            assert snapshot['ma_trend'].get('minute_needed',0)==0, '正式收盘结果仍依赖分钟过程核验'
+     html = get(base + "/dashboard.html").decode("utf-8")
+     text_report = (config.ROOT / "snapshot_report.md").read_text(encoding="utf-8")
+     marker = "var DATA = "
+--- baseline/config.py
++++ config.py
+@@ -32,7 +32,7 @@
+     'broken_repair_pct': 3., 'broken_close_position': .7,
+ }
+ MA_TREND = {
+-    'version': 'ma-trend-2026-10-15.4',
++    'version': 'ma-trend-2026-10-15.5',
+     'origin_days': 5, 'origin_base_days': 5,
+     'impulse_day_pct': 4., 'impulse_two_day_pct': 6., 'impulse_rise_atr': 1.2,
+     'volume_ratio': 1.8, 'close_position': .75,
+@@ -54,7 +54,7 @@
+     'board_min_members': 6, 'board_min_coverage': 80.,
+ }
+ MARKET_STRENGTH = {
+-    'version': 'market-strength-2026-10-13.4',
++    'version': 'market-strength-2026-10-15.5',
+     'periods': [5, 10, 20], 'strong_min': 65, 'very_strong_min': 80, 'normal_min': 45,
+     'stock_full_returns': {5: 8, 10: 12, 20: 20},
+     'board_full_returns': {5: 5, 10: 8, 20: 12},
+--- baseline/dashboard_template.html
++++ dashboard_template.html
+@@ -1709,6 +1709,11 @@
+   var el=document.getElementById('fresh-txt'), dot=document.getElementById('fresh-dot');
+   var im=(DATA&&DATA.intraday_model)||{}, auctionOnly=DATA&&['集合竞价','竞价结束'].indexOf(DATA.session)>=0;
+   var stamp=(auctionOnly?im.auction_latest_quote_at:im.latest_valid_quote_at)||'';
++  var closed=(DATA&&DATA.market_strength||{}).close_verification||{},closeDay=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
++  if(DATA.session==='已收盘'&&sessionNow()==='已收盘'&&closed.date===closeDay&&closed.verified>0){
++    el.textContent=(location.protocol==='file:'?'静态快照 · ':'')+'正式收盘已核验 · 日线截至 '+closed.date+' · 实际源时间 '+closed.source_at;
++    dot.style.background='#8e8e93';dot.style.boxShadow='none';return;
++  }
+   if(!stamp){
+     (DATA&&DATA.stocks||[]).concat(DATA&&DATA.coverage_catalog||[]).forEach(function(s){
+       if(s.intraday_quote_fresh===true&&s.intraday_quote_at&&(!stamp||s.intraday_quote_at>stamp))stamp=s.intraday_quote_at;});
+--- baseline/emotion_relay.py
++++ emotion_relay.py
+@@ -4,9 +4,9 @@
+ from datetime import datetime,timedelta
+ from pathlib import Path
+ from statistics import median,mean
+-import config,intraday,market_strength as M,relay_data as D,relay_history as H,relay_regulation as R,relay_cycles as C,relay_pools as W
++import config,intraday,market_strength as M,relay_data as D,relay_history as H,relay_regulation as R,relay_cycles as C,relay_pools as W,closing_price
+ P=config.EMOTION_RELAY;VERSION=P['version']
+-IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(D.__file__).read_bytes()+Path(H.__file__).read_bytes()+Path(R.__file__).read_bytes()+Path(C.__file__).read_bytes()+Path(W.__file__).read_bytes()+json.dumps(P,sort_keys=True).encode()).hexdigest()
++IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(D.__file__).read_bytes()+Path(H.__file__).read_bytes()+Path(R.__file__).read_bytes()+Path(C.__file__).read_bytes()+Path(W.__file__).read_bytes()+Path(closing_price.__file__).read_bytes()+json.dumps(P,sort_keys=True).encode()).hexdigest()
+ 
+ def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+ def pct(n,d):return round(100*n/d,2) if d else None
+--- baseline/ma_trend.py
++++ ma_trend.py
+@@ -9,10 +9,11 @@
+ 
+ import config
+ import intraday
++import closing_price
+ 
+ P = config.MA_TREND
+ VERSION = P['version']
+-IMPLEMENTATION_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('board_stock_rank.py').read_bytes() + json.dumps(P,sort_keys=True).encode()).hexdigest()
++IMPLEMENTATION_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('board_stock_rank.py').read_bytes() + Path(closing_price.__file__).read_bytes() + json.dumps(P,sort_keys=True).encode()).hexdigest()
+ LABELS = {5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'}
+ _DAILY_CACHE = {}
+ 
+@@ -424,14 +425,15 @@
+     return out
+ 
+ 
+-def live(row,q,bars,calendar,now,session,previous=None,center=None):
++def live(row,q,bars,calendar,now,session,previous=None,center=None,daily_proof=None):
+     import market_strength as M
+     code=row['code'];m=empty(code);old=previous or {};day=now.date().isoformat()
+-    if old.get('version')==VERSION and old.get('candidate_mode') and (old.get('tracking') or {}).get('exit_at'):
++    formal=session=='已收盘' and (bool(daily_proof) or (row.get('market_strength') or {}).get('mode')=='正式收盘')
++    if not formal and old.get('version')==VERSION and old.get('candidate_mode') and (old.get('tracking') or {}).get('exit_at'):
+         m.update(candidate_mode=True,recovery_candidate=copy.deepcopy(old.get('recovery_candidate')),
+                  tracking=copy.deepcopy(old['tracking']),exit_at=old.get('exit_at'))
+     # Quote gaps must not erase a verified downgrade or a failed wave/platform.
+-    if old.get('version')==VERSION and old.get('stage') in LABELS and ((old.get('tracking') or {}).get('exit_at') or (old.get('tracking') or {}).get('transitions')):
++    if not formal and old.get('version')==VERSION and old.get('stage') in LABELS and ((old.get('tracking') or {}).get('exit_at') or (old.get('tracking') or {}).get('transitions')):
+         m.update(stage=old['stage'],stage_label=LABELS[old['stage']],platform=copy.deepcopy(old.get('platform') or {}),
+                  origin=copy.deepcopy(old.get('origin')),transitions=copy.deepcopy(old.get('transitions') or []),
+                  tracking=copy.deepcopy(old['tracking']),exit_at=old.get('exit_at'))
+@@ -441,7 +443,6 @@
+             m=copy.deepcopy(old);m.update(mode='参考行情 · 原时点 '+str(old.get('quote_at')),reference_only=True,eligible=False)
+         else:m.update(pending=True,reason='等待正常交易时段报价',status='待核验')
+         return m,None
+-    formal=(row.get('market_strength') or {}).get('mode')=='正式收盘'
+     native=[b for b in bars if b['date']<day or formal and b['date']==day]
+     completed=[d for d in calendar if d<day or formal and d==day]
+     if not completed or not native or native[-1]['date']!=completed[-1]:
+@@ -454,10 +455,12 @@
+     m.update(asof=setup.get('asof'),reason=setup['reason'],pending=setup['pending'])
+     if setup['pending']:m['data_reasons']=[setup['reason']];m['status']='待核验';return m,None
+     at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'),now)
+-    valid,at,error=M.quote_valid(q,now,session,center,formal)
++    valid,at,error=M.quote_valid(q,now,session,center,formal,daily_proof)
+     if not valid:
+         m.update(pending=True,status='报价待核验',reason=error,data_reasons=[error]);return m,None
+     m['quote_at']=str(at);m['price']=q.get('price');m['change_pct']=q.get('change_pct')
++    if formal:m.update(decision_at=day+' 15:00:00',judgment_basis='最终完成日线；分钟过程不覆盖收盘结论')
++    if daily_proof:m['completed_daily_proof']=copy.deepcopy(daily_proof)
+     m['valid_until']=str(at+timedelta(seconds=config.INTRADAY['max_quote_age_seconds']))
+     if session=='午间休市':m['valid_until']=day+' 13:00:00'
+     elif session=='已收盘':m['valid_until']=day+' 23:59:59'
+@@ -480,7 +483,7 @@
+             candidate.update(active=False,state='候选已过期',ended_at=day,reason='超出最近5个交易日候选窗口')
+     stage=setup.get('stage');root=setup.get('origin');platform=setup.get('platform') or {}
+     same_wave=bool(root and (old.get('origin') or {}).get('date')==root['date'])
+-    if same_wave and stage==5 and old.get('stage')==10 and (old.get('tracking') or {}).get('transitions'):
++    if not formal and same_wave and stage==5 and old.get('stage')==10 and (old.get('tracking') or {}).get('transitions'):
+         stage=10;platform=copy.deepcopy(old.get('platform') or setup.get('ma10_candidate') or {})
+     provisional=False
+     # A fresh current-price breakout can enter early without pretending volume is completed.
+@@ -504,7 +507,7 @@
+         candidate=m.get('recovery_candidate') or {}
+         if candidate.get('active'):
+             support=context['thresholds'][10]
+-            track=copy.deepcopy(old.get('tracking') or {}) if (old.get('recovery_candidate') or {}).get('date')==candidate['date'] and old.get('candidate_mode') else {}
++            track=copy.deepcopy(old.get('tracking') or {}) if not formal and (old.get('recovery_candidate') or {}).get('date')==candidate['date'] and old.get('candidate_mode') else {}
+             m.update(stage=None,stage_label='阶段待确认',status='涨停收复·新启动候选',candidate_mode=True,
+                 startup_pending=True,exit_at=None,pending=False,eligible=False,tracking=track,
+                 reason='涨停收复事件 '+candidate['date']+'；未通过独立强势入口，继续以MA10观察',
+@@ -518,7 +521,7 @@
+             if price<=support-P['break_atr']*unit or formal and price<support:
+                 route_failure(m,context,q,dict(at=m['quote_at'],reason='明显跌破候选MA10' if not formal else '正式收盘失守候选MA10'))
+                 return m,None
+-            if q.get('low',math.inf)<support:
++            if not formal and q.get('low',math.inf)<support:
+                 m['minute_needed']=True
+                 if price<support:m.update(pending=True,status='支撑失守·修复观察',reason='涨停收复候选等待MA10分钟修复核验')
+             return m,context
+@@ -526,7 +529,7 @@
+     support=platform['low'] if stage==20 else context['thresholds'][stage]
+     newly_confirmed=formal and setup.get('entry_date')==day
+     m.update(stage=stage,stage_label=LABELS[stage],origin=root,platform=platform,
+-             entry_date=setup.get('entry_date') or day,entry_at=(str(at) if newly_confirmed else
++             entry_date=setup.get('entry_date') or day,entry_at=(day+' 15:00:00' if newly_confirmed else
+                  (old.get('entry_at') if old.get('stage')==stage else None) or (str(at) if provisional else None)),
+              support_price=support,support_basis='平台底部' if stage==20 else 'MA'+str(stage)+'触线价',
+              ma_support_price=context['thresholds'][stage],ma_value=context['provisional_ma'][stage],atr20=unit,
+@@ -542,7 +545,7 @@
+                      status='完成日量价' if not provisional else '当日成交量未作完成日放量判断')
+     if (root or {}).get('volume_ratio') is None:m['data_reasons'].append('起点量能待核验；仅使用价格突破证据')
+     same_platform=stage==20 and platform.get('id')==(old.get('platform') or {}).get('id')
+-    track=copy.deepcopy(old.get('tracking') or {}) if old.get('stage')==stage and (same_platform or same_wave) else {}
++    track=copy.deepcopy(old.get('tracking') or {}) if not formal and old.get('stage')==stage and (same_platform or same_wave) else {}
+     m['tracking']=track
+     context=dict(context,support=support,setup=setup,formal=formal,
+                  ma10_platform=setup.get('ma10_candidate') or {},ma20_platform=setup.get('ma20_candidate') or {})
+@@ -559,7 +562,7 @@
+     needs=number(q.get('low')) and (q['low']<support or stage in (10,20) and
+         (q['low']<=platform.get('low',-math.inf)+P['near_atr']*unit
+          or abs(q['low']-context['provisional_ma'][stage])<=P['near_atr']*unit))
+-    if needs and not newly_confirmed:
++    if needs and not newly_confirmed and not formal:
+         m['minute_needed']=True
+     if formal and not newly_confirmed and stage in (10,20) and platform and price>=support:
+         # Only today's verified completed close can confirm a current daily rebound.
+@@ -641,6 +644,7 @@
+ 
+ 
+ def apply_minutes(m,context,q,bars):
++    if context.get('formal'):return
+     if not m.get('minute_needed'):return
+     result=minutes_status(bars,context,q,m['quote_at'],m.get('minute_observation_at',m.get('entry_at')));m['minute_evidence']=result
+     m['minute_coverage']=result.get('coverage')
+@@ -725,7 +729,7 @@
+ 
+ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,minute_data=None,fetch_minutes=True):
+     import close_monitor as C
+-    now=now or datetime.fromisoformat(snap['quote_capture_at']);day=now.date().isoformat()
++    now=closing_price.assessment_time(snap,now or datetime.fromisoformat(snap['quote_capture_at']));day=now.date().isoformat()
+     prior_meta=(previous or {}).get('ma_trend') or {}
+     prior_rows={r['code']:r.get('ma_trend') or {} for r in (previous or {}).get('stocks',[])+(previous or {}).get('coverage_catalog',[])} if prior_meta.get('implementation_hash')==IMPLEMENTATION_HASH else {}
+     models={};contexts={};rows=snap.get('stocks',[])+snap.get('coverage_catalog',[])
+@@ -743,18 +747,19 @@
+             saved_clock=intraday.parse_quote_timestamp(saved.get('quote_at') or saved.get('ts'))
+             effective[row['code']]=saved if saved_clock==clock and saved.get('price')==row.get('price') else row
+     quotes=effective
++    proofs={c:p for c,q in quotes.items() if (p:=closing_price.verify(snap,q,histories.get(c) or [],calendar,now))} if snap.get('session')=='已收盘' else {}
+     import market_strength as M
+     # Rejected after-close timestamps must not move the center away from a valid
+     # preserved closing batch. Build the clock only from individually valid input.
+     times=[]
+     for row in rows:
+         valid,clock,_=M.quote_valid(quotes.get(row['code']) or {},now,snap.get('session'),None,
+-            (row.get('market_strength') or {}).get('mode')=='正式收盘')
++            (row.get('market_strength') or {}).get('mode')=='正式收盘',proofs.get(row['code']))
+         if valid:times.append(clock)
+     times.sort()
+     center=times[len(times)//2] if times else None
+     for row in rows:
+-        code=row['code'];m,ctx=live(row,quotes.get(code) or {},histories.get(code) or [],calendar,now,snap.get('session'),prior_rows.get(code),center)
++        code=row['code'];m,ctx=live(row,quotes.get(code) or {},histories.get(code) or [],calendar,now,snap.get('session'),prior_rows.get(code),center,proofs.get(code))
+         models[code]=m;row['ma_trend']=m
+         if ctx:contexts[code]=ctx
+     # Reference-only copies can retain yesterday's minute_needed flag. They have
+--- baseline/ma_trend_ui.js
++++ ma_trend_ui.js
+@@ -55,7 +55,7 @@
+ }
+ function mtRecoveryDetail(m){var c=msRecoveryCandidate(m);if(!c)return '';return '<details class="card ma-trend-detail"><summary>涨停收复判断依据 · 本轮候选</summary><div><p>'+msRecoveryTag(m)+'</p><p>本轮收复 '+esc(c.date)+' · 第 '+c.age_sessions+' / '+c.window_sessions+' 个交易日</p><p>'+esc(c.basis)+'；事件量比 '+mtValue(c.volume_ratio)+'，独立展示。</p><p>候选MA10触线价 '+mtValue(m.support_price,4)+' · 暂态MA10 '+mtValue(m.ma_value,4)+'</p><p>'+esc(m.mode)+' · 最新核验 '+esc(m.quote_at)+' · 完成日截至 '+esc(m.asof)+'</p><p class="ms-muted">仅保留最近5个交易日内最新一轮有效候选；MA10有效失守、正式强势入口确认或窗口到期后隐藏候选标签。</p><p>'+esc(m.reason)+'</p></div></details>';}
+ function mtDetail(m){if(!m)return '';if(msRecoveryCandidate(m))return mtRecoveryDetail(m);if(m.candidate_mode)return '<details class="card ma-trend-detail"><summary>候选核验状态 · '+esc(mtSnapshotFresh(m)?m.status:'快照已过期')+'</summary><p>当前无有效涨停收复候选标签。'+esc(m.reason||'等待最新报价及支撑核验')+'</p><p class="ms-muted">源行情 '+esc(m.quote_at||'待更新')+'</p></details>';var p=mtModel().parameters,o=m.origin||{},pl=m.platform||{},rb=m.rebound||{};
+- return '<details class="card ma-trend-detail"><summary>均线趋势判断依据 · '+esc(m.stage_label)+' · '+esc(m.status)+'</summary><div><p>'+esc(m.mode)+' · 源报价 '+esc(m.quote_at||'—')+' · 完成日 '+esc(m.asof||'—')+'</p><p>'+esc(m.reason)+'</p><p>'+esc((m.events||[]).join(' / '))+'</p><p>防守依据 '+esc(m.support_basis||'—')+' · 本阶段支撑触线价 '+mtValue(m.support_price,4)+' · 暂态均线 '+mtValue(m.ma_value,4)+'</p><p>'+(mtHistorical(m)||m.candidate_mode?'历史波段起点 ':'本轮强势启动 ')+esc(o.date||'—')+' · '+esc(o.kind||'—')+' · '+esc(o.basis||'—')+'</p><p>最近强势确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+' · 实际覆盖 '+(m.history_days||'—')+' 个完成交易日（'+esc(m.history_from||'—')+' 至 '+esc(m.asof||'—')+'）</p>'+(msRecoveryCandidate(m)?'<p>'+msRecoveryTag(m)+'</p>':'')+'<p>阶段转换 '+esc((m.transitions||[]).map(function(t){return (t.at||t.date)+' MA'+t.from_stage+'→MA'+t.to_stage;}).join('；')||'暂无')+'</p><p>单日上涨 '+pctHtml(o.day_return_pct)+' / 两日 '+pctHtml(o.two_day_return_pct)+'；'+(o.rise_days||'—')+'日净上攻 '+mtValue(o.rise_atr)+' ATR（放量上攻门槛 '+p.impulse_rise_atr+'）；量比 '+mtValue(o.volume_ratio)+'（上攻 '+p.volume_ratio+' / 突破 '+p.breakout_volume_ratio+'）；收盘位置 '+mtValue(o.close_position==null?null:o.close_position*100,1)+'%</p><p>前段上涨 '+pctHtml(pl.rise_pct)+' / '+mtValue(pl.rise_atr)+' ATR；固定低点 '+mtValue(pl.base_low)+'（'+esc(pl.base_at||'—')+'）</p>'+(pl.latest_cycle?'<p>最近上涨 '+esc(pl.rise_start||pl.base_at||'—')+' → '+esc(pl.rise_end||pl.peak_date||'—')+'；整理起于 '+esc(pl.start||'—')+'；平台底部保留 '+pctHtml(pl.retained_pct)+' / '+mtValue(pl.retained_atr)+' ATR。振幅 '+mtValue(pl.width_pct)+'%（超过10%仅提示），宽度 '+mtValue(pl.width_atr)+' ATR（≤2）。</p>':'')+'<p>'+esc(pl.confirmed?'锁定平台':'承接区间（平台尚未确认）')+' '+mtValue(pl.low)+' 至 '+mtValue(pl.high)+' · 成立 '+esc(pl.formed_at||'—')+' · 最近核验 '+esc(pl.validated_at||'—')+' · 当前 '+(pl.current_days||pl.days||'—')+' 日 · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</p><p>本次底部反弹 '+mtValue(rb.distance_atr)+' ATR（门槛 '+p.rebound_atr+'） · '+esc(rb.basis||'尚无本次反弹证据')+' · '+esc(rb.at||'—')+'</p><p>MA20允许线下偏离 '+p.ma20_below_atr+' ATR与'+p.ma20_below_pct+'%取小；平台底部仍是防守位。</p><p class="ms-card-risk">失守 '+p.repair_minutes+' 个交易分钟未收回：MA5转MA10，MA10无合格MA20平台则退出，MA20平台失守退出；明显跌破 '+p.break_atr+' ATR提前退出。'+esc(m.exit_at?' 已退出：'+m.exit_at:'')+'</p>'+(m.minute_coverage?'<p>分钟来源 '+esc(m.minute_coverage.source)+' · 覆盖 '+esc(m.minute_coverage.first_at)+' 至 '+esc(m.minute_coverage.last_at)+' · '+m.minute_coverage.bars+' 条'+(m.minute_coverage.no_trade_minutes?'；累计成交量与成交额均未变化，已核验无成交 '+m.minute_coverage.no_trade_minutes+' 分钟':'')+'；对应报价 '+esc(m.minute_coverage.quote_at)+'</p>':'')+'<p class="ms-muted">'+esc((m.data_reasons||[]).join('；')||'当前必要数据已核验')+'</p><details><summary>完整阶段、支撑与分钟依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details></div></details>';
++ return '<details class="card ma-trend-detail"><summary>均线趋势判断依据 · '+esc(m.stage_label)+' · '+esc(m.status)+'</summary><div><p>'+esc(m.mode)+' · 源报价 '+esc(m.quote_at||'—')+' · 完成日 '+esc(m.asof||'—')+'</p><p>'+esc(m.reason)+'</p><p>'+esc((m.events||[]).join(' / '))+'</p><p>防守依据 '+esc(m.support_basis||'—')+' · 本阶段支撑触线价 '+mtValue(m.support_price,4)+' · 暂态均线 '+mtValue(m.ma_value,4)+'</p><p>'+(mtHistorical(m)||m.candidate_mode?'历史波段起点 ':'本轮强势启动 ')+esc(o.date||'—')+' · '+esc(o.kind||'—')+' · '+esc(o.basis||'—')+'</p><p>最近强势确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+' · 实际覆盖 '+(m.history_days||'—')+' 个完成交易日（'+esc(m.history_from||'—')+' 至 '+esc(m.asof||'—')+'）</p>'+(msRecoveryCandidate(m)?'<p>'+msRecoveryTag(m)+'</p>':'')+'<p>阶段转换 '+esc((m.transitions||[]).map(function(t){return (t.at||t.date)+' MA'+t.from_stage+'→MA'+t.to_stage;}).join('；')||'暂无')+'</p><p>单日上涨 '+pctHtml(o.day_return_pct)+' / 两日 '+pctHtml(o.two_day_return_pct)+'；'+(o.rise_days||'—')+'日净上攻 '+mtValue(o.rise_atr)+' ATR（放量上攻门槛 '+p.impulse_rise_atr+'）；量比 '+mtValue(o.volume_ratio)+'（上攻 '+p.volume_ratio+' / 突破 '+p.breakout_volume_ratio+'）；收盘位置 '+mtValue(o.close_position==null?null:o.close_position*100,1)+'%</p><p>前段上涨 '+pctHtml(pl.rise_pct)+' / '+mtValue(pl.rise_atr)+' ATR；固定低点 '+mtValue(pl.base_low)+'（'+esc(pl.base_at||'—')+'）</p>'+(pl.latest_cycle?'<p>最近上涨 '+esc(pl.rise_start||pl.base_at||'—')+' → '+esc(pl.rise_end||pl.peak_date||'—')+'；整理起于 '+esc(pl.start||'—')+'；平台底部保留 '+pctHtml(pl.retained_pct)+' / '+mtValue(pl.retained_atr)+' ATR。振幅 '+mtValue(pl.width_pct)+'%（超过10%仅提示），宽度 '+mtValue(pl.width_atr)+' ATR（≤2）。</p>':'')+'<p>'+esc(pl.confirmed?'锁定平台':'承接区间（平台尚未确认）')+' '+mtValue(pl.low)+' 至 '+mtValue(pl.high)+' · 成立 '+esc(pl.formed_at||'—')+' · 最近核验 '+esc(pl.validated_at||'—')+' · 当前 '+(pl.current_days||pl.days||'—')+' 日 · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</p><p>本次底部反弹 '+mtValue(rb.distance_atr)+' ATR（门槛 '+p.rebound_atr+'） · '+esc(rb.basis||'尚无本次反弹证据')+' · '+esc(rb.at||'—')+'</p><p>MA20允许线下偏离 '+p.ma20_below_atr+' ATR与'+p.ma20_below_pct+'%取小；平台底部仍是防守位。</p><p class="ms-card-risk">'+(m.mode==='正式收盘'?'正式收盘按最终完成日线确认阶段及支撑；MA5失守转MA10，MA10无合格MA20平台则退出，MA20平台底部失守退出。分钟过程不覆盖收盘结论。':'盘中失守 '+p.repair_minutes+' 个交易分钟未收回：MA5转MA10，MA10无合格MA20平台则退出，MA20平台失守退出；明显跌破 '+p.break_atr+' ATR提前退出。')+esc(m.exit_at?' 已退出：'+m.exit_at:'')+'</p>'+(m.minute_coverage?'<p>分钟来源 '+esc(m.minute_coverage.source)+' · 覆盖 '+esc(m.minute_coverage.first_at)+' 至 '+esc(m.minute_coverage.last_at)+' · '+m.minute_coverage.bars+' 条'+(m.minute_coverage.no_trade_minutes?'；累计成交量与成交额均未变化，已核验无成交 '+m.minute_coverage.no_trade_minutes+' 分钟':'')+'；对应报价 '+esc(m.minute_coverage.quote_at)+'</p>':'')+'<p class="ms-muted">'+esc((m.data_reasons||[]).join('；')||'当前必要数据已核验')+'</p><details><summary>完整阶段、支撑与分钟依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details></div></details>';
+ }
+ function mtOverview(){var meta=mtModel(),breadth=DATA.breadth||{},temperature=DATA.market_emotion||{},host=document.getElementById('ms-overview-host');
+  document.getElementById('hero-h1').textContent='今天重点看哪里';document.getElementById('hero-p').textContent='均线三阶段观察 · 板块同步 · 情绪参考';document.getElementById('hero-stamp').textContent=msStamp();
+--- baseline/market_strength.py
++++ market_strength.py
+@@ -12,13 +12,14 @@
+ 
+ import config
+ import intraday
++import closing_price
+ 
+ P = config.MARKET_STRENGTH
+ VERSION = P['version']
+ 
+ 
+ def implementation_hash():
+-    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('direction_changes.py').read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
++    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('direction_changes.py').read_bytes() + Path(closing_price.__file__).read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
+ 
+ 
+ IMPLEMENTATION_HASH = implementation_hash()  # fixed at process import
+@@ -281,7 +282,7 @@
+                 observations=[dict(at=str(t),return_pct=v) for t,v in ordered]+[dict(at=str(at),return_pct=r)])
+ 
+ 
+-def quote_valid(q, now, session, center, formal_close=False):
++def quote_valid(q, now, session, center, formal_close=False, completed_daily_proof=None):
+     at = intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'), now)
+     if not at:
+         return False, None, '报价时间缺失'
+@@ -295,7 +296,8 @@
+     # delayed update may survive lunch. Keep the original source timestamp.
+     morning_close = now.replace(hour=11, minute=30, second=0, microsecond=0)
+     lunch = session == '午间休市' and -config.INTRADAY['max_quote_age_seconds'] <= (at-morning_close).total_seconds() < 180
+-    closing_quote = session == '已收盘' and 900 <= minute <= 902
++    proved_close = formal_close and session=='已收盘' and closing_price.matches(completed_daily_proof,q,now)
++    closing_quote = session == '已收盘' and (900 <= minute <= 902 or proved_close)
+     if not (570 <= minute <= 690 or 780 <= minute <= 900 or lunch or closing_quote):
+         return False, at, '非连续竞价报价'
+     if session == '已收盘' and not closing_quote:
+@@ -306,25 +308,27 @@
+         return False, at, '尚无上午收市有效行情'
+     if age > config.INTRADAY['max_quote_age_seconds'] and not lunch and not (formal_close and closing_quote):
+         return False, at, '报价过期'
+-    if center and not lunch and abs((at-center).total_seconds()) > config.INTRADAY['max_quote_batch_skew_seconds']:
++    if center and not lunch and not (formal_close and closing_quote) and abs((at-center).total_seconds()) > config.INTRADAY['max_quote_batch_skew_seconds']:
+         return False, at, '报价批次时间偏差过大'
+     return True, at, None
+ 
+ 
+-def stock_scores(quotes, contexts, histories, calendar, now, session, formal_close=False, observations=None):
++def stock_scores(quotes, contexts, histories, calendar, now, session, formal_close=False, observations=None, completed_proofs=None):
++    completed_proofs=completed_proofs or {}
+     result, aligned = {}, {}
+     times = [intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'), now) for q in quotes.values()]
+     times = [at for at in times if at and at.date() == now.date() and
+              -config.INTRADAY['max_quote_future_seconds'] <= (now-at).total_seconds() <= config.INTRADAY['max_quote_age_seconds']]
+     center = sorted(times)[len(times)//2] if times else None
+     for c, q in quotes.items():
+-        valid, at, reason = quote_valid(q, now, session, center, formal_close)
++        valid, at, reason = quote_valid(q, now, session, center, formal_close,completed_proofs.get(c))
+         mode = '正式收盘' if formal_close else '午休参考' if session == '午间休市' else '连续竞价'
+         m = empty(str(at) if at else None, mode)
+         result[c] = m
+         if not valid:
+             m['data_reasons'].append(reason)
+             continue
++        if c in completed_proofs:m['completed_daily_proof']=copy.deepcopy(completed_proofs[c])
+         bars = histories.get(c) or []
+         dates = [d for d in calendar if d < now.date().isoformat()]
+         native = [b for b in bars if b['date']<now.date().isoformat()]
+@@ -366,7 +370,7 @@
+     groups = {}
+     # S0 uses every valid R0 in the same effective limit group, even if H is unavailable.
+     for c,q in quotes.items():
+-        valid, _, _ = quote_valid(q, now, session, center, formal_close)
++        valid, _, _ = quote_valid(q, now, session, center, formal_close,completed_proofs.get(c))
+         if valid and finite(q.get('change_pct')) and positive(q.get('limit_pct')):
+             groups.setdefault(q['limit_pct'], {})[c] = q['change_pct']
+     for limit, values in groups.items():
+@@ -558,7 +562,7 @@
+     return dict(at=str(at),session=saved['session'],quotes=copy.deepcopy(qs),valid_codes=list(valid),risk_flags=copy.deepcopy(saved.get('risk_flags',{})))
+ 
+ 
+-def archived_close_input(now,pool):
++def archived_close_input(now,pool,histories=None,calendar=None,snapshot=None):
+     """Recover one intact raw closing acquisition, with original source clocks."""
+     day=now.date().isoformat();path=config.CACHE_DIR/'intraday_history'/'acquisitions'/(day+'.jsonl.gz')
+     selected=None
+@@ -573,7 +577,11 @@
+                     required={'code','price','last_close','quote_at','price_basis','price_basis_source','last_close_semantics'}
+                     if not required.issubset(fields) or fields[0]!='code':continue
+                     quotes={values[0]:dict(zip(fields[1:],values[1:])) for values in record['rows'] if values[0] in pool and len(values)==len(fields)}
+-                    if sum(quote_valid(q,now,'已收盘',None,True)[0] for q in quotes.values())<len(pool)*.60:continue
++                    count=0
++                    for c,q in quotes.items():
++                        proof=closing_price.verify(snapshot,q,(histories or {}).get(c) or [],calendar or [],now) if snapshot else None
++                        count+=quote_valid(q,now,'已收盘',None,True,proof)[0]
++                    if count<len(pool)*.60:continue
+                     if selected is None or capture>intraday.parse_quote_timestamp(selected['archive_captured_at']):
+                         selected=dict(day=day,quotes=quotes,archive_captured_at=record['captured_at'])
+                 except (ValueError,TypeError,KeyError,IndexError):continue
+@@ -583,6 +591,7 @@
+ 
+ def attach(snap, quotes, pool, histories, calendar, contexts=None, now=None, previous=None):
+     now = now or datetime.fromisoformat(snap['quote_capture_at'])
++    now = closing_price.assessment_time(snap,now)
+     session = snap.get('session','')
+     rows = {str(r['code']):r for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
+     for c in pool:
+@@ -595,29 +604,34 @@
+     reference = session in ('盘前','集合竞价','竞价结束','非交易日','收盘竞价') or 897 <= now.hour*60+now.minute < 900
+     verified_at = intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
+     formal_close = (session == '已收盘' and verified_at is not None and
+-                    verified_at.date() == now.date() and verified_at.hour >= 15 and
++                    verified_at.date() == now.date() and verified_at.hour*60+verified_at.minute >= 905 and
+                     (verified_at-now).total_seconds() <= config.INTRADAY['max_quote_future_seconds'])
+     # Suppliers may update their timestamp after the market has closed. Such
+     # quotes still fail quote_valid; reuse an intact, same-day closing batch
+     # with its original source clock instead of emptying the published lists.
+     close_source = (previous or {}).get('market_strength_close_input') or {}
++    completed_proofs={c:p for c,q in qs.items() if (p:=closing_price.verify(snap,q,histories.get(c) or [],calendar,now))} if formal_close else {}
++    saved_proofs={c:p for c,q in (close_source.get('quotes') or {}).items() if c in pool and (p:=closing_price.verify(snap,q,histories.get(c) or [],calendar,now))} if formal_close and close_source.get('day')==now.date().isoformat() else {}
+     if formal_close:
+-        saved_valid=sum(quote_valid(q,now,session,None,True)[0] for c,q in (close_source.get('quotes') or {}).items() if c in pool) if close_source.get('day')==now.date().isoformat() else 0
+-        if saved_valid<len(pool)*.60 and sum(quote_valid(q,now,session,None,True)[0] for q in qs.values())<len(pool)*.60:
+-            recovered=archived_close_input(now,pool)
+-            if recovered:close_source=recovered
++        saved_valid=sum(quote_valid(q,now,session,None,True,saved_proofs.get(c))[0] for c,q in (close_source.get('quotes') or {}).items() if c in pool) if close_source.get('day')==now.date().isoformat() else 0
++        if saved_valid<len(pool)*.60 and sum(quote_valid(q,now,session,None,True,completed_proofs.get(c))[0] for c,q in qs.items())<len(pool)*.60:
++            recovered=archived_close_input(now,pool,histories,calendar,snap)
++            if recovered:
++                close_source=recovered
++                saved_proofs={c:p for c,q in recovered['quotes'].items() if (p:=closing_price.verify(snap,q,histories.get(c) or [],calendar,now))}
+     if formal_close and close_source.get('day') == now.date().isoformat():
+         saved = {c:q for c,q in (close_source.get('quotes') or {}).items() if c in pool}
+-        valid_now = sum(quote_valid(q,now,session,None,True)[0] for q in qs.values())
+-        valid_saved = sum(quote_valid(q,now,session,None,True)[0] for q in saved.values())
++        valid_now = sum(quote_valid(q,now,session,None,True,completed_proofs.get(c))[0] for c,q in qs.items())
++        valid_saved = sum(quote_valid(q,now,session,None,True,saved_proofs.get(c))[0] for c,q in saved.items())
+         if valid_now < len(pool)*.60 and valid_saved >= len(pool)*.60:
+             qs = copy.deepcopy(saved)
++            completed_proofs={c:p for c,q in qs.items() if (p:=closing_price.verify(snap,q,histories.get(c) or [],calendar,now))}
+             for c,q in qs.items():
+                 rows[c].update(copy.deepcopy(q))
+             contexts = {}  # Align preserved prices against the actual formal history.
+             snap['market_strength_close_reference'] = dict(
+-                source_at=max(str(q.get('quote_at') or q.get('ts')) for q in qs.values()
+-                              if quote_valid(q,now,session,None,True)[0]),
++                source_at=max(str(q.get('quote_at') or q.get('ts')) for c,q in qs.items()
++                              if quote_valid(q,now,session,None,True,completed_proofs.get(c))[0]),
+                 archive_captured_at=close_source.get('archive_captured_at'),
+                 reason='收盘后源时间不用于新评分；使用当日已核验收市报价')
+     # Reuse only raw return observations. Scores from the previous model are
+@@ -654,7 +668,7 @@
+         for obs in raw_ring:
+             for c,quote in obs['quotes'].items():
+                 observations.setdefault(c,[]).append({'at':quote.get('at'),'return':quote.get('return_pct'),'limit_pct':quote.get('limit_pct')})
+-    current, aligned = stock_scores(qs, contexts or {}, histories, calendar, now, session, formal_close,observations) if not reference else ({},{})
++    current, aligned = stock_scores(qs, contexts or {}, histories, calendar, now, session, formal_close,observations,completed_proofs) if not reference else ({},{})
+     raw_quotes={c:dict(at=m['quote_at'],return_pct=qs[c].get('change_pct'),limit_pct=qs[c].get('limit_pct'))
+                 for c,m in current.items() if m.get('quote_at') and c in qs}
+     if raw_quotes:
+@@ -850,6 +864,9 @@
+         coverage=dict(pool=len(pool),trend_valid=sum(m['trend_score'] is not None for m in current.values()),
+                       emotion_valid=len(emotion_codes),trend_missing=sum(m['trend_score'] is None for m in current.values()),
+                       emotion_missing=len(pool)-len(emotion_codes)))
++    if formal_close:
++        snap['market_strength']['close_verification']=dict(date=now.date().isoformat(),expected=len(pool),verified=len(completed_proofs),
++            source_at=max((p['quote_at'] for p in completed_proofs.values()),default=None),basis='独立完成日线开高低收及价格尺度逐项核验')
+     # Legacy opportunity objects are projections only. No waiting state or lifecycle accumulation.
+     by_code = {c:dict(code=c,name=rows[c].get('name'),version=VERSION,current=m['focus'],market_strength=m,
+                      labels=m['events'],main_label=m['phase'],status=m['phase'] or '—',risk=m['risks'],boards=[],categories={}) for c,m in current.items()}
+--- baseline/relay_history.py
++++ relay_history.py
+@@ -3,7 +3,7 @@
+ from concurrent.futures import ThreadPoolExecutor,as_completed,TimeoutError
+ from datetime import datetime
+ from decimal import Decimal
+-import config,datafeed,intraday,market_strength as M,relay_data as D
++import config,datafeed,intraday,market_strength as M,relay_data as D,closing_price
+ 
+ 
+ def fetch_reference(codes,begin,asof):
+@@ -127,15 +127,9 @@
+     The provider's actual timestamp is retained. A late timestamp alone never
+     establishes a closing price; all four prices and the native scale must match.
+     """
+-    at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'))
+-    verified=intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
+-    if snap.get('session')!='已收盘' or not verified or verified.date()!=now.date() or verified.hour*60+verified.minute<905:return None
+-    if not at or at.date()!=now.date() or at.hour<15 or (at-now).total_seconds()>config.INTRADAY['max_quote_future_seconds']:return None
+-    if q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES or q.get('last_close_semantics')!='previous_trade_day_raw_close':return None
+-    if not (M.positive(q.get('amount_wan')) or M.positive(q.get('volume_shou'))):return None
+-    native=next((b for b in reversed(bars) if b['date']==now.date().isoformat()),None)
+-    if not native or not intraday._valid_historical_price_bar(native):return None
+-    if native.get('price_basis_source') not in intraday._QFQ_HISTORY_SOURCES|intraday._RAW_HISTORY_SOURCES:return None
++    proof=closing_price.verify(snap,q,bars,calendar,now)
++    if proof:return proof
++    if not code:return None
+     context=intraday.align_price_basis(q,bars,calendar,observation_day=now.date().isoformat())
+     suspension_days=[]
+     if not context.get('valid') and code and '历史窗口缺口' in str(context.get('reason')):
+@@ -144,12 +138,10 @@
+         evidence=dict(verified_halts=reg['suspension_intervals']);native_dates={b['date'] for b in bars if b.get('volume',0)>0}
+         suspension_days=[d for d in calendar if d not in native_dates and halt_on(evidence,code,d)]
+         if suspension_days:context=intraday.align_price_basis(q,bars,[d for d in calendar if d not in suspension_days],observation_day=now.date().isoformat())
+-    if not context.get('valid') or not context.get('scale_factor'):return None
+-    factor=context['scale_factor'];converted={k:native[k]*factor for k in ('open','high','low','close')}
+-    for key,qkey in (('open','open'),('high','high'),('low','low'),('close','price')):
+-        if not isinstance(q.get(qkey),(int,float)) or D.tick(converted[key])!=D.tick(q[qkey]):return None
+-    return dict(date=native['date'],verified_at=str(verified),quote_at=str(at),history_source=native['price_basis_source'],history_basis=native['price_basis'],scale_factor=factor,
+-        prices={k:float(D.tick(v)) for k,v in converted.items()},verified_suspension_days=suspension_days,basis='已完成独立日线按经核验尺度转换，逐项匹配报价开高低收；保留实际收盘后源时刻')
++    if not suspension_days:return None
++    proof=closing_price.verify(snap,q,bars,[d for d in calendar if d not in suspension_days],now)
++    if proof:proof['verified_suspension_days']=suspension_days
++    return proof
+ 
+ 
+ def ingest_close(snap,quotes,now,proofs=None):
+--- /dev/null
++++ closing_price.py
+@@ -0,0 +1,57 @@
++"""Shared completed-close evidence. Source timestamps are never rewritten."""
++from decimal import Decimal,ROUND_HALF_UP
++from datetime import datetime,timedelta
++from pathlib import Path
++import hashlib,math
++import config,intraday
++
++IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
++
++def positive(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0
++def tick(v):return Decimal(str(v)).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
++
++def assessment_time(snap,now):
++    # The acquisition can precede the completed daily verification in one scan.
++    # Advance only the evaluation clock to an actually observed verification;
++    # the source quote clock remains untouched.
++    at=intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
++    if (snap.get('session')=='已收盘' and at and at.date()==now.date() and at.hour*60+at.minute>=905
++        and at<=datetime.now()+timedelta(seconds=config.INTRADAY['max_quote_future_seconds'])):return max(now,at)
++    return now
++
++def verify(snap,q,bars,calendar,now):
++    at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'))
++    verified=intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
++    if (snap.get('session')!='已收盘' or not verified or verified.date()!=now.date() or
++        verified.hour*60+verified.minute<905 or (verified-now).total_seconds()>config.INTRADAY['max_quote_future_seconds']):return None
++    if not at or at.date()!=now.date() or at.hour<15 or (at-now).total_seconds()>config.INTRADAY['max_quote_future_seconds']:return None
++    if q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES or q.get('last_close_semantics')!='previous_trade_day_raw_close':return None
++    if not (positive(q.get('amount_wan')) or positive(q.get('volume_shou'))):return None
++    native=[b for b in bars if b.get('date')==now.date().isoformat()]
++    if len(native)!=1:return None
++    native=native[0]
++    if not intraday._valid_historical_price_bar(native) or not positive(native.get('volume')):return None
++    sources={('qfq',s) for s in intraday._QFQ_HISTORY_SOURCES}|{('raw',s) for s in intraday._RAW_HISTORY_SOURCES}
++    if (native.get('price_basis'),native.get('price_basis_source')) not in sources:return None
++    context=intraday.align_price_basis(q,bars,calendar,observation_day=now.date().isoformat())
++    if not context.get('valid') or not positive(context.get('scale_factor')):return None
++    # Today's native bar must use the same scale/source as the aligned history.
++    previous=next((b for b in reversed(bars) if b.get('date')==context['last_history_date']),None)
++    if not previous or (previous.get('price_basis'),previous.get('price_basis_source'))!=(native.get('price_basis'),native.get('price_basis_source')):return None
++    factor=context['scale_factor'];converted={k:native[k]*factor for k in ('open','high','low','close')}
++    for key,qkey in (('open','open'),('high','high'),('low','low'),('close','price')):
++        if not positive(q.get(qkey)) or tick(converted[key])!=tick(q[qkey]):return None
++    return dict(date=native['date'],verified_at=str(verified),quote_at=str(at),history_source=native['price_basis_source'],history_basis=native['price_basis'],scale_factor=factor,
++        prices={k:float(tick(v)) for k,v in converted.items()},verified_suspension_days=[],
++        basis='已完成独立日线按经核验尺度转换，逐项匹配报价开高低收；保留实际收盘后源时刻')
++
++def matches(proof,q,now):
++    if not proof:return False
++    at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'))
++    verified=intraday.parse_quote_timestamp(proof.get('verified_at'))
++    if (not at or at.date()!=now.date() or at.hour<15 or proof.get('date')!=now.date().isoformat() or proof.get('quote_at')!=str(at)
++        or not verified or verified.date()!=now.date() or verified.hour*60+verified.minute<905
++        or max((at-now).total_seconds(),(verified-now).total_seconds())>config.INTRADAY['max_quote_future_seconds']):return False
++    if q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES or q.get('last_close_semantics')!='previous_trade_day_raw_close':return False
++    return all(positive((proof.get('prices') or {}).get(k)) and positive(q.get(qk)) and tick(proof['prices'][k])==tick(q[qk])
++        for k,qk in (('open','open'),('high','high'),('low','low'),('close','price')))
+--- /dev/null
++++ test_closing_judgment.py
+@@ -0,0 +1,104 @@
++"""Regression for verified post-close source clocks and final MA decisions."""
++import copy,unittest,tempfile
++from pathlib import Path
++from datetime import timedelta
++from unittest.mock import patch
++import config,closing_price as C,market_strength as M,ma_trend as T
++from test_market_strength import fixture
++from test_ma_trend import sample
++
++def close_fixture(kind=None):
++    s,q,p,h,cal,now=sample(kind) if kind else fixture(8)
++    now=now.replace(hour=16,minute=30);day=now.date().isoformat();s.update(session='已收盘',close_daily_verified_at=day+' 15:08:10',quote_capture_at=str(now))
++    for c,v in q.items():
++        v['quote_at']=day+' 16:14:45'
++        h[c].append(dict(h[c][-1],date=day,open=v['open'],high=v['high'],low=v['low'],close=v['price'],volume=120.))
++    cal.append(day)
++    return s,q,p,h,cal,now
++
++class ClosingJudgment(unittest.TestCase):
++    def setUp(self):
++        self.temp=tempfile.TemporaryDirectory();self.patch=patch.object(config,'CACHE_DIR',Path(self.temp.name));self.patch.start()
++    def tearDown(self):self.patch.stop();self.temp.cleanup()
++    def test_verified_final_ohlc_restores_market_axes_and_preserves_raw_inputs(self):
++        s,q,p,h,cal,n=close_fixture();before=copy.deepcopy((q,h,cal));M.attach(s,q,p,h,cal,now=n)
++        self.assertEqual((q,h,cal),before);self.assertEqual(s['market_strength']['coverage']['trend_valid'],8)
++        self.assertEqual(s['market_strength']['coverage']['emotion_valid'],8)
++        self.assertEqual(s['market_strength']['close_verification']['verified'],8)
++        self.assertEqual(len(s['market_strength_close_input']['quotes']),8)
++        for row in s['stocks']:
++            self.assertEqual(row['market_strength']['quote_at'],q[row['code']]['quote_at'])
++            self.assertEqual(row['market_strength']['completed_daily_proof']['date'],n.date().isoformat())
++        M.validate(s)
++    def test_native_match_needed_even_with_global_verified_flag(self):
++        for fault in ('missing','open','high','low','close','source','scale','duplicate','previous_close','quote_source','semantics','future','wrong_day','verification','early','volume'):
++            s,q,p,h,cal,n=close_fixture();c=next(iter(q));quote=q[c];bars=h[c]
++            if fault=='missing':bars.pop()
++            elif fault in ('open','high','low','close'):bars[-1][fault]+=.02
++            elif fault=='source':bars[-1]['price_basis_source']='unknown'
++            elif fault=='scale':bars[-1].update(price_basis='qfq',price_basis_source='tencent_qfqday')
++            elif fault=='duplicate':bars.append(copy.deepcopy(bars[-1]))
++            elif fault=='previous_close':quote['last_close']=80.
++            elif fault=='quote_source':quote['price_basis_source']='unknown'
++            elif fault=='semantics':quote['last_close_semantics']='unknown'
++            elif fault=='future':quote['quote_at']=str(n+timedelta(minutes=5))
++            elif fault=='wrong_day':quote['quote_at']=str(n-timedelta(days=1))
++            elif fault=='verification':s['close_daily_verified_at']=str(n-timedelta(days=1))
++            elif fault=='early':s['close_daily_verified_at']=str(n.replace(hour=15,minute=4))
++            elif fault=='volume':quote['amount_wan']=quote['volume_shou']=0
++            self.assertIsNone(C.verify(s,quote,bars,cal,n),fault)
++    def test_postclose_approval_does_not_relax_intraday_or_unproved_time(self):
++        s,q,p,h,cal,n=close_fixture();c=next(iter(q));v=q[c];proof=C.verify(s,v,h[c],cal,n)
++        self.assertFalse(M.quote_valid(v,n,'已收盘',None,True)[0])
++        self.assertTrue(M.quote_valid(v,n,'已收盘',None,True,proof)[0])
++        self.assertFalse(M.quote_valid(v,n,'尾盘',None,True,proof)[0])
++        changed=dict(v,price=v['price']+.01);self.assertFalse(M.quote_valid(changed,n,'已收盘',None,True,proof)[0])
++        stale=dict(v,quote_at=str(n-timedelta(minutes=20)));self.assertFalse(M.quote_valid(stale,n,'午盘',None)[0])
++    def test_one_missing_close_does_not_zero_other_verified_rows(self):
++        s,q,p,h,cal,n=close_fixture();c=next(iter(q));h[c].pop();M.attach(s,q,p,h,cal,now=n)
++        self.assertEqual(s['market_strength']['coverage']['trend_valid'],7)
++        self.assertEqual(s['market_strength']['close_verification']['verified'],7)
++    def test_acquisition_before_daily_verification_uses_actual_completed_assessment(self):
++        s,q,p,h,cal,n=close_fixture();n=n.replace(hour=15,minute=5)
++        for v in q.values():v['quote_at']=str(n)
++        s['close_daily_verified_at']=str(n+timedelta(minutes=3))
++        M.attach(s,q,p,h,cal,now=n);T.attach(s,q,p,h,cal,now=n,minute_data={},fetch_minutes=False)
++        self.assertEqual(s['market_strength']['coverage']['trend_valid'],8)
++        self.assertEqual(s['market_strength']['at'],s['close_daily_verified_at'])
++        self.assertTrue(all(r['ma_trend']['quote_at']==str(n) for r in s['stocks']))
++    def test_saved_final_batch_is_reverified_when_new_source_quote_is_unusable(self):
++        s,q,p,h,cal,n=close_fixture();M.attach(s,q,p,h,cal,now=n);previous=copy.deepcopy(s)
++        bad={c:dict(v,quote_at=str(n+timedelta(minutes=30))) for c,v in q.items()}
++        M.attach(s,bad,p,h,cal,now=n,previous=previous)
++        self.assertEqual(s['market_strength']['coverage']['trend_valid'],8)
++        self.assertTrue(s.get('market_strength_close_reference'))
++        self.assertEqual(s['market_strength_close_input']['quotes'][next(iter(q))]['quote_at'],next(iter(q.values()))['quote_at'])
++    def test_archived_late_source_recovers_on_restart_only_with_native_ohlc(self):
++        import intraday_path
++        s,q,p,h,cal,n=close_fixture()
++        intraday_path.save_acquisition(config.CACHE_DIR/'intraday_history',q,n-timedelta(minutes=1),'已收盘')
++        bad={c:dict(v,quote_at=str(n+timedelta(minutes=30))) for c,v in q.items()}
++        M.attach(s,bad,p,h,cal,now=n,previous={})
++        self.assertEqual(s['market_strength']['coverage']['trend_valid'],8)
++        self.assertEqual(s['market_strength_close_reference']['source_at'],next(iter(q.values()))['quote_at'])
++    def test_final_ma_close_does_not_require_missing_minute_path(self):
++        s,q,p,h,cal,n=close_fixture('retained');c=next(iter(q));q[c]['low']=100.;h[c][-1]['low']=100.
++        M.attach(s,q,p,h,cal,now=n)
++        with patch('close_monitor._get_minutes',side_effect=AssertionError('Final close must not fetch minute path')):
++            T.attach(s,q,p,h,cal,now=n,minute_data={},fetch_minutes=True)
++        m=s['stocks'][0]['ma_trend'];self.assertFalse(m['pending']);self.assertTrue(m['eligible']);self.assertNotIn('minute_needed',m)
++        self.assertEqual(m['quote_at'],q[c]['quote_at']);self.assertEqual(m['decision_at'],n.date().isoformat()+' 15:00:00');T.validate(s)
++    def test_final_close_replays_daily_instead_of_retaining_an_intraday_exit(self):
++        s,q,p,h,cal,n=close_fixture('retained');M.attach(s,q,p,h,cal,now=n);T.attach(s,q,p,h,cal,now=n,minute_data={},fetch_minutes=False)
++        previous=copy.deepcopy(s);m=previous['stocks'][0]['ma_trend'];m.update(status='已退出',exit_at=n.date().isoformat()+' 10:00:00',tracking=dict(exit_at=n.date().isoformat()+' 10:00:00',exit_reason='盘中失守'))
++        T.attach(s,q,p,h,cal,now=n,previous=previous,minute_data={},fetch_minutes=False)
++        self.assertTrue(s['stocks'][0]['ma_trend']['eligible']);self.assertFalse(s['stocks'][0]['ma_trend']['pending'])
++    def test_native_qfq_converted_to_raw_quote_preserves_original_history(self):
++        s,q,p,h,cal,n=close_fixture();c=next(iter(q));before=copy.deepcopy(h[c])
++        for b in h[c]:
++            b.update(price_basis='qfq',price_basis_source='tencent_qfqday')
++            for k in ('open','high','low','close'):b[k]/=1.02
++        proof=C.verify(s,q[c],h[c],cal,n);self.assertAlmostEqual(proof['scale_factor'],1.02)
++        self.assertEqual(proof['prices']['close'],q[c]['price']);self.assertEqual(h[c][-1]['close'],before[-1]['close']/1.02)
++
++if __name__=='__main__':unittest.main()

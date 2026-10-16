@@ -1,0 +1,164 @@
+"""本地短样本回放：只比较20/60日强度，固定10日持有，不搜索参数。"""
+from collections import defaultdict, Counter
+from datetime import datetime
+from pathlib import Path
+from statistics import mean, median
+import csv
+import json
+import sqlite3
+
+import config
+import strength
+
+
+def local_data():
+    pool = json.loads((config.CACHE_DIR / "pool.json").read_text(encoding="utf-8"))
+    series = defaultdict(list)
+    with sqlite3.connect((config.CACHE_DIR / "market.db").resolve().as_uri() + "?mode=ro", uri=True) as conn:
+        for row in conn.execute("SELECT code,date,open,close,high,low,volume,amount FROM kline ORDER BY code,date"):
+            if row[0] in pool:
+                series[row[0]].append(dict(zip(("date", "open", "close", "high", "low", "volume", "amount"), row[1:])))
+    return pool, {c: strength.completed(ks) for c, ks in series.items()}
+
+
+def trade_path(bars_by_date, calendar, signal_index, horizon=10):
+    """不改变信号集合；买不到不补选，到期卖不出顺延并单独记录。"""
+    signal = bars_by_date[calendar[signal_index]]
+    entry_index = signal_index + 1
+    entry = bars_by_date.get(calendar[entry_index])
+    if not entry or entry.get("volume", 0) <= 0 or entry.get("open", 0) <= 0:
+        return {"status": "entry_missing"}
+    # 普通主板的保守近涨停处理；用9.5%容差，避免复权小数造成假成交。
+    if entry["open"] / signal["close"] - 1 >= 0.095:
+        return {"status": "entry_limit"}
+    target_index = signal_index + horizon  # 次日开盘入场，第10个市场交易日收盘退出。
+    previous = entry["close"]
+    for i in range(entry_index + 1, len(calendar)):
+        b = bars_by_date.get(calendar[i])
+        if not b or b.get("volume", 0) <= 0:
+            continue
+        locked_down = b["high"] == b["low"] and b["close"] / previous - 1 <= -0.095
+        if i >= target_index and not locked_down:
+            path = [bars_by_date[d] for d in calendar[entry_index:i + 1] if d in bars_by_date]
+            gross = (b["close"] / entry["open"] - 1) * 100
+            return {"status": "closed", "entry_date": calendar[entry_index], "exit_date": calendar[i],
+                    "entry_price": entry["open"], "exit_price": b["close"],
+                    "gross_pct": gross, "net_pct": gross - 0.30,
+                    "mae_pct": (min(x["low"] for x in path) / entry["open"] - 1) * 100,
+                    "exit_delay": i - target_index, "exit_index": i}
+        previous = b["close"]
+    return {"status": "unresolved", "entry_date": calendar[entry_index]}
+
+
+def run(output=None):
+    output = Path(output or config.ROOT / "research" / "simple_strength_20260923")
+    output.mkdir(parents=True, exist_ok=True)
+    pool, series = local_data()
+    calendar = strength.trading_calendar(series)
+    indexes = {c: {b["date"]: i for i, b in enumerate(ks)} for c, ks in series.items()}
+    by_date = {c: {b["date"]: b for b in ks} for c, ks in series.items()}
+    trades, skipped = {20: [], 60: []}, {20: Counter(), 60: Counter()}
+    busy = {20: {}, 60: {}}
+    cohort_diffs, dates_with_signal = [], {20: set(), 60: set()}
+    for t in range(60, len(calendar) - 10):
+        date = calendar[t]
+        wanted = calendar[t - 60:t + 1]
+        valid = []
+        for c, ks in series.items():
+            end = indexes[c].get(date)
+            if end is None or end < 60:
+                continue
+            window = ks[end - 60:end + 1]
+            if [b["date"] for b in window] != wanted:
+                continue
+            m = strength.day_metrics(window)
+            if not m or not m["above60"]:
+                continue
+            valid.append(dict(m, code=c))
+        cohort = {}
+        for formation in (20, 60):
+            candidates = sorted((m for m in valid if m[f"ret{formation}"] > 0),
+                                key=lambda m: (-m[f"ret{formation}"], m["code"]))[:20]
+            daily_closed = []
+            for m in candidates:
+                c = m["code"]
+                if busy[formation].get(c, -1) > t:
+                    skipped[formation]["already_held"] += 1
+                    continue
+                result = trade_path(by_date[c], calendar, t)
+                if result["status"] != "closed":
+                    skipped[formation][result["status"]] += 1
+                    if result["status"] == "unresolved":
+                        busy[formation][c] = len(calendar)
+                    continue
+                busy[formation][c] = result["exit_index"]
+                trade = dict(result, code=c, name=(pool.get(c) or {}).get("name", c),
+                             formation=formation, signal_date=date, strength_return=m[f"ret{formation}"])
+                trades[formation].append(trade)
+                dates_with_signal[formation].add(date)
+                daily_closed.append(result["net_pct"])
+            cohort[formation] = mean(daily_closed) if daily_closed else None
+        if all(cohort[k] is not None for k in (20, 60)):
+            cohort_diffs.append(cohort[20] - cohort[60])
+    summaries = {}
+    for formation, rows in trades.items():
+        months = Counter(r["signal_date"][:7] for r in rows)
+        summaries[str(formation)] = {
+            "closed_trades": len(rows), "unique_stocks": len({r["code"] for r in rows}),
+            "signal_days": len(dates_with_signal[formation]), "by_month": dict(months),
+            "mean_gross_pct": mean(r["gross_pct"] for r in rows) if rows else None,
+            "mean_net_pct": mean(r["net_pct"] for r in rows) if rows else None,
+            "median_net_pct": median(r["net_pct"] for r in rows) if rows else None,
+            "win_rate_pct": mean(r["net_pct"] > 0 for r in rows) * 100 if rows else None,
+            "mean_mae_pct": mean(r["mae_pct"] for r in rows) if rows else None,
+            "worst_mae_pct": min((r["mae_pct"] for r in rows), default=None),
+            "delayed_exits": sum(r["exit_delay"] > 0 for r in rows), "skipped": dict(skipped[formation]),
+        }
+    result = {"created_at": datetime.now().isoformat(timespec="seconds"),
+              "data_start": calendar[0], "data_end": calendar[-1],
+              "signal_start": calendar[60], "signal_end": calendar[-11],
+              "signal_sessions": max(0, len(calendar) - 70), "pool_size": len(pool),
+              "rules": {"formations": [20, 60], "top_n": 20, "holding_sessions": 10,
+                        "round_trip_cost_pct_assumption": 0.30, "skip_recent": 0,
+                        "structure": "信号日收盘高于60日均线；对应形成期收益为正",
+                        "liquidity": "不设历史成交额入选门槛",
+                        "entry": "次日开盘；无数据/无成交/开盘涨幅>=9.5%跳过，不补选",
+                        "exit": "第10个市场交易日收盘；缺失或一字跌停顺延",
+                        "repeated": "持有期间重复信号不计数；不为被占用的名额补选低排名股票"},
+              "limitations": ["当前股票池回放，存在幸存者偏差与历史ST身份未知问题",
+                              "日线较短，窗口重叠；只报告描述统计，不宣称显著性或最优参数",
+                              "使用现有前复权日线，成交额为估算；日线不能证明真实成交",
+                              "仅比较强度排序，不包含行业广度、入场形态或过热过滤",
+                              "事件收益不是资金约束下的组合收益，最大不利波动不是组合最大回撤",
+                              "0.30%为假设的往返费用与滑点，非用户实际费率"],
+              "results": summaries}
+    config.atomic_write_text(output / "replay_results.json", json.dumps(result, ensure_ascii=False, indent=2))
+    rows = trades[20] + trades[60]
+    if rows:
+        with (output / "replay_trades.csv").open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    lines = ["# 20日 / 60日强度近期回放", "", f"信号区间：{result['signal_start']} 至 {result['signal_end']}，共{result['signal_sessions']}个交易日；数据截至{result['data_end']}。", "",
+             "相同股票池、60日线上、估算流动性门槛、每日前20名；不跳过近期；次日开盘入场，固定10个市场交易日。往返费用与滑点假设合计0.30%。", "",
+             "| 排名窗口 | 完成事件 | 净均值 | 净中位数 | 净胜率 | 平均不利波动 | 最差不利波动 |",
+             "|---|---:|---:|---:|---:|---:|---:|"]
+    for window, v in summaries.items():
+        def fmt(key):
+            return f"{v[key]:.2f}%" if v[key] is not None else "—"
+        lines.append(f"| {window}日 | {v['closed_trades']} | {fmt('mean_net_pct')} | {fmt('median_net_pct')} | {fmt('win_rate_pct')} | {fmt('mean_mae_pct')} | {fmt('worst_mae_pct')} |")
+    lines += ["", "## 交易与样本", ""]
+    for w, v in summaries.items():
+        lines.append(f"- {w}日：{v['unique_stocks']}只股票、{v['signal_days']}个入场信号日；各月事件数 {v['by_month']}；顺延退出 {v['delayed_exits']}；跳过统计 {v['skipped']}。")
+    lines += ["", "## 使用边界", ""] + ["- " + x for x in result["limitations"]]
+    lines += ["", "暂保留20日作为在线默认；这次回放用于比较近期表现，不据单段样本自动改参数。", ""]
+    config.atomic_write_text(output / "近期回放.md", "\n".join(lines))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
+
+
+if __name__ == "__main__":
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    run()

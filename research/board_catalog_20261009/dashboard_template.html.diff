@@ -1,0 +1,51 @@
+--- dashboard_template.html.before
++++ dashboard_template.html
+@@ -4570,6 +4570,9 @@
+   }
+   h+=uiTag('成员 · '+(b.trend_state||'待观察'),b.member_diffusion?'blue':'',
+     '当前有效主板成员的近3个完成日线：在线成员连续两次增加且在线比例高于全体主板，才标记持续扩散。不是历史全市场成分回测，也不证明带动关系。');
++  if(!b.pool_members)h+=uiTag('成员待补齐','warn','同花顺目录中存在该板块，但当前尚未取得可用的主板成员；保留查询入口，不生成成员强势结论。');
++  else if(!b.valid_members)h+=uiTag('日线待补齐','warn','已归集成员，但本轮没有通过日线数据检查的有效样本；不进入正式筛选。');
++  if(b.membership_stale)h+=uiTag('成员待更新','warn','该板块本次详情读取未完整成功，保留上次有来源的成员；不把部分分页标记为完整名单。');
+   if(!b.ranking_eligible)h+=uiTag('小样本','warn',b.ranking_reason||'有效成员不足6只，不参与正式筛选及排名。');
+   if(b.wide)h+=uiTag('宽题材','','成员超过60只，建议结合详情中的细分成员观察。');
+   return h;
+@@ -4592,7 +4595,7 @@
+ }
+ function setBoardFilter(key){BC_FILTER=key;renderBoards();renderThemesPage();}
+ function centerMarkup(kind,showTabs){
+-  var all=boardCatalog().filter(function(b){return b.type===kind&&b.valid_members>0;});
++  var all=boardCatalog().filter(function(b){return b.type===kind;});
+   if(BC_SEARCH)all=all.filter(function(b){return b.name.toLowerCase().indexOf(BC_SEARCH.toLowerCase())>=0;});
+   var boards=all.filter(function(b){return boardMatches(b,BC_FILTER);});
+   boards.sort(function(a,b){
+@@ -4606,12 +4609,12 @@
+       +'<button class="btn '+(kind==='theme'?'primary':'')+'" onclick="BC_KIND=\'theme\';renderBoards()">题材</button>':'')
+     +'<button class="btn '+(BC_SORT==='trend'?'primary':'')+'" onclick="BC_SORT=\'trend\';renderBoards();renderThemesPage()">成员趋势排序</button>'
+     +'<button class="btn '+(BC_SORT==='today'?'primary':'')+'" onclick="BC_SORT=\'today\';renderBoards();renderThemesPage()">今日热度</button>'
+-    +'<input id="bc-search-'+(showTabs?'boards':'themes')+'" aria-label="搜索板块" placeholder="搜索行业或题材" value="'+esc(BC_SEARCH)+'" '
++    +'<input id="bc-search-'+(showTabs?'boards':'themes')+'" aria-label="搜索板块" placeholder="搜索全部行业或题材" value="'+esc(BC_SEARCH)+'" '
+     +'oninput="updateBoardSearch(this)" class="bc-search"></div>'
+     +'<div class="bc-filters" role="group" aria-label="板块趋势筛选">'+BC_FILTERS.map(function(x){
+       return '<button type="button" data-board-filter="'+x[0]+'" aria-pressed="'+(BC_FILTER===x[0])+'" class="bc-filter '+(BC_FILTER===x[0]?'active':'')+'" onclick="setBoardFilter(\''+x[0]+'\')">'
+         +x[1]+'<span>'+all.filter(function(b){return boardMatches(b,x[0]);}).length+'</span></button>';}).join('')+'</div>'
+-    +'<div class="bc-reference"><span>'+(showTabs?'指数与成员独立判断':'完成日线 '+esc((DATA.board_trend_model||DATA.strength_model||{}).asof||'—'))+'</span>'
++    +'<div class="bc-reference"><span>'+(BC_SEARCH?'全部目录查询':showTabs?'指数与成员独立判断':'完成日线 '+esc((DATA.board_trend_model||DATA.strength_model||{}).asof||'—'))+'</span>'
+     +uiTag('筛选口径','','指数须最新22个连续交易日对齐且至少6只有效主板成员，并按完整可用历史逐日跟踪。强势推进须MA5＞MA10；回踩保留强势背景。已转弱移出观察。成员扩散独立展示。')
+     +'<span>'+boards.length+' / '+all.length+' 个</span></div></div>'
+     +'<div class="bc-grid">'+(boards.length?boards.map(boardCard).join(''):'<div class="empty bc-empty">当前没有符合条件的板块，可切换筛选或清空搜索。</div>')+'</div>';
+@@ -4629,7 +4632,13 @@
+ }
+ function renderThemesPage(){document.getElementById('theme-center').innerHTML=centerMarkup('theme',false);}
+ function updateBoardSearch(input){
+-  BC_SEARCH=input.value;var id=input.id,pos=input.selectionStart;
++  var previous=BC_SEARCH;BC_SEARCH=input.value;var id=input.id,pos=input.selectionStart;
++  // 搜索是查目录；用户不应因默认重点观察而误认为板块不存在。
++  if(BC_SEARCH&&!previous)BC_FILTER='all';
++  if(BC_SEARCH&&id==='bc-search-boards'){
++    var matches=boardCatalog().filter(function(b){return b.name.toLowerCase().indexOf(BC_SEARCH.toLowerCase())>=0;});
++    if(matches.length&&!matches.some(function(b){return b.type===BC_KIND;}))BC_KIND=matches[0].type;
++  }
+   renderBoards();renderThemesPage();
+   var current=document.getElementById(id);if(current){current.focus();current.setSelectionRange(pos,pos);}
+ }

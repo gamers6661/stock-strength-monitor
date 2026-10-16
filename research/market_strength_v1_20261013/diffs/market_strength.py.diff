@@ -1,0 +1,575 @@
+--- before/market_strength.py
++++ after/market_strength.py
+@@ -0,0 +1,572 @@
++"""Single, stateless market strength model. Percent returns; no strategy eligibility gates."""
++import copy
++import hashlib
++import json
++import math
++from bisect import bisect_left, bisect_right
++from datetime import datetime
++from decimal import Decimal, ROUND_HALF_UP
++from pathlib import Path
++from statistics import mean, median
++
++import config
++import intraday
++
++P = config.MARKET_STRENGTH
++VERSION = P['version']
++
++
++def implementation_hash():
++    return hashlib.sha256(Path(__file__).read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
++
++
++IMPLEMENTATION_HASH = implementation_hash()  # fixed at process import
++
++
++def finite(x):
++    return isinstance(x, (float, int)) and not isinstance(x, bool) and math.isfinite(x)
++
++
++def positive(x):
++    return finite(x) and x > 0
++
++
++def clamp(x):
++    return max(0., min(1., x))
++
++
++def rounded(x):
++    return float(Decimal(str(x)).quantize(Decimal('.01'), rounding=ROUND_HALF_UP)) if finite(x) else None
++
++
++def level(x):
++    return None if x is None else ('很强' if x >= P['very_strong_min'] else
++                                  '强' if x >= P['strong_min'] else
++                                  '一般' if x >= P['normal_min'] else '弱')
++
++
++def percentiles(values):
++    values = {c: v for c, v in values.items() if finite(v)}
++    ordered = sorted(values.values())
++    n = len(ordered)
++    return {c: 50. if n == 1 else 100. * (bisect_left(ordered, v) +
++            (bisect_right(ordered, v)-bisect_left(ordered, v)-1)/2)/(n-1)
++            for c, v in values.items()}
++
++
++def period_score(r, s, k, full):
++    a = 100*clamp(r/full)
++    g = P['absolute_weight']*a + P['relative_weight']*s
++    return dict(R=r, S=s, A=a, G=g, K=k, T=g*k)
++
++
++def structure(price, ma_now, ma_prev, dd):
++    f = P['structure_factors']
++    if price < ma_now or ma_now < ma_prev or dd > P['drawdown_max_atr']:
++        return f['damaged']
++    return f['pullback'] if dd > P['drawdown_shallow_atr'] else f['intact']
++
++
++def trend_raw(price, bars, atr, atr_date, calendar=None):
++    out = {}
++    for n in P['periods']:
++        part = dict(R=None, S=None, A=None, G=None, K=None, T=None,
++                    MA_now=None, MA_previous=None, peak=None, dd=None,
++                    ATR=atr if positive(atr) else None, ATR_date=atr_date)
++        window = bars[-n:]
++        if positive(price) and len(window) == n and all(positive(b.get('close')) for b in window):
++            if calendar and [b['date'] for b in window] != calendar[-n:]:
++                part['reason'] = '完成日窗口存在缺口'
++            else:
++                closes = [b['close'] for b in window]
++                now, prev, peak = (price + sum(closes[1:]))/n, mean(closes), max(closes)
++                part.update(R=100*(price/closes[0]-1), MA_now=now, MA_previous=prev, peak=peak,
++                            dates=[b['date'] for b in window])
++                if positive(atr) and atr_date == window[-1]['date']:
++                    dd = max(0, peak-price)/atr
++                    part.update(dd=dd, K=structure(price, now, prev, dd))
++                else:
++                    part['reason'] = '前一完成日ATR20待核验'
++        else:
++            part['reason'] = '价格或该周期完成日历史不足'
++        out[str(n)] = part
++    return out
++
++
++def choose(parts):
++    valid = [(int(n), v['T']) for n, v in parts.items() if finite(v.get('T'))]
++    if not valid:
++        return None, None
++    highest = max(t for _, t in valid)
++    dominant = max(n for n, t in valid if highest-t <= P['tie_epsilon'])
++    return rounded(dict(valid)[dominant]), dominant
++
++
++def empty(at, mode):
++    return dict(version=VERSION, trend_score=None, emotion_score=None, trend_level=None,
++                emotion_level=None, dominant_period=None, phase=None, events=[], event_evidence={},
++                trend_strong=False, emotion_strong=False, focus=False, trend_at=at, emotion_at=at,
++                mode=mode, trend_parts_by_period={}, emotion_parts={}, reasons=[], risks=[], data_reasons=[])
++
++
++def brief(m):
++    """Display projection; numerical evidence stays on the canonical stock/board detail."""
++    keys=('version','trend_score','emotion_score','trend_level','emotion_level','dominant_period',
++          'phase','events','trend_strong','emotion_strong','focus','trend_at','emotion_at','mode','reasons','risks','data_reasons')
++    return {k:m.get(k) for k in keys}
++
++
++def finish(m):
++    m['trend_score'], m['dominant_period'] = choose(m['trend_parts_by_period'])
++    for axis in ('trend', 'emotion'):
++        score = m[axis+'_score']
++        m[axis+'_level'] = level(score)
++        m[axis+'_strong'] = score is not None and score >= P['strong_min']
++    m['focus'] = m['trend_strong'] or m['emotion_strong']
++
++
++def phase(t, e, history, consolidating):
++    if len(history) != P['phase_history_days'] or any(x is None for x in history):
++        return None, None
++    days = sum(x >= P['strong_min'] for x in history)
++    if t is not None and t >= P['strong_min']:
++        if consolidating is None:
++            return None, days
++        return ('回踩整理' if days >= 1 and consolidating else
++                '推进' if days >= P['phase_mature_strong_days'] and not consolidating else '启动'), days
++    if e is not None and e >= P['strong_min'] and days == 0:
++        return '启动', days
++    if t is not None and t < P['strong_min'] and days >= 1:
++        return '转弱', days
++    return None, days
++
++
++def emotion_raw(q):
++    price, op, hi, lo, r, limit = (q.get(k) for k in ('price','open','high','low','change_pct','limit_pct'))
++    if not all(positive(v) for v in (price, op, hi, lo, limit)) or not finite(r) or hi < lo:
++        return None, '当日情绪字段或正常有效涨幅限制不足'
++    if price < lo or price > hi or op < lo or op > hi:
++        return None, '现价或开盘价超出当日区间'
++    tick = q.get('price_tick') if positive(q.get('price_tick')) else P['quote_tick_default']
++    locked = positive(q.get('limit_up')) and abs(price-q['limit_up']) <= tick*P['limit_tick_tolerance']+1e-9
++    l = 100*clamp((price-lo)/(hi-lo)) if hi > lo else None
++    oscore = 100*clamp((100*(price/op-1))/(P['open_full_limit_ratio']*limit))
++    if hi == lo and not locked:
++        return None, '非实际涨停的同高低价，完整情绪未知'
++    h = 100. if locked else P['hold_position_weight']*l + P['hold_open_weight']*oscore
++    return dict(R0=r, limit_pct=limit, S0=None, J=100*clamp(r/limit), D=None,
++                L=l, Oscore=oscore, H=h, actual_limit=locked,
++                price=price, open=op, high=hi, low=lo, limit_up=q.get('limit_up')), None
++
++
++def quote_valid(q, now, session, center, formal_close=False):
++    at = intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'), now)
++    if not at:
++        return False, None, '报价时间缺失'
++    if not positive(q.get('price')) or not (positive(q.get('amount_wan')) or positive(q.get('volume_shou'))):
++        return False, at, '报价不可用或无真实成交'
++    if formal_close:
++        return True, at, None
++    age = (now-at).total_seconds()
++    minute = at.hour*60+at.minute
++    lunch = session == '午间休市' and at.date() == now.date() and 690 <= minute < 780
++    if at.date() != now.date() or age < -config.INTRADAY['max_quote_future_seconds']:
++        return False, at, '报价日期不一致或时间超前'
++    if age > config.INTRADAY['max_quote_age_seconds'] and not lunch:
++        return False, at, '报价过期'
++    if not (570 <= minute <= 690 or 780 <= minute <= 900 or session == '已收盘' and minute >= 900):
++        # Existing lunch collector reports 11:31/11:32: retain 11:30 effective judgment.
++        if not lunch:
++            return False, at, '非连续竞价报价'
++    if session in ('午盘','尾盘') and minute < 780:
++        return False, at, '本段开盘报价未更新'
++    if session == '午间休市' and not lunch:
++        return False, at, '尚无上午收市有效行情'
++    if center and not lunch and abs((at-center).total_seconds()) > config.INTRADAY['max_quote_batch_skew_seconds']:
++        return False, at, '报价批次时间偏差过大'
++    return True, at, None
++
++
++def stock_scores(quotes, contexts, histories, calendar, now, session, formal_close=False):
++    result, aligned = {}, {}
++    times = [intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'), now) for q in quotes.values()]
++    times = [at for at in times if at and at.date() == now.date() and
++             -config.INTRADAY['max_quote_future_seconds'] <= (now-at).total_seconds() <= config.INTRADAY['max_quote_age_seconds']]
++    center = sorted(times)[len(times)//2] if times else None
++    for c, q in quotes.items():
++        valid, at, reason = quote_valid(q, now, session, center, formal_close)
++        mode = '正式收盘' if formal_close else '午休参考' if session == '午间休市' else '连续竞价'
++        m = empty(str(at) if at else None, mode)
++        result[c] = m
++        if not valid:
++            m['data_reasons'].append(reason)
++            continue
++        bars = histories.get(c) or []
++        # Always align formal history; never reuse a synthetic current-day bar as completed history.
++        context = contexts.get(c) or intraday.align_price_basis(q, bars, calendar, observation_day=now.date().isoformat())
++        if context.get('quote_day') != now.date().isoformat():
++            context = intraday.align_price_basis(q, bars, calendar, observation_day=now.date().isoformat())
++        if context.get('valid'):
++            factor = context['scale_factor']
++            raw = [dict(b, **{k: b[k]*factor for k in ('open','high','low','close')})
++                   for b in bars if b['date'] < now.date().isoformat() and all(positive(b.get(k)) for k in ('open','high','low','close'))]
++            aligned[c] = raw
++            dates = [d for d in calendar if d < now.date().isoformat()]
++            m['trend_parts_by_period'] = trend_raw(q['price'], raw, context.get('atr20'), context.get('last_history_date'), dates)
++            m['price_context'] = {k:v for k,v in context.items() if k != 'aligned_bars'}
++        else:
++            m['data_reasons'].append(context.get('reason') or '价格口径待核验')
++        emotion, error = emotion_raw(q)
++        if emotion:
++            m['emotion_parts'] = emotion
++        else:
++            m['data_reasons'].append(error)
++        m['quote_at'] = str(at)
++    for n in P['periods']:
++        vals = {c:m['trend_parts_by_period'].get(str(n),{}).get('R') for c,m in result.items()
++                if m['trend_parts_by_period'].get(str(n),{}).get('K') is not None}
++        ranks = percentiles(vals)
++        for c,s in ranks.items():
++            part = result[c]['trend_parts_by_period'][str(n)]
++            part.update(period_score(part['R'], s, part['K'], P['stock_full_returns'][n]), N=len(ranks))
++    groups = {}
++    # S0 uses every valid R0 in the same effective limit group, even if H is unavailable.
++    for c,q in quotes.items():
++        valid, _, _ = quote_valid(q, now, session, center, formal_close)
++        if valid and finite(q.get('change_pct')) and positive(q.get('limit_pct')):
++            groups.setdefault(q['limit_pct'], {})[c] = q['change_pct']
++    for limit, values in groups.items():
++        ranks = percentiles(values)
++        for c,s in ranks.items():
++            result[c]['emotion_reference'] = dict(limit_pct=limit,R0=values[c],S0=s,N=len(ranks))
++            ep = result[c]['emotion_parts']
++            if not ep:
++                continue
++            ep.update(S0=s, N=len(ranks), D=P['absolute_weight']*ep['J']+P['relative_weight']*s)
++            result[c]['emotion_score'] = rounded(P['emotion_attack_weight']*ep['D']+P['emotion_hold_weight']*ep['H'])
++    for m in result.values():
++        finish(m)
++    return result, aligned
++
++
++def historical_scores(histories, calendar, day):
++    """Completed-day evaluation: P=day close; ATR/window strictly precede that day."""
++    result = {}
++    prior = [d for d in calendar if d < day]
++    for c, bars in histories.items():
++        by = {b['date']:b for b in bars}
++        m = empty(day+' 15:00:00', '完成日历史背景')
++        result[c] = m
++        current = by.get(day)
++        dates = prior[-21:]
++        window = [by.get(d) for d in dates]
++        if not current or len(dates) < 21 or any(not b or not intraday._valid_historical_price_bar(b) for b in window+[current]):
++            continue
++        modes = {(b.get('price_basis'),b.get('price_basis_source')) for b in window+[current]}
++        if len(modes) != 1:
++            continue
++        basis, source = next(iter(modes))
++        if not (basis == 'qfq' and source in intraday._QFQ_HISTORY_SOURCES or basis == 'raw' and source in intraday._RAW_HISTORY_SOURCES):
++            continue
++        atr = mean(max(window[i]['high']-window[i]['low'], abs(window[i]['high']-window[i-1]['close']),
++                       abs(window[i]['low']-window[i-1]['close'])) for i in range(1,21))
++        previous = [b for b in bars if b['date'] < day]
++        m['trend_parts_by_period'] = trend_raw(current['close'], previous, atr, prior[-1], prior)
++        m['R3'] = 100*(current['close']/previous[-3]['close']-1)
++        m['consolidating'] = current['close'] < m['trend_parts_by_period']['5']['MA_now'] or m['R3'] <= 0
++    for n in P['periods']:
++        vals = {c:m['trend_parts_by_period'].get(str(n),{}).get('R') for c,m in result.items()
++                if m['trend_parts_by_period'].get(str(n),{}).get('K') is not None}
++        ranks = percentiles(vals)
++        for c,s in ranks.items():
++            part = result[c]['trend_parts_by_period'][str(n)]
++            part.update(period_score(part['R'],s,part['K'],P['stock_full_returns'][n]), N=len(ranks))
++    for m in result.values():
++        finish(m)
++    return result
++
++
++def trim(values):
++    ordered = sorted(values.items(), key=lambda x:(x[1],x[0]))
++    k = max(1, math.floor(len(ordered)*P['board_trim_ratio']))
++    kept = ordered[k:-k]
++    return (mean(v for _,v in kept) if kept else None,
++            [c for c,_ in ordered[:k]+ordered[-k:]])
++
++
++def coverage(codes, expected):
++    pct = len(codes)/len(expected)*100 if expected else None
++    return dict(valid=len(codes), expected=len(expected), coverage_pct=pct, member_codes=sorted(codes),
++                eligible=len(codes) >= P['board_min_valid_members'] and pct is not None and pct >= P['board_min_coverage_pct'])
++
++
++def board_scores(boards, stocks, pool, quotes=None, at=None):
++    result = {}
++    for b in boards:
++        m = empty(at, '主板成员共振')
++        result[b['id']] = m
++        # Preserve confirmed membership; missing data remains in the denominator.
++        expected = set(b.get('member_codes') or []) & set(pool)
++        if quotes is not None:
++            expected = {c for c in expected if not (c in quotes and
++                        finite(quotes[c].get('amount_wan')) and finite(quotes[c].get('volume_shou')) and
++                        quotes[c]['amount_wan'] <= 0 and quotes[c]['volume_shou'] <= 0)}
++        m['expected'] = len(expected)
++        m['expected_codes'] = sorted(expected)
++        for n in P['periods']:
++            codes = [c for c in expected if finite(stocks.get(c,{}).get('trend_parts_by_period',{}).get(str(n),{}).get('T'))]
++            cov = coverage(codes, expected)
++            part = dict(cov, R=None,S=None,A=None,G=None,K=None,T=None, B=None, trimmed_codes=[])
++            m['trend_parts_by_period'][str(n)] = part
++            if not cov['eligible']:
++                part['reason'] = '该周期成员不足6只或覆盖不足80%'
++                continue
++            part['R'],part['trimmed_codes'] = trim({c:stocks[c]['trend_parts_by_period'][str(n)]['R'] for c in codes})
++            part['B'] = mean(stocks[c]['trend_parts_by_period'][str(n)]['K'] >= P['structure_factors']['pullback'] for c in codes)
++            part['K'] = P['board_structure_base']+P['board_structure_weight']*part['B']
++        codes = [c for c in expected if stocks.get(c,{}).get('emotion_score') is not None]
++        ep = dict(coverage(codes,expected), R0=None,S0=None,J=None,D=None,B=None,H=None, trimmed_codes=[])
++        m['emotion_parts'] = ep
++        if ep['eligible']:
++            ep['R0'],ep['trimmed_codes'] = trim({c:stocks[c]['emotion_parts']['R0'] for c in codes})
++            ep['J'] = 100*clamp(ep['R0']/P['board_today_full_return'])
++            ep['B'] = 100*mean(stocks[c]['emotion_score'] >= P['strong_min'] for c in codes)
++            ep['H'] = median(stocks[c]['emotion_parts']['H'] for c in codes)
++        else:
++            m['data_reasons'].append('情绪成员不足6只或覆盖不足80%')
++    for kind in ('industry','theme'):
++        ids = [b['id'] for b in boards if b['type'] == kind and b.get('classification_rankable',True)]
++        for n in P['periods']:
++            vals = {i:result[i]['trend_parts_by_period'][str(n)]['R'] for i in ids}
++            ranks = percentiles(vals)
++            for i,s in ranks.items():
++                part = result[i]['trend_parts_by_period'][str(n)]
++                part.update(period_score(part['R'],s,part['K'],P['board_full_returns'][n]),N=len(ranks))
++        ranks = percentiles({i:result[i]['emotion_parts']['R0'] for i in ids})
++        for i,s in ranks.items():
++            ep = result[i]['emotion_parts']
++            ep.update(S0=s,N=len(ranks),D=P['absolute_weight']*ep['J']+P['relative_weight']*s)
++            weights = P['board_emotion_weights']
++            result[i]['emotion_score'] = rounded(weights['attack']*ep['D']+weights['hot_share']*ep['B']+weights['hold']*ep['H'])
++    for m in result.values():
++        finish(m)
++    return result
++
++
++def sort_key(m, identity, order='combined'):
++    t,e = m.get('trend_score'),m.get('emotion_score')
++    last = lambda x: -x if x is not None else math.inf
++    if order == 'trend':
++        return last(t),last(e),identity
++    if order == 'emotion':
++        return last(e),last(t),identity
++    both = m.get('trend_strong') and m.get('emotion_strong')
++    valid = sorted([x for x in (t,e) if x is not None],reverse=True)
++    return not both,last(valid[0] if valid else None),last(valid[1] if len(valid)>1 else None),identity
++
++
++def lists(results):
++    ordered = sorted(results,key=lambda c:sort_key(results[c],c))
++    out = {'all':ordered, 'focus':[c for c in ordered if results[c]['focus']],
++           'trend':[c for c in ordered if results[c]['trend_strong']],
++           'emotion':[c for c in ordered if results[c]['emotion_strong']],
++           'both':[c for c in ordered if results[c]['trend_strong'] and results[c]['emotion_strong']]}
++    out['sorts'] = {k:sorted(results,key=lambda c:sort_key(results[c],c,k)) for k in ('combined','trend','emotion')}
++    return out
++
++
++def attach(snap, quotes, pool, histories, calendar, contexts=None, now=None, previous=None):
++    now = now or datetime.fromisoformat(snap['quote_capture_at'])
++    session = snap.get('session','')
++    rows = {str(r['code']):r for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
++    for c in pool:
++        if c not in rows:
++            row = dict(pool[c] if isinstance(pool,dict) else {},code=c,coverage_only=True)
++            row.update(quotes.get(c) or {})
++            snap.setdefault('coverage_catalog',[]).append(row)
++            rows[c] = row
++    qs = {c:quotes[c] for c in pool if c in quotes}
++    reference = session in ('盘前','集合竞价','竞价结束','非交易日','收盘竞价') or 897 <= now.hour*60+now.minute < 900
++    formal_close = session == '已收盘' and bool(snap.get('close_daily_verified_at'))
++    current, aligned = stock_scores(qs, contexts or {}, histories, calendar, now, session, formal_close) if not reference else ({},{})
++    for c in pool:
++        current.setdefault(c,empty(None,'参考行情' if reference else '连续竞价'))
++        if c not in qs:
++            current[c]['data_reasons'].append('本轮报价缺失')
++    days = [d for d in calendar if d < now.date().isoformat()][-P['phase_history_days']:]
++    history = {d:historical_scores({c:histories.get(c,[]) for c in pool},calendar,d) for d in days}
++    boards = snap.get('board_catalog',[])
++    board_current = board_scores(boards,current,pool,qs, str(now))
++    board_history = {d:board_scores(boards,hist,pool,None,d+' 15:00:00') for d,hist in history.items()}
++    for c,m in current.items():
++        q = qs.get(c,{})
++        bars = aligned.get(c,[])
++        m['history_trend'] = [{'date':d,'score':history[d].get(c,{}).get('trend_score')} for d in days]
++        m['consolidating'],m['R3'] = None,None
++        if len(bars)>=5 and positive(q.get('price')):
++            m['R3'] = 100*(q['price']/bars[-3]['close']-1)
++            m['consolidating'] = q['price'] < (q['price']+sum(b['close'] for b in bars[-4:]))/5 or m['R3'] <= 0
++        m['phase'],m['strong_days'] = phase(m['trend_score'],m['emotion_score'],[x['score'] for x in m['history_trend']],m['consolidating'])
++        if m['phase']=='启动' and not m['trend_strong']:
++            m['reasons'].append('情绪先行')
++        if m['phase']=='转弱' and m['emotion_strong']:
++            m['reasons'].append('短线活跃')
++        if m['dominant_period'] in (5,10):
++            p20 = m['trend_parts_by_period'].get('20',{})
++            if p20.get('MA_now') is not None and (q['price'] < p20['MA_now'] or p20['MA_now'] < p20['MA_previous']):
++                m['reasons'].append('短期走强，中期未恢复')
++        if m['trend_strong']:
++            m['reasons'].append(str(m['dominant_period'])+'日趋势强')
++        if m['emotion_strong']:
++            m['reasons'].append('当日情绪强')
++        # Events depend only on reliable price evidence; never determine admission.
++        if bars:
++            price = q['price']
++            if len(bars)>=P['breakout_days'] and price > max(b['high'] for b in bars[-P['breakout_days']:]):
++                m['event_evidence']['突破'] = dict(price=price,threshold=max(b['high'] for b in bars[-20:]),dates=[b['date'] for b in bars[-20:]])
++            prev = history.get(days[-1],{}).get(c,{}) if days else {}
++            p5 = m['trend_parts_by_period'].get('5',{})
++            if prev.get('trend_strong') and prev.get('consolidating') and m['trend_strong'] and finite(q.get('change_pct')) and q['change_pct']>0 and price >= p5.get('MA_now',math.inf) and price > max(b['high'] for b in bars[-P['restart_days']:]):
++                m['event_evidence']['再启动'] = dict(price=price,previous_day=days[-1],previous_trend=prev['trend_score'],MA5=p5['MA_now'],threshold=max(b['high'] for b in bars[-3:]),dates=[b['date'] for b in bars[-3:]])
++            if bars[-1]['close'] < bars[-1]['open'] and finite(q.get('change_pct')) and q['change_pct']>0 and price>=bars[-1]['open']:
++                m['event_evidence']['反包'] = dict(price=price,threshold=bars[-1]['open'],date=bars[-1]['date'])
++        m['events'] = [e for e in P['event_priority'] if e in m['event_evidence']]
++        m['risks'] = list(dict.fromkeys(rows[c].get('intraday_risk_flags') or [])) if m.get('quote_at') else []
++        # Old daily risk_notes mixes qualification failures with risk facts; never project it.
++        p5=m['trend_parts_by_period'].get('5',{})
++        if p5.get('MA_now') is not None and positive(p5.get('ATR')):
++            if (q['price']-p5['MA_now'])/p5['ATR'] > config.INTRADAY_RISK['overheat_dist_atr']:
++                m['risks'].append('现价距盘中MA5过远，位置偏热')
++        if m['emotion_parts'].get('actual_limit'):
++            m['risks'].append('当前报价在涨停价')
++        m['risks']=list(dict.fromkeys(m['risks']))
++        if reference and previous and (previous.get('market_strength') or {}).get('implementation_hash') == IMPLEMENTATION_HASH:
++            old = next((r.get('market_strength') for r in previous.get('stocks',[])+previous.get('coverage_catalog',[]) if r['code']==c),None)
++            if old:
++                m = current[c] = copy.deepcopy(old)
++                m['mode'] = '参考行情 · 原时点 '+str(old.get('trend_at') or old.get('emotion_at'))
++        rows[c]['market_strength'] = m
++    for b in boards:
++        m = board_current[b['id']]
++        m['history_trend'] = [{'date':d,'score':board_history[d][b['id']]['trend_score']} for d in days]
++        m['history_basis'] = '当前确认成员的历史背景，不是当时成分回测'
++        dominant = m['dominant_period']
++        codes = m['trend_parts_by_period'].get(str(dominant),{}).get('member_codes',[])
++        cons_codes = [c for c in codes if current[c].get('R3') is not None and current[c]['trend_parts_by_period'].get('5',{}).get('MA_now') is not None]
++        cp = coverage(cons_codes,m['expected_codes'])
++        cons = None
++        if cp['eligible']:
++            cp['R3'],cp['trimmed_codes'] = trim({c:current[c]['R3'] for c in cons_codes})
++            cp['below_MA5_share'] = mean(qs[c]['price'] < current[c]['trend_parts_by_period']['5']['MA_now'] for c in cons_codes)
++            cons = cp['R3'] <= 0 or cp['below_MA5_share'] >= P['phase_consolidation_share']
++        m['consolidation_parts'] = cp
++        m['phase'],m['strong_days'] = phase(m['trend_score'],m['emotion_score'],[x['score'] for x in m['history_trend']],cons)
++        if m['phase']=='启动' and not m['trend_strong']:
++            m['reasons'].append('情绪先行')
++        if m['trend_strong']:
++            m['reasons'].append(str(dominant)+'日成员趋势共振')
++        if m['emotion_strong']:
++            m['reasons'].append('成员情绪共振')
++        m['member_event_counts'] = {e:sum(e in current[c]['events'] for c in m['expected_codes']) for e in P['event_priority']}
++        m['events'] = [e+str(n)+'只' for e,n in m['member_event_counts'].items() if n]
++        idx = (b.get('index_quote') or b.get('index_trend') or {})
++        index_r = idx.get('change_pct',idx.get('ret1'))
++        rb = m['emotion_parts'].get('R0')
++        m['index_reference'] = copy.deepcopy(idx)
++        idx_current=b.get('index_current') or {}
++        index_valid=bool(idx.get('valid',idx.get('ready',False)) or
++                         idx_current.get('ready') and idx_current.get('quote_at')==idx.get('quote_at'))
++        m['index_reference']['valid']=index_valid
++        if finite(index_r) and finite(rb) and index_r*rb < 0 and index_valid:
++            m['reasons'].append('指数/主板成员分歧')
++        if reference and previous and (previous.get('market_strength') or {}).get('implementation_hash') == IMPLEMENTATION_HASH:
++            old=next((x.get('market_strength') for x in previous.get('board_catalog',[]) if x['id']==b['id']),None)
++            if old:
++                m=board_current[b['id']]=copy.deepcopy(old)
++                m['mode']='参考行情 · 原时点 '+str(old.get('trend_at') or old.get('emotion_at'))
++        b['market_strength'] = m
++        # Every member, including emotion-only and unknown stocks, uses the stock's single result.
++        b['members'] = [dict(code=c,name=rows[c].get('name'),change_pct=rows[c].get('change_pct'),market_strength=brief(current[c])) for c in sorted(set(b.get('member_codes',[]))) if c in current]
++        b['lists'] = {k:[r['code'] for r in b['members'] if r['market_strength'][k+'_strong']] for k in ('trend','emotion')}
++        b['lists']['focus'] = [r['code'] for r in b['members'] if r['market_strength']['focus']]
++        b['opportunity'] = dict(version=VERSION,current_opportunity=m['focus'],primary_label=m['phase'],status=m['phase'] or '—',market_strength=m)
++    stock_lists,board_lists = lists(current),lists(board_current)
++    pool_stats = {}
++    for n in P['periods']:
++        codes = sorted(c for c,m in current.items() if finite(m['trend_parts_by_period'].get(str(n),{}).get('T')))
++        pool_stats[str(n)] = dict(N=len(codes),coverage_pct=len(codes)/len(pool)*100 if pool else None,hash=hashlib.sha256(json.dumps(codes).encode()).hexdigest())
++    emotion_codes = sorted(c for c,m in current.items() if m['emotion_score'] is not None)
++    emotion_groups = {}
++    for limit in sorted({q['limit_pct'] for q in qs.values() if positive(q.get('limit_pct'))}):
++        codes = sorted(c for c in current if current[c].get('emotion_reference',{}).get('limit_pct')==limit)
++        emotion_groups[str(limit)] = dict(N=len(codes),valid=sum(current[c]['emotion_score'] is not None for c in codes),
++                                         member_codes=codes,hash=hashlib.sha256(json.dumps(codes).encode()).hexdigest())
++    board_pools={}
++    for kind in ('industry','theme'):
++        ids=[b['id'] for b in boards if b['type']==kind]
++        board_pools[kind]={}
++        for axis in [str(n) for n in P['periods']]+['emotion']:
++            valid_ids=sorted(i for i in ids if (board_current[i]['emotion_score'] if axis=='emotion' else
++                             board_current[i]['trend_parts_by_period'].get(axis,{}).get('T')) is not None)
++            board_pools[kind][axis]=dict(N=len(valid_ids),ids=valid_ids,hash=hashlib.sha256(json.dumps(valid_ids).encode()).hexdigest())
++    snap['market_strength'] = dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,parameters=copy.deepcopy(P),
++        at=str(now),mode='参考行情' if reference else '正式收盘' if formal_close else '午休参考' if session=='午间休市' else '连续竞价',
++        stocks=stock_lists,boards=board_lists,counts={k:len(stock_lists[k]) for k in ('all','focus','trend','emotion','both')},
++        board_counts={k:len(board_lists[k]) for k in ('all','focus','trend','emotion','both')},
++        reference_pools=pool_stats,emotion_reference_pools=emotion_groups,board_reference_pools=board_pools,
++        coverage=dict(pool=len(pool),trend_valid=sum(m['trend_score'] is not None for m in current.values()),
++                      emotion_valid=len(emotion_codes),trend_missing=sum(m['trend_score'] is None for m in current.values()),
++                      emotion_missing=len(pool)-len(emotion_codes)))
++    # Legacy opportunity objects are projections only. No waiting state or lifecycle accumulation.
++    by_code = {c:dict(code=c,name=rows[c].get('name'),version=VERSION,current=m['focus'],market_strength=m,
++                     labels=m['events'],main_label=m['phase'],status=m['phase'] or '—',risk=m['risks'],boards=[],categories={}) for c,m in current.items()}
++    for c,r in rows.items():
++        r['radar_opportunity'] = by_code[c]
++    snap['radar_opportunity'] = dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,by_code=by_code,
++        lists=dict(current=stock_lists['focus']),counts=dict(current=len(stock_lists['focus'])),market_strength_version=VERSION)
++    snap['radar'] = dict(market_strength=stock_lists)
++    snap['board_opportunity_model'] = dict(version=VERSION,counts=dict(current=len(board_lists['focus'])),lists=dict(current=board_lists['focus']))
++    return snap['market_strength']
++
++
++def validate(snap):
++    meta = snap['market_strength']
++    assert meta['version'] == VERSION
++    assert meta['implementation_hash'] == IMPLEMENTATION_HASH
++    assert json.dumps(json.loads(json.dumps(meta['parameters'])),sort_keys=True) == json.dumps(json.loads(json.dumps(P)),sort_keys=True)
++    rows = snap.get('stocks',[])+snap.get('coverage_catalog',[])
++    assert len(rows) == len({r['code'] for r in rows}), 'duplicate stock'
++    stocks = {r['code']:r['market_strength'] for r in rows}
++    boards = {b['id']:b['market_strength'] for b in snap.get('board_catalog',[])}
++    for objects in (stocks,boards):
++        for c,m in objects.items():
++            assert m['version'] == VERSION
++            for axis in ('trend','emotion'):
++                score = m[axis+'_score']
++                assert score is None or finite(score) and 0<=score<=100 and rounded(score)==score
++                assert m[axis+'_strong'] == (score is not None and score>=P['strong_min'])
++                assert m[axis+'_level'] == level(score)
++            assert m['focus'] == (m['trend_strong'] or m['emotion_strong'])
++            assert (m['trend_score'],m['dominant_period']) == choose(m['trend_parts_by_period'])
++            for n,part in m['trend_parts_by_period'].items():
++                if part.get('T') is not None:
++                    scale = P['board_full_returns' if objects is boards else 'stock_full_returns'][int(n)]
++                    expected = period_score(part['R'],part['S'],part['K'],scale)
++                    assert all(abs(part[k]-v)<1e-8 for k,v in expected.items())
++                    if objects is boards:
++                        assert part['valid'] >= P['board_min_valid_members'] and part['coverage_pct']>=P['board_min_coverage_pct']
++            if objects is stocks and m['emotion_score'] is not None:
++                ep=m['emotion_parts']
++                assert m['emotion_score'] == rounded(P['emotion_attack_weight']*ep['D']+P['emotion_hold_weight']*ep['H'])
++                if ep['R0']<=0:assert m['emotion_score']<=58
++    assert meta['stocks'] == lists(stocks)
++    assert meta['boards'] == lists(boards)
++    assert meta['counts'] == {k:len(meta['stocks'][k]) for k in ('all','focus','trend','emotion','both')}
++    assert meta['board_counts'] == {k:len(meta['boards'][k]) for k in ('all','focus','trend','emotion','both')}
++    assert snap['radar_opportunity']['lists']['current']==meta['stocks']['focus']
++    for b in snap.get('board_catalog',[]):
++        assert b['opportunity']['current_opportunity']==b['market_strength']['focus']
++        assert len(b['members'])==len({r['code'] for r in b['members']})
++        for r in b['members']:assert r['market_strength']==brief(stocks[r['code']])
++        for axis in ('trend','emotion'):assert b['lists'][axis]==[r['code'] for r in b['members'] if r['market_strength'][axis+'_strong']]
++    return True

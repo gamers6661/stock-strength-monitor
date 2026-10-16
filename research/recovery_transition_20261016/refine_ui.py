@@ -1,0 +1,19 @@
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+def edit(name,old,new):
+    p=ROOT/name;s=p.read_text(encoding='utf8');assert s.count(old)==1,(name,old[:80],s.count(old));p.write_text(s.replace(old,new),encoding='utf8')
+edit('stock_rank_ui.js'," 'MA5初期推进':", " 'MA20整理跟踪':'本轮上涨已达到20%及4 ATR，失守MA10但仍守住MA20，先继续跟踪；尚未回踩MA20或形成合格平台，不计入有效近线观察。',\n '再启动待确认':'MA20整理后已重新站上MA5，等待后续完成日继续上涨、超过观察日收盘且MA5及MA10上行。尚未转为已确认的MA5阶段。',\n '涨停收复后推进确认':'近5个交易日的有效涨停收复后，至少一个完成日收盘高于前日和收复日、守住MA5且MA5及MA10上行，期间MA10未失守。收复日记为本轮起点，后续确认日单独记录。',\n '涨停起涨后强势确认':'旧波段结束后出现涨停收复MA5，但当时未通过正式入口。后续5日内通过原有强势入口且两线向上，才关联该次起涨日；不会回填起涨日已入选。',\n 'MA20整理后再启动':'MA20整理跟踪期间收复MA5，后续完成日继续上涨、超过观察日收盘且MA5及MA10上行，转回MA5；既有强势入口也可独立确认。再启动观察日与确认日分别记录，旧波段仅供回看。',\n 'MA5初期推进':")
+edit('stock_rank_ui.js','尚未通过现有强势入口，不计入三阶段有效观察。候选日期与历史波段起点分别记录。','等待后续完成日沿MA5继续上涨确认，或通过原有独立强势入口；当前不计入三阶段有效观察。')
+edit('stock_rank_ui.js','有完成日放量上攻、有效突破或涨停突破的强势入口，随后沿MA5推进。','有完成日放量上攻、有效突破、涨停突破或已确认的收复/整理再启动，随后沿MA5推进。')
+edit('ma_trend_ui.js',"function mtOrigin(m){", "function mtDates(m){var o=m.origin||{},f=o.confirmation||{},w=m.ma20_restart_observation;return '<span class=\"cd\">'+(f.kind==='MA20整理后再启动'?'再启动观察 ':f.kind?'本轮起涨 ':'本轮启动 ')+esc(o.date||'—')+(f.date?' · 阶段确认 '+esc(f.date):'')+'</span>'+(w?'<span class=\"cd\">本次再启动观察 '+esc(w.date)+' · 待后续完成日确认</span>':'')+'<span class=\"cd\">最近强势确认 '+esc((m.last_confirmation||{}).date||f.date||o.date||'—')+'</span>'; }\nfunction mtOrigin(m){")
+edit('ma_trend_ui.js',"+'</b><span class=\"cd\">'+(mtHistorical(m)||m.candidate_mode?'历史启动 ':'本轮启动 ')+esc(o.date||'—')+' · 最近确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+'</span><span class=\"cd\">启动量比 '", "+'</b>'+mtDates(m)+'<span class=\"cd\">事件量比 '")
+edit('ma_trend_ui.js',"function mtDetail(m){", "function mtConfirmation(m){var o=m.origin||{},f=o.confirmation||{};if(!f.date)return '';var independent=f.independent_signal||{};return '<p><b '+msTipAttrs(f.kind)+'>'+esc(f.kind)+'</b></p>'+mtDates(m)+'<p>事件收盘 '+mtValue(f.event_close)+' → 确认收盘 '+mtValue(f.close)+'；确认日MA5 '+mtValue(f.ma5)+' / MA10 '+mtValue(f.ma10)+'</p><p>'+esc(f.basis||'后续完成日高于前日及事件日收盘，守住MA5，MA5及MA10上行，期间MA10未失守')+'</p>'+(independent.kind?'<p>独立入口 '+esc(independent.kind)+' · 确认日量比 '+mtValue(independent.volume_ratio)+'</p>':'')+(f.prior_stage===20?'<p>前段上涨 '+pctHtml(f.prior_rise_pct)+' / '+mtValue(f.prior_rise_atr)+' ATR；'+(f.prior_ma20_touched?'已核验MA20回踩':'此前为MA20上方整理跟踪，未标作实际回踩MA20')+'</p>':'');}\nfunction mtDetail(m){")
+edit('ma_trend_ui.js',"+'<p>单日上涨 '", "+(o.confirmation?mtConfirmation(m):'<p>单日上涨 '")
+edit('ma_trend_ui.js',"+'%</p><p>前段上涨 '", "+'%</p>')+'<p>前段上涨 '")
+edit('ma_trend_ui.js',"var e=mtHistorical(m)?{stage:m.stage,date:m.exit_at,reason:m.reason,origin:m.origin,platform:m.platform,support:m.support_price}:m.last_exit;", "var e=mtHistorical(m)?{stage:m.stage,date:m.exit_at,reason:m.reason,origin:m.origin,platform:m.platform,support:m.support_price}:[m.last_phase,m.last_exit].filter(Boolean).sort(function(a,b){return String(b.date||'').localeCompare(String(a.date||''));})[0];")
+edit('ma_trend_ui.js','过往均线阶段记录 · ', '过往均线阶段记录 · ')
+edit('ma_trend_ui.js','MA20优先守线，失守后看合格平台；两者均失守退出。','MA20优先守线，失守后看合格平台；两者均失守退出。MA20上方整理跟踪与正式近线观察分开；收复MA5后另记观察日和确认日。')
+edit('csv_export.js',"'本轮启动日','最近强势确认日'", "'本轮启动日','阶段确认日','再启动观察日','最近强势确认日'")
+edit('csv_export.js',"(mt.origin||{}).date,(mt.last_confirmation||mt.origin||{}).date", "(mt.origin||{}).date,((mt.origin||{}).confirmation||{}).date||mt.entry_date,(mt.ma20_restart_observation||{}).date||(((mt.origin||{}).confirmation||{}).prior_stage===20?(mt.origin||{}).date:null),(mt.last_confirmation||mt.origin||{}).date")
+edit('csv_export.js',"'起点日期','起点通道'", "'起点日期','阶段确认日','再启动观察日','最近强势确认日','起点通道'")
+edit('csv_export.js',"m.distance_atr,o.date,o.kind", "m.distance_atr,o.date,(o.confirmation||{}).date||m.entry_date,(m.ma20_restart_observation||{}).date||((o.confirmation||{}).prior_stage===20?o.date:null),(m.last_confirmation||o).date,o.kind")

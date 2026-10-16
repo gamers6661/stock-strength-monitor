@@ -1,0 +1,45 @@
+import csv
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+OUT = Path(__file__).parent
+raw = (OUT / 'browser_result.txt').read_text(encoding='utf-8-sig')
+browser, _ = json.JSONDecoder().raw_decode(raw.split('### Result', 1)[1].lstrip())
+(OUT / 'browser.json').write_text(json.dumps(browser, ensure_ascii=False, indent=2), encoding='utf-8')
+
+def read_csv(name):
+    with (ROOT / 'output/playwright' / name).open(encoding='utf-8-sig', newline='') as handle:
+        reader = csv.DictReader(handle)
+        return reader.fieldnames, list(reader)
+
+headers, rows = read_csv('followup-layout-all.csv')
+prior_headers, prior = read_csv('layout-all.csv')
+assert headers == prior_headers and rows == prior, '修改前后导出内容有差异'
+assert len(rows) == 3120 and len(headers) == 241
+assert browser['followup']['codes'] == browser['followup']['expected']
+assert browser['followup']['count'] == 24
+assert browser['labels']['nonTrendLabeled'] == 0
+scope = json.loads((OUT / 'scope.json').read_text(encoding='utf-8'))
+scope.update(csv_exactly_unchanged=True, csv_rows=len(rows), csv_columns=len(headers))
+(OUT / 'scope.json').write_text(json.dumps(scope, ensure_ascii=False, indent=2), encoding='utf-8')
+report = '''# 转强跟踪与个股回踩标签验收
+
+本轮调整页面展示：dashboard_template.html、生成的dashboard.html，以及check_dashboard.py和check_live_service.py内对应页面节点的验收约定。71份模型与运行源码、数据快照、筛选、排序、评分和导出函数保持不变。
+
+转强后跟踪：每只股票使用独立卡片，股票名称及报价单列；已有转强保持、风险降级、转弱退出、待核验和风险记录以标签呈现，点击或悬停可查看原有依据。转强前整理天数、原转强参考价、连续失守MA20次数独立显示，跟踪时间只保留一处。
+
+首页：移除旧MA5、MA10、MA20近线对照板块及对应切换功能。后台原有观察记录保留，供个股标签引用。
+
+个股列表及详情：仅在原有trend_online成立且存在MA观察记录或历史回踩形态时显示回踩标签。MA5、MA10、MA20均有实际验证。近线观察与已有收复记录分别显示，注释保留距离百分比、ATR距离、均线价、报价时间和原判断。近线不等于触线或反弹确认；午间、旧报价和历史日线用上午、上次或日线前缀标明参考性质。没有趋势或回踩证据的股票不显示标签。没有新增选股门槛或评分。
+
+验证：真实浏览器24条跟踪记录数量和顺序逐项不变，进攻75只、整理21只不变；191只股票引用原有证据显示标签，非趋势股票标签数量为0；MA5顺发恒能、MA10确成股份、MA20南方传媒在列表及详情均通过点击检查，苏宁环球MA5收复记录通过核对；宝钢股份趋势存在但无回踩证据，没有添加标签。标签注释、个股详情、原CSV导出可用。390px窄屏卡片没有横向溢出。
+
+原生CSV导出3120行、241列，列名和全部数值与本轮修改前完全一致。check_dashboard.py与check_live_service.py通过。此次验收发生在午间，当前盘中标签在上午参考状态下验证，下午实时交易更新由原有运行链路负责。
+
+截图：output/playwright/followup-cards.png、followup-mobile.png、pullback-stock-list.png、pullback-stock-detail.png。详细数据见browser.json与scope.json。
+
+原模板备份在本目录dashboard_template.before.html，仅用于恢复，不参与新版运行。
+'''
+(OUT / '验收记录.md').write_text(report, encoding='utf-8')
+print(json.dumps(dict(scope=scope, followup=browser['followup'], labeled_stocks=browser['labels']['labeledStocks']), ensure_ascii=False))

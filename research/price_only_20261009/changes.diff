@@ -1,0 +1,1406 @@
+--- attack_model.py before
++++ attack_model.py after
+@@ -5,9 +5,8 @@
+ 
+ 
+ VERSION = "趋势进攻模型1"
+-LIVE_VERSION = "盘中进攻资金模型2"
+-LIVE_WEIGHTS = {"price": .85, "main_fund": .15}
+-FUND_PARAMETERS = {"proxy_weight": .075, "full_ratio_pct": 20.0, "max_age_seconds": 600}
++LIVE_VERSION = "盘中价格进攻模型3"
++LIVE_WEIGHTS = {"price": 1.0}
+ WEIGHTS = {"attack5": .50, "attack10": .30, "attack20": .20}
+ LABELS = {"attack5": "5日攻击速度", "attack10": "10日推进", "attack20": "20日涨幅基础"}
+ # 初版研究参数，固定公布；不能为单只股票更改或使用未来收益寻优。
+@@ -95,37 +94,9 @@
+ 
+ 
+ def fund_confirmation(row, meta, captured_at):
+-    """净额占成交额评分；超大单只作半权重代理，未知不补零。"""
+-    result = {"score": None, "weight": 0.0, "ratio": None,
+-              "status": "资金待核验，沿用价格分", "source": row.get("fund_today_source"),
+-              "at": row.get("fund_today_at")}
+-    source = row.get("fund_today_source") or ""
+-    if not number(row.get("fund_today_yi")) or not number(row.get("fund_today_ratio")):
+-        return result
+-    if meta.get("stale") is not False or source != meta.get("source"):
+-        return result
+-    try:
+-        now, at, quote_at = [datetime.strptime(v, "%Y-%m-%d %H:%M:%S") for v in
+-                            (captured_at, row.get("fund_today_at"), row.get("intraday_quote_at"))]
+-    except (TypeError, ValueError):
+-        return result
+-    if (now.date() != at.date() or at.date() != quote_at.date()
+-            or not 0 <= (now-at).total_seconds() <= FUND_PARAMETERS["max_age_seconds"]
+-            or abs((at-quote_at).total_seconds()) > FUND_PARAMETERS["max_age_seconds"]):
+-        return result
+-    if source == "东财主力净流入":
+-        weight, label = LIVE_WEIGHTS["main_fund"], "主力净额确认"
+-    elif source == "新浪当日超大单净额" and meta.get("period") == "today":
+-        weight, label = FUND_PARAMETERS["proxy_weight"], "超大单参考（源未给交易日）"
+-    else:
+-        return result
+-    ratio, net = row["fund_today_ratio"], row["fund_today_yi"]
+-    if abs(ratio) > 100 or (net > 0 and ratio < 0) or (net < 0 and ratio > 0):
+-        return result
+-    result.update(score=round(max(0, min(100, 50 + ratio / FUND_PARAMETERS["full_ratio_pct"] * 50)), 2),
+-                  weight=weight, ratio=ratio,
+-                  status=label + (" · 净流入" if ratio > 0 else " · 净流出" if ratio < 0 else " · 中性"))
+-    return result
++    """仅保留旧字段的空值合同；资金流不再进入任何当前判断。"""
++    return {"score": None, "weight": 0.0, "ratio": None,
++            "status": "已停用", "source": None, "at": None}
+ 
+ 
+ def enrich(snap, quotes, price_contexts, previous_snapshot=None):
+@@ -159,12 +130,8 @@
+         context = price_contexts[code]
+         price_key = tier(item["score"], returns[code], row.get("intraday_trend_ok") is True,
+                    row.get("past_impulse5_pct"))
+-        fund = row["live_attack_fund"]
+-        combined = round((1-fund["weight"])*item["score"] + fund["weight"]*fund["score"], 2) if fund["score"] is not None else item["score"]
++        combined = item["score"]
+         key = tier(combined, returns[code], row.get("intraday_trend_ok") is True, row.get("past_impulse5_pct"))
+-        # 资金只确认真实价格进攻；禁止资金把价格非A的慢涨股抬进A。
+-        if key == "A" and price_key != "A":
+-            key = price_key
+         pattern = price_pattern(context["aligned_bars"], q["price"],
+                                 row.get("intraday_ma10_exact"), q.get("change_pct"), live=True)
+         if key in ("A", "B") and pattern["stage"] == "趋势整理":
+@@ -207,7 +174,7 @@
+                 row["live_attack_price_score"] = old.get("live_attack_score")
+                 row["live_attack_price_tier"] = old.get("live_attack_tier")
+                 row["live_attack_fund"] = {"score": None, "weight": 0.0, "ratio": None,
+-                                           "status": "旧版价格观察 · 资金尚未重评",
++                                           "status": "已停用",
+                                            "source": None, "at": None}
+             row["live_attack_status"] = "历史观察，当前阶段未重新判断"
+     watched = sorted((r for r in rows if r["attack_watch_candidate"]),
+@@ -233,8 +200,8 @@
+                               "count": len(watched), "sample_count": len(scores),
+                               "rows": monitor_rows, "retained": retained,
+                               "parameters": PARAMETERS, "weights": LIVE_WEIGHTS,
+-                              "fund_parameters": FUND_PARAMETERS, "price_weights": WEIGHTS,
+-                              "criterion": "价格进攻与资金辅助后的综合分均达暂态A；当日上涨≥3%或反包/突破，现价守住MA10且无严重转弱；完整主力15%、超大单参考7.5%、资金未知沿用价格分；MA5过热及成交限制另列"}
++                              "price_weights": WEIGHTS,
++                              "criterion": "价格进攻达到暂态A；当日上涨≥3%或反包/突破，现价守住MA10且无严重转弱；MA5过热及成交限制另列"}
+     return snap["attack_monitor"]
+ 
+ 
+@@ -250,6 +217,7 @@
+         last=row.get('intraday_last_judgment') or {}
+         if (str(row['code']) in included or row.get('intraday_observation_available') is True
+                 or last.get('valid') is not True or last.get('attack') is not True
++                or (last.get('fund') or {}).get('weight', 0) > 0
+                 or not day or str(last.get('at') or '')[:10]!=day or not number(last.get('attack_score'))):
+             continue
+         shown.append(dict(code=row['code'],name=row.get('name'),price=last.get('price'),
+--- check_live_service.py before
++++ check_live_service.py after
+@@ -16,6 +16,7 @@
+ import board_quote
+ import weekly_members
+ import scoring
++import price_only
+ from datetime import datetime
+ 
+ 
+@@ -36,6 +37,10 @@
+     assert status["code_model_version"] == strength.VERSION
+     assert status["code_strength_version"] == stock_strength.VERSION
+     assert status.get('code_close_refresh_version') == scoring.CLOSE_REFRESH_VERSION, '服务尚未载入新版收盘更新流程，需要重启'
++    assert status.get('code_fund_reference_version') == price_only.VERSION, '服务尚未停用资金参考，需要重启'
++    assert snapshot.get('fund_reference_version') == served.get('fund_reference_version') == price_only.VERSION
++    assert snapshot.get('fund_available') is False and snapshot.get('fund_confirmation', {}).get('enabled') is False
++    assert not any(s.get('fund_today_yi') is not None or s.get('fund_positive_all') is not None for s in served['stocks']+served.get('coverage_catalog', []))
+     assert snapshot.get('close_refresh_version') == served.get('close_refresh_version') == scoring.CLOSE_REFRESH_VERSION, '收盘更新流程与实际页面快照不一致'
+     if served.get('close_daily_verified_at'):
+         day = served['close_daily_verified_at'][:10]
+@@ -212,8 +217,8 @@
+             assert row["intraday_quote_fresh"] and row["intraday_price_basis_comparable"] is True
+             assert row["live_attack_tier"] == "A" and not row["intraday_serious_weakness"]
+             assert row["live_attack_price_tier"] == "A"
+-            fund = row["live_attack_fund"]
+-            expected_score = round(row["live_attack_price_score"] * (1-fund["weight"]) + fund["score"] * fund["weight"], 2) if fund["score"] is not None else row["live_attack_price_score"]
++            assert row['live_attack_fund']['weight'] == 0 and row['live_attack_fund']['score'] is None
++            expected_score = row["live_attack_price_score"]
+             assert row["live_attack_score"] == expected_score
+             assert row["intraday_trend_ok"] is True
+         assert served["attack_monitor"]["count"] == len(watched)
+--- config.py before
++++ config.py after
+@@ -654,14 +654,13 @@
+ # 四、板块强度因子权重（合计 1.0）—— **板块榜专用**
+ #
+ # 注意：这与个股的 Sector 因子（SECTOR_WEIGHTS）是两套口径。
+-# 板块榜是"板块之间比强弱"，按用户要求保留东财主力资金作为排序项；
++# 板块榜是"板块之间比强弱"，只使用价格、联动和动能；
+ # 个股的 Sector 因子只用四项（不含主力资金）。
+ # ═══════════════════════════════════════════════════════
+ BOARD_WEIGHTS = {
+-    "rs":        0.32,   # 板块多周期涨幅相对强度
+-    "fund":      0.26,   # 板块主力资金净流入（东财口径）
+-    "linkage":   0.24,   # 板块内联动（上涨家数占比）
+-    "momentum":  0.18,   # 板块动能（近5日强于大盘天数）
++    "rs":        32/74, # 移除资金后，原有三个价格维度等比例归一
++    "linkage":   24/74,
++    "momentum":  18/74,
+ }
+ 
+ # 板块轮动阶段判定阈值（板块涨幅分位 / 资金流分位）
+--- dashboard_template.html before
++++ dashboard_template.html after
+@@ -935,7 +935,7 @@
+ <!-- ══════ 总览 ══════ -->
+ <section class="pane on" id="p-overview">
+   <div class="hero">
+-    <h1 id="hero-h1">今天的资金<br>去了哪里</h1>
++    <h1 id="hero-h1">价格趋势与<br>强势板块</h1>
+     <p id="hero-p">—</p>
+     <details class="hero-data"><summary>数据时间与来源 ▾</summary><div class="stamp" id="hero-stamp"></div></details>
+   </div>
+@@ -1062,7 +1062,7 @@
+ <section class="pane" id="p-radar">
+   <div class="hero" style="padding-bottom:26px">
+     <h1 style="font-size:clamp(2rem,3.6vw,3rem)">选股雷达</h1>
+-    <p id="rad-sub">先看5/10/20日线趋势，再按个股自身强度分位分档；回踩、资金和风险单列。</p>
++    <p id="rad-sub">先看5/10/20日线趋势，再按个股自身强度分位分档；回踩、量价结构和风险单列。</p>
+   </div>
+   <div class="main" style="padding-top:0">
+     <div class="grid" id="rad-tiers" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px"></div>
+@@ -1079,23 +1079,6 @@
+   </div>
+   <div class="main" style="padding-top:0">
+     <div class="grid g4" id="bd-metrics" style="margin-bottom:26px"></div>
+-    <div class="card" id="legacy-board-quadrant" style="display:none;margin-bottom:26px">
+-      <h3>板块四象限 <small>横轴 今日涨跌幅 · 纵轴 资金强度 · 点大小 = 综合强度</small></h3>
+-      <div class="q-toolbar">
+-        <span>默认只标注重点板块；悬停任意圆点看完整数据，点击圆点查看板块链路。</span>
+-        <button class="btn" id="q-toggle" type="button">显示更多标签</button>
+-      </div>
+-      <canvas class="chart" id="q-cv" style="height:430px"></canvas>
+-      <div id="q-hover" class="q-hover">将鼠标移到圆点上查看板块名称、涨幅、资金强度和综合分。</div>
+-      <div id="q-focus" class="q-focus"></div>
+-      <div class="row wrap" style="gap:18px;margin-top:14px;font-size:11.5px;color:var(--txt3);align-items:center">
+-        <span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#e8271a;margin-right:6px"></i>双强共振（涨幅+资金双强 → 主升）</span>
+-        <span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f08c00;margin-right:6px"></i>资金潜伏（资金已进、涨幅未启动 → 轮动前哨）</span>
+-        <span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#0071e3;margin-right:6px"></i>涨幅先行（涨了但资金没跟 → 谨慎）</span>
+-        <span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#6e6e73;margin-right:6px"></i>双弱（回避）</span>
+-      </div>
+-      <div id="q-sub" style="font-size:11.5px;color:var(--txt3);margin-top:9px"></div>
+-    </div>
+     <div class="card" id="legacy-board-table" style="display:none;margin-bottom:26px">
+       <h3>板块强度榜 <small id="bd-sub"></small></h3>
+       <div class="tw" style="border:0;background:transparent"><table id="tb-boards"></table></div>
+@@ -1128,7 +1111,7 @@
+           <table id="tb-th2"></table></div>
+       </div>
+       <div class="card">
+-        <h3>题材资金流 <small>组内主力净额合计</small></h3>
++        <h3>题材成交活跃度 <small>组内成交额合计</small></h3>
+         <div class="tw" style="border:0;background:transparent;max-height:600px;overflow-y:auto">
+           <table id="tb-th3"></table></div>
+       </div>
+@@ -1405,7 +1388,7 @@
+   sort:{stocks:{k:null,asc:false},boards:{k:'score',asc:false},hold:{k:'score',asc:false}},
+   limit:80,
+   // 区间筛选一律用「下限~上限」成对出现，未改动时等于全域值（不参与计数）。
+-  // 之前没有资金分与60日位置的区间，用户想筛"资金流入前30%"只能靠状态标签猜。
++  // 数值区间与状态标签共同表达筛选条件。
+   filters:defaultFilters(),
+   cols:{board:true,industry:true,factors:true},
+   // 状态标签多选逻辑：'and' 需同时满足（适合"低位+放量"这类叠加条件），
+@@ -2052,10 +2035,7 @@
+   var raw=flags[0],label=raw.indexOf('位置偏热')>=0?'位置偏热':raw.indexOf('MA20')>=0?'MA20失守':raw.indexOf('MA10')>=0?'MA10失守':raw;
+   return uiTag(label+(flags.length>1?' +'+(flags.length-1):''),label==='位置偏热'?'warn':'risk',flags.join('\n'));
+ }
+-function uiFund(f){
+-  if(!f||f.score==null||f.ratio==null)return uiTag('资金待核验','','资金来源或覆盖未满足现有要求，进攻判断沿用已有价格结果。');
+-  return uiTag('资金 '+sgn(f.ratio,1)+'%',f.ratio>0?'good':'',f.status+'；占成交额 '+sgn(f.ratio,2)+'%；现有计分权重 '+fmt(f.weight*100,1)+'%；资金分 '+fmt(f.score,1)+'。\n采集 '+(f.at||'未知')+'。资金只作辅助，不能把价格非A提升为A。');
+-}
++function uiFund(f){return "";}
+ function uiCardStart(s,priceHtml,lookup){
+   return '<article class="work-observation ui-stock-card" data-stock-code="'+esc(s.code)+'" onclick="showStock(\''+jsq(s.code)+'\')">'
+     +'<div class="work-observation-top"><button type="button" class="ui-stock-name" aria-label="查看'+esc(s.name+s.code)+'详情"><span class="work-observation-name">'+esc(s.name)
+@@ -2231,7 +2211,7 @@
+     +(c.structure_state?uiTag(uiStructure(c.structure_state),'',c.structure_state+'。'+(c.breakout_threshold==null?'':'原平台突破门槛 ¥'+fmt(c.breakout_threshold,4)+'；价格越界仍需成交量和收盘确认。')):'')
+     +uiRisk(flags,!valid||s.intraday_risk_level==='待核验')
+     +(!e.valid?uiTag('历史待核验','warn',e.reason||'历史窗口尚未完成核验'):'')+'</div>'
+-    +'<div class="ui-metrics">'+uiMetric('综合进攻',a==null?null:fmt(a,1),'分','原有综合进攻分；'+(s.live_attack_tier||'待核验')+'档；判断截至 '+(s.intraday_judgment_at||s.intraday_quote_at||'未知')+'。',a)
++    +'<div class="ui-metrics">'+uiMetric('进攻强度',a==null?null:fmt(a,1),'分','原有综合进攻分；'+(s.live_attack_tier||'待核验')+'档；判断截至 '+(s.intraday_judgment_at||s.intraday_quote_at||'未知')+'。',a)
+     +uiMetric('最新价格进攻',valid&&c.price_attack_score!=null?fmt(c.price_attack_score,1):null,'分','原有最新价格分；'+(c.price_attack_tier||'待核验')+'档；报价 '+(c.quote_at||'未知')+'。')
+     +uiMetric('距盘中 MA5',s.live_overheat_dist_atr==null?null:fmt(s.live_overheat_dist_atr,2),'ATR','原有距离。严格超过3.5 ATR触发位置偏热；分数不抵消风险。')
+     +uiMetric(valid&&c.breakout_threshold!=null?'原平台突破门槛':'20日高点',valid&&c.breakout_threshold!=null?fmt(c.breakout_threshold,2):high==null?null:fmt(high,2),'元','已换算到当前报价尺度。原平台固定；20日高点仅为价格形态参考。')+'</div>'
+@@ -2367,9 +2347,6 @@
+   st.push('<span class="t">阶段 <b>'+esc(sess)+'</b></span>');
+   st.push('<span class="t">模式 <b>'+(DATA.mode==='full'?'全量':'增量')+'</b></span>');
+   st.push('<span class="t">耗时 <b>'+n(DATA.elapsed)+'s</b></span>');
+-  st.push('<span class="t">资金口径 <b>'+esc(DATA.fund_source||'—')+'</b></span>');
+-  var cov=boards.filter(function(x){return x.fund_covered>0||x.fund_today_covered>0;}).length;
+-  st.push('<span class="t">题材资金覆盖 <b>'+cov+'/'+boards.length+'</b></span>');
+   var sh=DATA.data_sources||{};
+   function srcState(x){
+     x=x||{}; if(x.status==='ok')return '实时';
+@@ -2379,9 +2356,7 @@
+     return '未探测';
+   }
+   st.push('<span class="t">数据源 <b>同花顺概念 '+srcState(sh.ths_concepts)
+-    +' · 腾讯行情 '+srcState(sh.tencent_quotes)
+-    +' · 东财资金 '+srcState(sh.eastmoney_fundflow)
+-    +' · 新浪当日资金 '+srcState(sh.sina_fundflow)+'</b></span>');
++    +' · 腾讯行情 '+srcState(sh.tencent_quotes)+'</b></span>');
+   document.getElementById('hero-stamp').innerHTML=st.join('');
+ 
+   /* — 指标卡 — */
+@@ -2546,7 +2521,6 @@
+ }
+ 
+ /* ═══════════════ 板块页 ═══════════════ */
+-var FUND_TIP='资金强度为全市场分位分（0-100），非绝对金额。\n东财不可用时使用新浪当日超大单净额，口径不同；行业、题材、概念归属仍使用同花顺。';
+ var LINK_TIP='板块内联动 = 同花顺概念成员组内上涨家数占比。\n覆盖率不足的板块不参与打分。';
+ 
+ function sortRows(rows,key,asc){
+@@ -2635,12 +2609,9 @@
+ function renderBoards(){
+   var B=(DATA.boards||[]);
+   var tr=(DATA.theme_rank||[]);
+-  var cov=B.filter(function(x){return (x.fund_src||'').indexOf('东财')===0;}).length;
+   var best=B[0]||{};
+   document.getElementById('bd-metrics').innerHTML=[
+     {l:'有效板块',v:B.length,s:'同花顺概念（已剔风格类）'},
+-    {l:'资金真实覆盖',v:cov+'<span style="font-size:1.1rem">/'+B.length+'</span>',
+-     s:'其余为成交额动量降级口径'},
+     {l:'最强板块',v:'<span style="font-size:1.5rem">'+esc(best.name||'—')+'</span>',
+      s:best.score?'综合强度 '+fmt(best.score,1):''},
+     {l:'入选题材组',v:tr.length,s:'覆盖率达标且成员数够'}
+@@ -2648,7 +2619,7 @@
+     +'<div class="lbl">'+m.l+'</div><div class="val">'+m.v+'</div><div class="sub">'+m.s+'</div></div>';}).join('');
+ 
+   document.getElementById('bd-sub').innerHTML=
+-    '资金口径覆盖 '+cov+'/'+B.length+' · 点击行 → 直接筛出该板块成分股，点 ⓘ → 看板块明细';
++    '价格、联动与动能 · 点击行 → 直接筛出该板块成分股，点 ⓘ → 看板块明细';
+ 
+   var rows=sortRows(B,STATE.sort.boards.k,STATE.sort.boards.asc);
+   var h='<thead><tr>'
+@@ -2661,7 +2632,6 @@
+     +thSort('boards','position60','60日位置')
+     +thSort('boards','vol_expand','量能')
+     +thSort('boards','rs','相对强度')
+-    +thSort('boards','fund','<span class="tip" data-tip="'+esc(FUND_TIP)+'">资金强度</span>')
+     +thSort('boards','linkage','<span class="tip" data-tip="'+esc(LINK_TIP)+'">联动</span>')
+     +thSort('boards','momentum','动能')
+     +thSort('boards','score','综合')
+@@ -2688,7 +2658,6 @@
+       +'<td>'+fmt(b.position60,0)+'</td>'
+       +'<td class="'+(n(b.vol_expand)>=1.3?'up':'flat')+'">'+fmt(b.vol_expand)+'x</td>'
+       +'<td>'+hm(b.rs)+'</td>'
+-      +'<td>'+hm(b.fund)+'</td>'
+       +'<td>'+(b.linkage==null?'<span class="flat">—</span>':hm(b.linkage))+'</td>'
+       +'<td>'+hm(b.momentum)+'</td>'
+       +'<td><b style="color:'+scoreColor(b.score)+'">'+fmt(b.score,1)+'</b></td></tr>';});
+@@ -2697,7 +2666,7 @@
+   /* 题材组榜 */
+   var rr=sortRows(tr,STATE.sort.themes?STATE.sort.themes.k:'avg_chg',false);
+   var g='<thead><tr><th>#</th><th class="l">题材</th><th>成员</th><th>覆盖</th>'
+-    +'<th>上涨占比</th><th class="l">涨/跌/平</th><th>等权涨幅</th><th>成交额</th><th>主力净额</th></tr></thead><tbody>';
++    +'<th>上涨占比</th><th class="l">涨/跌/平</th><th>等权涨幅</th><th>成交额</th></tr></thead><tbody>';
+   rr.forEach(function(t){
+     var tnk=tagCount(t.name);
+     var tclk=tnk ? 'pickThemeByName(\''+jsq(t.name)+'\')' : 'explainNoMembers(\''+jsq(t.name)+'\')';
+@@ -2713,28 +2682,9 @@
+       +'<td class="l flat">'+n(t.up)+' / '+n(t.down)+' / '+n(t.flat)+'</td>'
+       +'<td class="'+cls(t.avg_chg)+'">'+pct(t.avg_chg)+'</td>'
+       +'<td>'+yi(t.amount_wan)+'</td>'
+-      +'<td class="'+(n(t.main_net_sum)>0?'up':(n(t.main_net_sum)<0?'down':'flat'))+'">'
+-      +yi(Math.abs(n(t.main_net_sum))/1e4*1e4===0?n(t.main_net_sum):n(t.main_net_sum))+'</td></tr>';});
++      +'</tr>';});
+   document.getElementById('tb-themes').innerHTML=g+'</tbody>';
+ 
+-  /* 四象限（只取东财真实资金口径，避免纵轴被价量代理污染） */
+-  var qrows=(DATA.boards||[]).filter(function(b){
+-    return b.fund!=null && (b.fund_src||'').indexOf('东财')===0;
+-  }).sort(function(a,b){return n(b.score)-n(a.score);}).slice(0,150);
+-  var qcv=document.getElementById('q-cv');
+-  var qt=document.getElementById('q-toggle');
+-  if(qt){
+-    qt.textContent=window.QUAD_MORE?'收起标签':'显示更多标签';
+-    qt.onclick=function(){window.QUAD_MORE=!window.QUAD_MORE;
+-      qt.textContent=window.QUAD_MORE?'收起标签':'显示更多标签';
+-      if(qcv)drawQuadrant(qcv,qrows);};
+-  }
+-  if(qcv)drawQuadrant(qcv,qrows);
+-  renderQuadrantFocus(qrows);
+-  var qs=document.getElementById('q-sub');
+-  if(qs)qs.innerHTML='纵轴仅纳入东财真实资金口径的板块 <b>'+qrows.length+'</b> 个；'
+-    +'成交额动量降级口径不参与（价量代理放上纵轴会让"资金潜伏"与"涨幅先行"混为一谈）。'
+-    +'左上角含义：主力资金已净流入、但今日涨幅仍未启动 —— 轮动的前哨位。';
+ }
+ 
+ /* ── 板块明细抽屉 ── */
+@@ -2793,7 +2743,7 @@
+     +[['今日',pct(b.ret1),cls(b.ret1)],['5日',pct(b.ret5,1),cls(b.ret5)],['20日',pct(b.ret20,1),cls(b.ret20)],
+       ['5日涨天',n(b.up_days_5)+'/5',''],['60日位置',fmt(b.position60,0),''],
+       ['量能',fmt(b.vol_expand)+'x',n(b.vol_expand)>=1.3?'up':''],
+-      ['相对强度',fmt(b.rs,1),''],['资金强度',b.fund==null?'—':fmt(b.fund,1),''],
++      ['相对强度',fmt(b.rs,1),''],
+       ['板块内联动',b.linkage==null?'—':fmt(b.linkage,1),'']]
+     .map(function(x){return '<div class="metric"><div class="lbl">'+x[0]+'</div>'
+       +'<div class="val" style="font-size:1.5rem" class="'+x[2]+'"><span class="'+x[2]+'">'+x[1]+'</span></div></div>';}).join('')
+@@ -2801,7 +2751,6 @@
+   h+=renderBoardChain(b);
+   h+='<div class="card" style="margin-bottom:16px"><h3>口径说明</h3>'
+     +'<div style="font-size:13px;color:var(--txt2);line-height:1.7">'
+-    +'资金强度：<b>'+esc(b.fund_src||'—')+'</b>　'
+     +(b.linkage_src?'板块内联动：<b>'+esc(b.linkage_src)+'</b>':'')
+     +(n(b.gate,1)<1?'<br><span style="color:var(--orange)">⚠ 该板块 5/20 日处于下跌，强度分已施加跌势闸门</span>':'')
+     +'</div></div>';
+@@ -2820,7 +2769,7 @@
+     +'<button class="btn primary" onclick="closeDrawer();pickThemeByName(\''
+     +jsq(b.name)+'\')">筛选该板块全部成分股 →</button>'
+     +'<span style="font-size:12.5px;color:var(--txt3);align-self:center">'
+-    +'跳到个股页并应用筛选条件，可按资金 / 涨幅 / 五日线再叠加排序</span></div>';
++    +'跳到个股页并应用筛选条件，可按涨幅 / 强度 / 五日线再叠加排序</span></div>';
+   openDrawer(esc(b.name),'板块强度 '+fmt(b.score,1)+' · 排名第 '+b.rank,h,true);
+ }
+ 
+@@ -2854,7 +2803,7 @@
+   var by=tr.slice().sort(function(a,b){return n(b.main_net_sum)-n(a.main_net_sum);});
+   var g='<thead><tr><th>#</th><th class="l">题材</th><th>成员</th><th>主力净额</th><th>上涨占比</th><th>涨幅</th></tr></thead><tbody>';
+   by.slice(0,40).forEach(function(t,i){
+-    var v=n(t.main_net_sum);
++    var v=n(t.amount_wan);
+     var tnk=tagCount(t.name);
+     var tclk=tnk ? 'pickThemeByName(\''+jsq(t.name)+'\')' : 'explainNoMembers(\''+jsq(t.name)+'\')';
+     g+='<tr class="'+(tnk?'clickable':'')+'" onclick="'+tclk+'">'
+@@ -2880,7 +2829,7 @@
+       ['上涨占比',fmt(t.up_ratio,1)+'%',n(t.up_ratio)>=60?'up':''],
+       ['等权涨幅',pct(t.avg_chg),cls(t.avg_chg)],
+       ['涨/跌/平',n(t.up)+'/'+n(t.down)+'/'+n(t.flat),''],
+-      ['主力净额',yi(Math.abs(n(t.main_net_sum))),n(t.main_net_sum)>0?'up':'down']]
++      ['成交额',yi(t.amount_wan),'']]
+     .map(function(x){return '<div class="metric"><div class="lbl">'+x[0]+'</div>'
+       +'<div class="val" style="font-size:1.45rem"><span class="'+x[2]+'">'+x[1]+'</span></div></div>';}).join('')
+     +'</div>';
+@@ -2906,14 +2855,14 @@
+     +'<button class="btn primary" onclick="closeDrawer();pickThemeByName(\''
+     +jsq(t.name)+'\')">筛选该题材全部成分股 →</button>'
+     +'<span style="font-size:12.5px;color:var(--txt3);align-self:center">'
+-    +'跳到个股页并应用筛选条件，可按资金 / 涨幅 / 五日线再叠加排序</span></div>';
++    +'跳到个股页并应用筛选条件，可按涨幅 / 强度 / 五日线再叠加排序</span></div>';
+   openDrawer(esc(t.name),'题材组 · 第 '+t.rank+' 名 · '+n(t.n)+' 只成员',h,true);
+ }
+ 
+ /* ═══════════════ 个股页 ═══════════════ */
+ 
+ var FACTORS=[['rs','日线进攻强度分位'],['sector','行业广度%']];
+-var FACTORS_AUX=[['fund','主力资金分位（仅辅助）']];
++var FACTORS_AUX=[];
+ var STATEFN={
+   'persistent_strength':function(s){return s.persistent_strong===true;},
+   'recent_strength':function(s){return s.recent_improving===true;},
+@@ -2927,7 +2876,6 @@
+   'pullback':function(s){return s.pullback_observe;},
+   'failed10':function(s){return s.touch_state==='回踩失守'||s.touch_state==='收盘失守10日线';},
+   'recover10':function(s){return s.touch_state==='跌破后收复';},
+-  'fundpos':function(s){return s.fund_positive_all===true;},
+   'reso':function(s){return s.watch_candidate&&s.industry_supported;},
+   'above60':function(s){return s.trend_aligned;},
+   'above20':function(s){return s.above20;},
+@@ -2935,9 +2883,9 @@
+   'limit1':function(s){return n(s.limit_today)&&n(s.limit_streak)<=1;},
+   'streak':function(s){return n(s.limit_streak)>=2;}
+ };
+-var STATE_LABEL={persistent_strength:'日线进攻强势',recent_strength:'日线近期增强',fading_strength:'日线高位衰减',axis_both:'情绪活跃·日线趋势在线',axis_emotion:'情绪活跃·日线趋势未在线',axis_trend:'日线趋势在线·情绪平稳',axis_weak:'日线趋势未在线·情绪平稳',watch:'日线趋势在线',breakout:'当前回踩观察',pullback:'日线回踩形态',failed10:'日线10日线失守',recover10:'日线跌破后收复',fundpos:'资金三期均正',reso:'行业支持',above60:'日线三线多头',above20:'日线站上20日线',hot:'盘中位置偏热',limit1:'今日首板',streak:'连板'};
+-var STATE_TIP={persistent_strength:'完成日趋势在线、进攻分≥65、5/20日上涨，且5日≥5%或10日≥8%或20日≥12%；不限制名额',recent_strength:'日线相邻等长窗口的相对表现增强或修复，且5日绝对收益为正；仅供观察',fading_strength:'日线20日涨幅分位≥80，但日线近期变化转弱；仅供观察',watch:'完成日MA5>MA10>MA20、MA20上行且收盘不低于MA10',breakout:'历史回踩形态成立，现价守住盘中MA10且通过风险、过热和成交限制',pullback:'最近完成日线记录的回踩形态',failed10:'完成日线趋势结构受损',recover10:'历史日线失守MA10后重新站回；不代表盘中转弱后收复',fundpos:'东财日级主力净额近3/5/10日均正；未知不算正',reso:'趋势在线且行业同伴多数站上20日线',above60:'完成日MA5>MA10>MA20且MA20上行',above20:'完成日线收盘高于20日均线',hot:'现价距离盘中暂态MA5超过3.5 ATR',limit1:'今日涨停且为第1板',streak:'连续2板及以上'};
+-var PRESETS={'全部有效样本':{},'日线进攻强势':{states:['persistent_strength'],sortK:'stock_strength_score'},'日线近期增强':{states:['recent_strength'],sortK:'strength_accel5_pp'},'日线高位衰减':{states:['fading_strength'],sortK:'ret20'},'情绪活跃·趋势在线':{states:['axis_both']},'情绪活跃·趋势未在线':{states:['axis_emotion']},'日线趋势在线·情绪平稳':{states:['axis_trend']},'日线趋势未在线·情绪平稳':{states:['axis_weak']},'日线趋势在线':{states:['watch']},'当前回踩观察':{states:['watch','breakout']},'日线回踩形态':{states:['pullback']},'日线10日线失守':{states:['failed10']},'日线跌破后收复':{states:['recover10']},'资金三期均正':{states:['fundpos']},'行业支持':{states:['reso']},'日线三线多头':{states:['above60']},'盘中位置偏热':{states:['hot']}};
++var STATE_LABEL={persistent_strength:'日线进攻强势',recent_strength:'日线近期增强',fading_strength:'日线高位衰减',axis_both:'情绪活跃·日线趋势在线',axis_emotion:'情绪活跃·日线趋势未在线',axis_trend:'日线趋势在线·情绪平稳',axis_weak:'日线趋势未在线·情绪平稳',watch:'日线趋势在线',breakout:'当前回踩观察',pullback:'日线回踩形态',failed10:'日线10日线失守',recover10:'日线跌破后收复',reso:'行业支持',above60:'日线三线多头',above20:'日线站上20日线',hot:'盘中位置偏热',limit1:'今日首板',streak:'连板'};
++var STATE_TIP={persistent_strength:'完成日趋势在线、进攻分≥65、5/20日上涨，且5日≥5%或10日≥8%或20日≥12%；不限制名额',recent_strength:'日线相邻等长窗口的相对表现增强或修复，且5日绝对收益为正；仅供观察',fading_strength:'日线20日涨幅分位≥80，但日线近期变化转弱；仅供观察',watch:'完成日MA5>MA10>MA20、MA20上行且收盘不低于MA10',breakout:'历史回踩形态成立，现价守住盘中MA10且通过风险、过热和成交限制',pullback:'最近完成日线记录的回踩形态',failed10:'完成日线趋势结构受损',recover10:'历史日线失守MA10后重新站回；不代表盘中转弱后收复',reso:'趋势在线且行业同伴多数站上20日线',above60:'完成日MA5>MA10>MA20且MA20上行',above20:'完成日线收盘高于20日均线',hot:'现价距离盘中暂态MA5超过3.5 ATR',limit1:'今日涨停且为第1板',streak:'连续2板及以上'};
++var PRESETS={'全部有效样本':{},'日线进攻强势':{states:['persistent_strength'],sortK:'stock_strength_score'},'日线近期增强':{states:['recent_strength'],sortK:'strength_accel5_pp'},'日线高位衰减':{states:['fading_strength'],sortK:'ret20'},'情绪活跃·趋势在线':{states:['axis_both']},'情绪活跃·趋势未在线':{states:['axis_emotion']},'日线趋势在线·情绪平稳':{states:['axis_trend']},'日线趋势未在线·情绪平稳':{states:['axis_weak']},'日线趋势在线':{states:['watch']},'当前回踩观察':{states:['watch','breakout']},'日线回踩形态':{states:['pullback']},'日线10日线失守':{states:['failed10']},'日线跌破后收复':{states:['recover10']},'行业支持':{states:['reso']},'日线三线多头':{states:['above60']},'盘中位置偏热':{states:['hot']}};
+ STATEFN.attack_watch=function(s){return currentCandidateActive(s,'attack_watch_candidate')||sessionNow()==='午间休市'&&s.intraday_observation_available===true&&s.attack_observation_candidate===true&&!!intradayDisplayRow(s);};
+ STATE_LABEL.attack_watch='当前进攻监测';
+ STATE_TIP.attack_watch='报价与价格尺度有效、暂态A且上涨≥3%或现价反包/突破；风险单列，待收盘确认';
+@@ -2953,7 +2901,6 @@
+   if(f.vrMin>0||f.vrMax<200)c++;
+   if(f.capMin>0||f.capMax<100000)c++;
+   if(f.ret5Min>-50||f.ret5Max<200)c++;
+-  if(f.fundMin>0||f.fundMax<100)c++;
+   if(f.pos60Min>0||f.pos60Max<100)c++;
+   if(f.distMin>-10||f.distMax<10)c++;
+   if(STATE.q)c++;
+@@ -2978,7 +2925,6 @@
+   if(f.turnMin>0||f.turnMax<100)out.push({k:'turn',label:'换手 '+f.turnMin+'~'+f.turnMax+'%'});
+   if(f.vrMin>0||f.vrMax<200)out.push({k:'vr',label:'量比 '+f.vrMin+'~'+f.vrMax});
+   if(f.capMin>0||f.capMax<100000)out.push({k:'cap',label:'市值 '+f.capMin+'~'+f.capMax+'亿'});
+-  if(f.fundMin>0||f.fundMax<100)out.push({k:'fund',label:'资金分 '+f.fundMin+'~'+f.fundMax});
+   if(f.pos60Min>0||f.pos60Max<100)out.push({k:'pos60',label:'60日位置 '+f.pos60Min+'~'+f.pos60Max});
+   if(f.distMin>-10||f.distMax<10)out.push({k:'dist',label:'距MA10 '+f.distMin+'~'+f.distMax+' ATR'});
+   return out;
+@@ -3055,11 +3001,6 @@
+       var da=n(s.live_dist_atr,-999);
+       if(da<f.distMin||da>f.distMax)return false;
+     }
+-    if(f.fundMin>0||f.fundMax<100){
+-      var fu=fa.fund;
+-      if(fu==null||fu===''){return false;}
+-      if(n(fu)<f.fundMin||n(fu)>f.fundMax)return false;
+-    }
+   }
+   return true;
+ }
+@@ -3077,7 +3018,6 @@
+   ['换手率区间',function(){STATE.filters.turnMin=0;STATE.filters.turnMax=100;}],
+   ['完成日量比区间',function(){STATE.filters.vrMin=0;STATE.filters.vrMax=200;}],
+   ['流通市值区间',function(){STATE.filters.capMin=0;STATE.filters.capMax=100000;}],
+-  ['资金分区间',function(){STATE.filters.fundMin=0;STATE.filters.fundMax=100;}],
+   ['60日位置区间',function(){STATE.filters.pos60Min=0;STATE.filters.pos60Max=100;}],
+   ['距MA10(ATR)',function(){STATE.filters.distMin=-10;STATE.filters.distMax=10;}]
+ ];
+@@ -3200,7 +3140,7 @@
+   return Object.assign({},s,{intraday_score:last.score,intraday_judgment_at:last.at,
+     intraday_trend_state:last.trend,intraday_observation_state:last.state,
+     intraday_risk_level:last.risk,intraday_risk_flags:last.flags||[],
+-    live_attack_score:last.attack_score,live_attack_tier:last.attack_tier,
++    live_attack_score:last.fund&&last.fund.weight>0?null:last.attack_score,live_attack_tier:last.fund&&last.fund.weight>0?null:last.attack_tier,
+     live_attack_stage:last.attack_stage,live_attack_fund:last.fund||s.live_attack_fund,intraday_display_retained:true});
+ }
+ function retainedIntradayQuote(s){
+@@ -3368,7 +3308,7 @@
+       +(lunchEarlierCount?'，另有 '+lunchEarlierCount+' 只显示更早有效报价':'')+'。':
+       ['集合竞价','竞价结束'].indexOf(sessionNow())>=0?'。竞价阶段不要求成交额；竞价报价覆盖 '
+       +auctionCount+' / '+pool.length+'。':
+-      '。盘中分三项齐全才生成，缺一项不补权重；行业、题材、资金分开展示。报价覆盖 '
++      '。盘中分三项齐全才生成，缺一项不补权重；行业与题材分开展示。报价覆盖 '
+       +n(im.valid_quote_count)+' / '+n(im.reference_pool_count)+'。')
+     +(im.sample_changed_since_previous?'分位比较样本较上次扫描变化，分数变化需谨慎解读。':'')
+     +(n(im.price_basis_mismatch_count)?'有 '+n(im.price_basis_mismatch_count)+' 只历史与报价口径异常，已暂停其均线判断。':'')
+@@ -3412,7 +3352,6 @@
+   if(f.turnMin>0||f.turnMax<100)out.push(rm("rmRange('turn')",'换手 '+f.turnMin+'~'+f.turnMax+'%'));
+   if(f.vrMin>0||f.vrMax<200)out.push(rm("rmRange('vr')",'量比 '+f.vrMin+'~'+f.vrMax));
+   if(f.capMin>0||f.capMax<100000)out.push(rm("rmRange('cap')",'市值 '+f.capMin+'~'+f.capMax+' 亿'));
+-  if(f.fundMin>0||f.fundMax<100)out.push(rm("rmRange('fund')",'资金分 '+f.fundMin+'~'+f.fundMax));
+   if(f.pos60Min>0||f.pos60Max<100)out.push(rm("rmRange('pos60')",'60日位置 '+f.pos60Min+'~'+f.pos60Max));
+   if(f.distMin>-10||f.distMax<10)out.push(rm("rmRange('dist')",'距MA10 '+f.distMin+'~'+f.distMax+' ATR'));
+   if(STATE.q)out.push(rm("rmQ()",'搜索：'+STATE.q));
+@@ -3435,7 +3374,6 @@
+   if(k==='turn'){f.turnMin=0;f.turnMax=100;}
+   if(k==='vr'){f.vrMin=0;f.vrMax=200;}
+   if(k==='cap'){f.capMin=0;f.capMax=100000;}
+-  if(k==='fund'){f.fundMin=0;f.fundMax=100;}
+   if(k==='pos60'){f.pos60Min=0;f.pos60Max=100;}
+   if(k==='dist'){f.distMin=-10;f.distMax=10;}
+   renderStocks();
+@@ -3482,15 +3420,15 @@
+ 
+ function exportCSV(){
+   var res=stockViewRows(STOCK_VIEW,true);
+-  var head=['代码','名称','判断日','日线进攻强度','日线强度分位','日线近期变化','综合状态','分位较前日变化','分位较前五日变化','5日攻击速度分','10日推进分','20日涨幅基础分','结构不计分','5日进攻依据','10日进攻依据','20日进攻依据','结构与量价依据','绝对方向','主要强项','主要短板','近10日跑赢主板天数','近3日收盘位置%','放量滞涨','当前距20日高点%','历史最大回撤修复%','5日相对优势变化百分点','20日涨幅%','20日涨幅分位','逐股报价时间','现价','今日涨跌%','双轴分类','趋势阶段','情绪热度','量价表现','行业状态','个股行业关系','趋势助攻','情绪助攻','个股角色','日线MA5','日线MA10','日线MA20','三线排列','日线趋势在线','完成日回踩形态','MA20近5日斜率%','20日最大回撤%','有方向20日路径效率','5日对市场超额百分点','20日对市场超额百分点','5日对同行超额百分点','20日对同行超额百分点','同行趋势在线%','同行趋势变化百分点','剔除前两名后趋势在线%','同行情绪活跃%','同行涨停数','主力3日净额亿元','主力5日净额亿元','主力10日净额亿元','资金核验日','行业','行业广度%','有效同伴','日线与历史风险'];
+-  head.push('扫描完成时间','盘中强度','相对评分变化','盘中趋势状态','盘中暂态MA5','盘中暂态MA10','盘中暂态MA20','日内位置%','距日内高点%','盘中风险等级','盘中风险标记','行业同期涨幅%','本股对同行超额点','历史回踩形态','当前回踩资格','报价是否有效','行情阶段','报价状态','最后有效报价时间','当日相对主板超额百分点','主板等权涨幅%','开盘后表现%','盘中评分完整项数','盘中观察分类','扫描状态变化','当前强势资格','初步启动资格','转弱修复资格','报价日前固定MA5','报价日前固定MA10','报价日前固定MA20','暂态MA20参考基准','当日资金净额亿元','当日资金来源','当日资金采集时间');
++  var head=['代码','名称','判断日','日线进攻强度','日线强度分位','日线近期变化','综合状态','分位较前日变化','分位较前五日变化','5日攻击速度分','10日推进分','20日涨幅基础分','结构不计分','5日进攻依据','10日进攻依据','20日进攻依据','结构与量价依据','绝对方向','主要强项','主要短板','近10日跑赢主板天数','近3日收盘位置%','放量滞涨','当前距20日高点%','历史最大回撤修复%','5日相对优势变化百分点','20日涨幅%','20日涨幅分位','逐股报价时间','现价','今日涨跌%','双轴分类','趋势阶段','情绪热度','量价表现','行业状态','个股行业关系','趋势助攻','情绪助攻','个股角色','日线MA5','日线MA10','日线MA20','三线排列','日线趋势在线','完成日回踩形态','MA20近5日斜率%','20日最大回撤%','有方向20日路径效率','5日对市场超额百分点','20日对市场超额百分点','5日对同行超额百分点','20日对同行超额百分点','同行趋势在线%','同行趋势变化百分点','剔除前两名后趋势在线%','同行情绪活跃%','同行涨停数','行业','行业广度%','有效同伴','日线与历史风险'];
++  head.push('扫描完成时间','盘中强度','相对评分变化','盘中趋势状态','盘中暂态MA5','盘中暂态MA10','盘中暂态MA20','日内位置%','距日内高点%','盘中风险等级','盘中风险标记','行业同期涨幅%','本股对同行超额点','历史回踩形态','当前回踩资格','报价是否有效','行情阶段','报价状态','最后有效报价时间','当日相对主板超额百分点','主板等权涨幅%','开盘后表现%','盘中评分完整项数','盘中观察分类','扫描状态变化','当前强势资格','初步启动资格','转弱修复资格','报价日前固定MA5','报价日前固定MA10','报价日前固定MA20','暂态MA20参考基准');
+   head=head.map(function(name){return ({'当前回踩资格':'扫描时当前回踩资格',
+     '当前强势资格':'扫描时当前强势资格','初步启动资格':'扫描时初步启动资格',
+     '转弱修复资格':'扫描时转弱修复资格'})[name]||name;});
+   function cell(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
+   var lines=[head.map(cell).join(',')];
+   res.forEach(function(s){var p=s.stock_strength_parts||{},e=s.stock_strength_evidence||{};
+-    lines.push([s.code,s.name,s.signal_date,s.stock_strength_score,s.stock_strength_percentile,s.daily_motion||s.stock_strength_motion,s.stock_strength_display_state,s.strength_delta1,s.strength_delta5,p.attack5,p.attack10,p.attack20,'',e.attack5,e.attack10,e.attack20,s.structure_evidence,s.strength_direction,s.stock_strength_main_good,s.stock_strength_main_weak,s.beat_days10,s.close_location3_pct,s.volume_spike_stall?'是':'否',s.current_drawdown_pct,s.drawdown_repair_pct,s.strength_accel5_pp,s.ret20,s.ret20_percentile,s.intraday_quote_at,s.price,s.change_pct,s.axis_group,s.trend_stage,s.emotion_heat,s.emotion_acceptance,s.industry_trend_state,s.industry_stock_relation,s.trend_assist,s.emotion_assist,(s.roles||[]).join('、'),s.ma5,s.ma10,s.ma20,s.trend_aligned?'是':'否',s.trend_online?'是':'否',s.touch_state,s.ma20_slope5_pct,s.max_dd20_pct,s.path_eff20,s.ret5_ex_market,s.ret20_ex_market,s.ret5_ex_industry,s.ret20_ex_industry,s.industry_peer_trend_pct,s.industry_peer_trend_delta_pp,s.industry_ex_top2_trend_pct,s.emotion_peer_active_pct,s.emotion_peer_limit,s.fund3_yi,s.fund5_yi,s.fund10_yi,s.fund_asof,s.primary_industry,s.industry_breadth,s.industry_peers,(s.risk_notes||[s.reason_text||'']).join('；'),DATA.scan_completed_at||DATA.generated_at,s.intraday_score,s.intraday_score_delta,s.intraday_trend_state,s.intraday_ma5,s.intraday_ma10,s.intraday_ma20,s.intraday_position_pct,s.intraday_drawdown_from_high_pct,s.intraday_risk_level,(s.intraday_risk_flags||[]).join('；'),s.industry_intraday_change_pct,s.industry_intraday_excess_pct,s.historical_pullback_shape?'是':'否',s.current_pullback_candidate?'是':'否',s.intraday_quote_fresh?'是':'否',s.intraday_phase_status,s.intraday_quote_status,s.last_valid_quote_at,s.intraday_relative_return_pct,s.intraday_market_return_pct,s.intraday_open_return_pct,s.intraday_score_available_components,s.intraday_observation_state,s.intraday_transition,s.current_strong_candidate?'是':'否',s.startup_candidate?'是':'否',s.turn_weak_repair_candidate?'是':'否',s.daily_ma5_fixed,s.daily_ma10_fixed,s.daily_ma20_fixed,s.intraday_previous_completed_ma20,s.fund_today_yi,s.fund_today_source,s.fund_today_at].map(cell).join(','));});
++    lines.push([s.code,s.name,s.signal_date,s.stock_strength_score,s.stock_strength_percentile,s.daily_motion||s.stock_strength_motion,s.stock_strength_display_state,s.strength_delta1,s.strength_delta5,p.attack5,p.attack10,p.attack20,'',e.attack5,e.attack10,e.attack20,s.structure_evidence,s.strength_direction,s.stock_strength_main_good,s.stock_strength_main_weak,s.beat_days10,s.close_location3_pct,s.volume_spike_stall?'是':'否',s.current_drawdown_pct,s.drawdown_repair_pct,s.strength_accel5_pp,s.ret20,s.ret20_percentile,s.intraday_quote_at,s.price,s.change_pct,s.axis_group,s.trend_stage,s.emotion_heat,s.emotion_acceptance,s.industry_trend_state,s.industry_stock_relation,s.trend_assist,s.emotion_assist,(s.roles||[]).join('、'),s.ma5,s.ma10,s.ma20,s.trend_aligned?'是':'否',s.trend_online?'是':'否',s.touch_state,s.ma20_slope5_pct,s.max_dd20_pct,s.path_eff20,s.ret5_ex_market,s.ret20_ex_market,s.ret5_ex_industry,s.ret20_ex_industry,s.industry_peer_trend_pct,s.industry_peer_trend_delta_pp,s.industry_ex_top2_trend_pct,s.emotion_peer_active_pct,s.emotion_peer_limit,s.primary_industry,s.industry_breadth,s.industry_peers,(s.risk_notes||[s.reason_text||'']).join('；'),DATA.scan_completed_at||DATA.generated_at,s.intraday_score,s.intraday_score_delta,s.intraday_trend_state,s.intraday_ma5,s.intraday_ma10,s.intraday_ma20,s.intraday_position_pct,s.intraday_drawdown_from_high_pct,s.intraday_risk_level,(s.intraday_risk_flags||[]).join('；'),s.industry_intraday_change_pct,s.industry_intraday_excess_pct,s.historical_pullback_shape?'是':'否',s.current_pullback_candidate?'是':'否',s.intraday_quote_fresh?'是':'否',s.intraday_phase_status,s.intraday_quote_status,s.last_valid_quote_at,s.intraday_relative_return_pct,s.intraday_market_return_pct,s.intraday_open_return_pct,s.intraday_score_available_components,s.intraday_observation_state,s.intraday_transition,s.current_strong_candidate?'是':'否',s.startup_candidate?'是':'否',s.turn_weak_repair_candidate?'是':'否',s.daily_ma5_fixed,s.daily_ma10_fixed,s.daily_ma20_fixed,s.intraday_previous_completed_ma20].map(cell).join(','));});
+   lines[0]+=',10日涨幅%,日线价格形态,盘中暂态进攻分,盘中暂态进攻档,盘中价格形态,进攻监测候选,进攻状态时间口径';
+   res.forEach(function(s,i){lines[i+1]+=','+[s.ret10,s.daily_attack_stage,s.live_attack_score,s.live_attack_tier,s.live_attack_stage,s.attack_watch_candidate?'是':'否',s.live_attack_status].map(cell).join(',');});
+   lines[0]+=',同花顺题材关系,题材关系状态,题材有效同伴覆盖,题材归属依据,全体强度名次,趋势池名次,趋势池分位,关注层级,行业归属来源,历史报价口径差异百分点,历史报价口径状态,扫描转换核验,当前强势未通过项';
+@@ -3512,8 +3450,8 @@
+       bridge?'午后报价待更新·11:30参考':openBridge?'开盘报价待更新·'+openBridge.kind:shown?shown.kind:'当日报价',shown?shown.at:s.intraday_quote_at,
+       shown?shown.price:s.price,shown?shown.change:s.change_pct].map(cell).join(',');
+   });
+-  lines[0]+=','+['价格进攻分','价格进攻档位','资金分','资金实际权重%','资金占成交额%','资金判断状态','距盘中MA5_ATR'].map(cell).join(',');
+-  res.forEach(function(s,i){var f=s.live_attack_fund||{};lines[i+1]+=','+[s.live_attack_price_score,s.live_attack_price_tier,f.score,f.weight==null?null:f.weight*100,f.ratio,f.status,s.live_overheat_dist_atr].map(cell).join(',');});
++  lines[0]+=','+['价格进攻分','价格进攻档位','距盘中MA5_ATR'].map(cell).join(',');
++  res.forEach(function(s,i){var f=s.live_attack_fund||{};lines[i+1]+=','+[s.live_attack_price_score,s.live_attack_price_tier,s.live_overheat_dist_atr].map(cell).join(',');});
+   lines[0]+=','+['盘中判断截至','盘中本轮判断可用','日内路径状态','累计获取次数','有效获取次数','MA10扫描变化记录'].map(cell).join(',');
+   res.forEach(function(s,i){var p=s.intraday_path||{};lines[i+1]+=','+[s.intraday_judgment_at,s.intraday_observation_available?'是':'否',p.state,p.acquired_count,p.valid_count,(p.events||[]).map(function(e){return e.at+' '+e.kind;}).join('；')].map(cell).join(',');});
+   lines[0]+=','+['整理资格','整理状态','整理结构标签','此前5日进攻%','进攻窗口截至','整理开始日','整理完成日数','整理形态','整理日线回撤ATR','整理量对上涨量','整理振幅变化','整理固定平台上沿','整理转强确认次数','整理突破确认次数','整理判断截至','整理未通过原因'].map(cell).join(',');
+@@ -3528,8 +3466,8 @@
+   res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.tracking_ma20,c.ma20_below_samples,c.ma20_recovery_samples,c.close_review_ma20,c.ma10_downgraded===true?'是':'否',(c.support_alerts||[]).map(function(a){return a.label+' ¥'+a.price+' 距'+a.distance_atr+'ATR';}).join('；'),c.support_alert_at,c.reference_only&&c.close_review_day&&c.support_alert_at===c.close_review_day+' 15:00:00'?'同源正式日线':'已核验报价',c.support_platform_low,c.legacy_ma10_exit_at].map(cell).join(',');});
+   lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
+   res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,w.volume0,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
+-  lines[0]+=','+['衔接模型','昨收基准日','昨收主榜','昨日日线档位','当日综合判断','衔接报价截至','当前价格进攻分','价格距昨收ATR','衔接风险','ATR算法','前日变化来源','前五日变化来源','资金历史完成日数','资金历史缺口原因','威科夫特征'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,s.fund_history_days,s.fund_history_reason,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
++  lines[0]+=','+['衔接模型','昨收基准日','昨收主榜','昨日日线档位','当日综合判断','衔接报价截至','当前价格进攻分','价格距昨收ATR','衔接风险','ATR算法','前日变化来源','前五日变化来源','威科夫特征'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
+   lines[0]+=','+['最新价格判断','当前平台状态','报价判断模式','整理条件状态','整理条件依据','本地日线数','历史窗口核验','当前原平台突破门槛','已完成整理日数'].map(cell).join(',');
+   res.forEach(function(s,i){var c=s.session_context||{},e=c.history_evidence||{};lines[i+1]+=','+[c.current_label,c.structure_state,c.observation_mode,c.setup_state,c.setup_reason,e.count,e.valid===true?'已核验':e.reason,c.breakout_threshold,c.completed_consolidation_days].map(cell).join(',');});
+   var blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
+@@ -3663,9 +3601,6 @@
+     +(s.trend_online==null?'':'<p><b>均线依据</b>　MA5 '+fmt(s.ma5,2)+'、MA10 '+fmt(s.ma10,2)
+       +'、MA20 '+fmt(s.ma20,2)+'；MA20 前日 '+fmt(s.ma20_prev,2)+'，完成日收盘 '+fmt(s.signal_close,2)+'。</p>')
+     +(e?'<p><b>盘中情绪</b>　'+esc(e.emotion_heat||'待观察')+' · '+esc(e.emotion_acceptance||'承接待观察')+'</p>':'')
+-    +'<p><b>当日资金净额</b>　'+(s.fund_today_yi==null?'未知':sgn(s.fund_today_yi,3)+'亿元')
+-    +' · '+esc(s.fund_today_source||'来源未知')+' · 采集 '+esc(s.fund_today_at||'时间未知')
+-    +'；多日资金 '+esc(s.fund_state||'未知')+'</p>'
+     +'<p><b>盘中趋势/风险</b>　'+esc(s.intraday_trend_state||'数据不可判断')+' · '
+     +esc((s.intraday_risk_flags||[]).join('；')||s.intraday_quote_status||'无显著风险')+'</p>'
+     +'<p class="flat">完成日MA10/MA20为固定参考；盘中MA以现价替换最近一个完成日收盘。缺少强度评分不代表个股转弱。</p></div></details>';
+@@ -3703,12 +3638,7 @@
+   }
+ }
+ 
+-function attackFundText(s){
+-  var f=s.live_attack_fund;
+-  if(!f)return '旧版价格观察 · 资金尚未重评';
+-  return f.status+(f.score==null?'':' · 占成交额 '+sgn(f.ratio,2)+'% · 权重 '+fmt(f.weight*100,1)+'% · '+fmt(f.score,1)+'分')
+-    +(f.at?' · 采集 '+f.at.slice(11,16):'');
+-}
++function attackFundText(s){return "";}
+ function renderAttackMonitor(lookup){
+   // 午休报价使用11:30定点缓存，午后新报价未到时继续衔接；评分时间独立，不能因非交易时段隐藏价格。
+   var board=DATA.attack_monitor||{},rows=board.rows||[];
+@@ -3741,10 +3671,10 @@
+       +'<div class="ui-tags">'+uiTag(label||'形态待核验','blue',(currentContext?(c.current_pattern||{}).note:s.live_attack_status)||'沿用本轮价格形态判断，待收盘确认。')
+       +uiTag(usable?'暂态A':state,'',usable?'沿用现有本轮达标结果；盘中暂态，待收盘确认。':'沿用最近有效观察，不生成新的盘中资格。')
+       +uiRisk(risk,s.intraday_risk_level==='待核验')+'</div>'
+-      +'<div class="ui-metrics">'+uiMetric('综合进攻',s.live_attack_score==null?null:fmt(s.live_attack_score,1),'分','已有价格与资金综合进攻分；判断截至 '+(s.intraday_judgment_at||s.intraday_quote_at||'未知')+'。',s.live_attack_score)
+-      +uiMetric('价格进攻',s.live_attack_price_score==null?null:fmt(s.live_attack_price_score,1),'分','已有价格进攻分，资金不改变价格档位。')
++      +'<div class="ui-metrics">'+uiMetric('进攻强度',s.live_attack_score==null?null:fmt(s.live_attack_score,1),'分','价格进攻分；判断截至 '+(s.intraday_judgment_at||s.intraday_quote_at||'未知')+'。',s.live_attack_score)
++      +uiMetric('日线进攻',source.stock_strength_score==null?null:fmt(source.stock_strength_score,1),'分','完成日线进攻分，和盘中价格进攻分别判断。')
+       +uiMetric('距盘中 MA5',metricSource.live_overheat_dist_atr==null?null:fmt(metricSource.live_overheat_dist_atr,2),'ATR','沿用现有距离；严格超过3.5 ATR才触发位置偏热。')+'</div>'
+-      +'<div class="ui-card-foot">'+uiFund(s.live_attack_fund)+'<span>'+esc(lunch?'上午参考':usable?'本轮报价':'最近参考')+' · '+uiTime(reference?(reference.sourceAt||reference.at):(s.intraday_quote_at||s.intraday_judgment_at))+'</span></div></article>';
++      +'<div class="ui-card-foot"><span>'+esc(lunch?'上午参考':usable?'本轮报价':'最近参考')+' · '+uiTime(reference?(reference.sourceAt||reference.at):(s.intraday_quote_at||s.intraday_judgment_at))+'</span></div></article>';
+   }).join('')||'<div class="work-observation-empty">'+(normal?'当前没有通过进攻监测条件的股票':'当前阶段未产生新的盘中候选；日线进攻档位见个股榜')+'</div>';
+ }
+ 
+@@ -3970,7 +3900,7 @@
+     +'<div class="detail-insight-section"><h4>结构与量价 · 不计入进攻分</h4><p>'+esc(s.structure_evidence||'数据不足')+'</p></div>'
+     +'<div class="detail-insight-section"><h4>风险提示</h4><div class="detail-insight-row"><strong>'+(s.risk_notes&&s.risk_notes.length?'需留意':'未触发')+'</strong>'
+     +'<span>'+esc((s.risk_notes||[]).join('；')||'未触发既定阈值')+'</span></div></div>'
+-    +'<div class="detail-insight-note">日线强度分位来自完成日线；盘中分只比较价格表现。资金、题材数量和所属最强概念不计入，研究权重尚未经过样本外验证。</div>'
++    +'<div class="detail-insight-note">日线强度分位来自完成日线；盘中分只比较价格表现。题材数量和所属最强概念不计入，研究权重尚未经过样本外验证。</div>'
+     +'</div></details>';
+   var themeRelations=s.theme_relations||[];
+   var themeItem=function(r){return '<div class="detail-insight-theme"><b>'+esc(r.name||'题材待核对')+'</b><span>'
+@@ -4004,22 +3934,9 @@
+     +(s.emotion_assist?'<div class="detail-insight-note">'+esc(s.emotion_assist)+'</div>':'')+'</div>'
+     +'<div class="detail-insight-note">行业和题材只说明共同参与；同日走势不能证明谁带动谁，也不能抵消个股风险。</div>'
+     +'</div></details>';
+-  var todayFundLabel=s.fund_today_source&&s.fund_today_source.indexOf('新浪')>=0?'当日超大单净额':'当日主力净额';
+   h+='<details class="detail-fold detail-insight"><summary><span class="detail-insight-icon data">▤</span>'
+-    +'<span class="detail-insight-head"><b>资金与数据口径</b><small>当日与多日资金分开看，归属来源可核对</small>'
+-    +'<span class="detail-insight-peek"><span>今日 '+(s.fund_today_yi==null?'未知':sgn(s.fund_today_yi,3)+' 亿')+'</span>'
+-    +'<span>历史资金 · '+esc(s.fund_state||'未知')+'</span>'
+-    +'<span>已核对概念 '+displayBoards(s).length+' 项</span></span></span></summary>'
++    +'<span class="detail-insight-head"><b>归属与数据来源</b><small>同花顺行业、题材及核对依据</small></span></summary>'
+     +'<div class="detail-fold-body detail-insight-body">'
+-    +'<div class="detail-insight-funds">'
+-    +'<div class="detail-insight-fund"><small>'+todayFundLabel+'</small><b class="'+(s.fund_today_yi==null?'flat':cls(s.fund_today_yi))+'">'
+-    +(s.fund_today_yi==null?'未知':sgn(s.fund_today_yi,3)+' 亿元')+'</b>'
+-    +'<p>'+(s.fund_today_ratio==null?'':'成交额占比 '+sgn(s.fund_today_ratio,1)+'% · ')
+-    +esc(s.fund_today_source||'来源未知')+' · 采集 '+esc(s.fund_today_at||'时间未知')+'</p></div>'
+-    +'<div class="detail-insight-fund"><small>3 / 5 / 10 日主力净额</small><b>'+fundTri(s)+'</b>'
+-    +'<p>'+esc(s.fund_state||'历史资金未知')+(s.fund_history_source?' · '+esc(s.fund_history_source):' · 来源未知')
+-    +(s.fund_asof?' · 截至 '+esc(s.fund_asof):'')+'</p></div></div>'
+-    +'<div class="detail-insight-note">两组资金按各自来源和日期展示，不拼成连续变化曲线；缺失保持未知。</div>'
+     +'<div class="detail-insight-section"><h4>个股归属</h4>'
+     +'<div class="detail-insight-row"><strong>个股角色</strong><span>'+esc((s.roles||['一般成员']).join('、'))+'；判断日 '+esc(s.signal_date||'—')+'</span></div>'
+     +'<div class="detail-insight-row"><strong>同花顺题材</strong><span class="detail-insight-tags">'
+@@ -4031,7 +3948,7 @@
+     +(s.theme_checked_at?' · '+esc(s.theme_checked_at):'')+'</span></div>'
+     +(s.member_only_themes&&s.member_only_themes.length?'<div class="detail-insight-row"><strong>仅成员页出现</strong><span>'+s.member_only_themes.map(esc).join(' · ')+'</span></div>':'')
+     +(s.f10_only_themes&&s.f10_only_themes.length?'<div class="detail-insight-row"><strong>仅个股 F10 出现</strong><span>'+s.f10_only_themes.map(esc).join(' · ')+'</span></div>':'')
+-    +'</div><div class="detail-insight-note">资金按成交单分类，不证明机构持仓；所有盘中数据均为暂态。</div>'
++    +'</div><div class="detail-insight-note">盘中价格与量价结构均为暂态，正式日线与报价时间分别保留。</div>'
+     +'</div></details>';
+   openDrawer(esc(s.name)+' '+esc(s.code),stockAffiliationSub(s),h,true);
+   var paint=function(){var cv=document.getElementById('k-cv');if(cv&&s.k)drawTrend(cv,s.k);};
+@@ -4042,138 +3959,6 @@
+ function setThemeFilter(name){
+   pickBoardMembers('theme:'+String(name||'').trim());
+ }
+-
+-/* ── 板块四象限：横轴涨幅 × 纵轴资金 ──
+-   只看「东财真实资金口径」的板块：成交额动量是价量代理，放上纵轴会让
+-   "资金潜伏" 与 "涨幅先行" 混在一起，失去判断意义。
+-   旧版把 16 个标签直接画在点旁边，强势板块集中时会全部叠成黑团。
+-   现在改为：点可悬停/点击、标签做碰撞避让、重点板块另列清单。 */
+-window.QUAD_MORE=window.QUAD_MORE||false;
+-function quadrantInfo(b){
+-  var up=n(b.ret1)>0, inf=n(b.fund)>=50;
+-  if(up&&inf)return {label:'双强共振',color:'#e8271a'};
+-  if(up&&!inf)return {label:'涨幅先行',color:'#0071e3'};
+-  if(!up&&inf)return {label:'资金潜伏',color:'#f08c00'};
+-  return {label:'双弱',color:'#6e6e73'};
+-}
+-function quadrantText(b){
+-  var q=quadrantInfo(b);
+-  return '<b>'+esc(b.name)+'</b> · '+q.label+'　今日 '+pct(b.ret1,1)
+-    +' · 资金 '+fmt(b.fund,1)+' · 综合 '+fmt(b.score,1);
+-}
+-function renderQuadrantFocus(rows){
+-  var el=document.getElementById('q-focus'); if(!el)return;
+-  if(!rows||!rows.length){el.innerHTML='';return;}
+-  var top=rows.slice().sort(function(a,b){return n(b.score)-n(a.score);}).slice(0,8);
+-  el.innerHTML='<div style="grid-column:1/-1;font-size:11.5px;color:var(--txt3);margin:1px 2px 0">'
+-    +'重点板块（按板块榜分数前 8，点击查看已覆盖成员与各自角色）</div>'
+-    +top.map(function(b){var q=quadrantInfo(b);
+-      return '<div class="q-focus-item" onclick="showBoardByName(\''+jsq(b.idx_code||'')+'\')">'
+-        +'<i class="q-dot" style="background:'+q.color+'"></i>'
+-        +'<span class="q-name" title="'+esc(b.name)+'">'+esc(b.name)+'</span>'
+-        +'<span class="q-meta">'+fmt(b.score,1)+' · '+pct(b.ret1,1)+'</span></div>';}).join('');
+-}
+-function drawQuadrant(cv,rows){
+-  var dpr=window.devicePixelRatio||1, w=cv.clientWidth||900, h=cv.clientHeight||430;
+-  cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr);
+-  var g=cv.getContext('2d'); g.setTransform(1,0,0,1,0,0); g.scale(dpr,dpr);
+-  g.clearRect(0,0,w,h);
+-  if(!rows||!rows.length){
+-    g.font='13px -apple-system,sans-serif'; g.textAlign='center'; g.fillStyle='rgba(0,0,0,.24)';
+-    g.fillText('暂无东财真实资金口径的板块数据',w/2,h/2);
+-    cv._quadPoints=[]; return;
+-  }
+-  var pad={l:48,r:20,t:20,b:36};
+-  var xmax=1.0;
+-  rows.forEach(function(b){xmax=Math.max(xmax,Math.abs(n(b.ret1)));});
+-  xmax=Math.ceil(xmax*1.18*10)/10;
+-  var X=function(v){return pad.l+(n(v)+xmax)/(2*xmax)*(w-pad.l-pad.r);};
+-  var Y=function(v){return h-pad.b-(n(v)/100)*(h-pad.t-pad.b);};
+-  var mid=X(0), midY=Y(50);
+-
+-  g.fillStyle='rgba(232,39,26,.06)';   g.fillRect(mid,pad.t,w-pad.r,midY-pad.t);
+-  g.fillStyle='rgba(240,140,0,.06)';  g.fillRect(pad.l,pad.t,mid-pad.l,midY-pad.t);
+-  g.fillStyle='rgba(0,113,227,.06)';  g.fillRect(mid,midY,w-pad.r,h-pad.b-midY);
+-  g.fillStyle='rgba(0,0,0,.02)'; g.fillRect(pad.l,midY,mid-pad.l,h-pad.b-midY);
+-
+-  g.strokeStyle='rgba(0,0,0,.05)'; g.lineWidth=1;
+-  [0,25,50,75,100].forEach(function(v){g.beginPath();g.moveTo(pad.l,Y(v));g.lineTo(w-pad.r,Y(v));g.stroke();});
+-  g.strokeStyle='rgba(0,0,0,.13)';
+-  g.beginPath();g.moveTo(mid,pad.t);g.lineTo(mid,h-pad.b);g.stroke();
+-  g.beginPath();g.moveTo(pad.l,midY);g.lineTo(w-pad.r,midY);g.stroke();
+-
+-  g.font='10px -apple-system,sans-serif';
+-  g.fillStyle='rgba(0,0,0,.24)';
+-  g.textAlign='right'; g.textBaseline='middle';
+-  [0,50,100].forEach(function(v){g.fillText(String(v),pad.l-9,Y(v));});
+-  g.textAlign='center'; g.textBaseline='top';
+-  [-xmax,-xmax/2,0,xmax/2,xmax].forEach(function(v){g.fillText(sgn(v,1)+'%',X(v),h-pad.b+9);});
+-
+-  g.font='11px -apple-system,sans-serif';
+-  g.textAlign='left';  g.textBaseline='top';
+-  g.fillStyle='rgba(232,39,26,.72)';  g.fillText('双强共振 · 主升',mid+11,pad.t+7);
+-  g.textAlign='right'; g.fillStyle='rgba(240,140,0,.72)'; g.fillText('资金潜伏 · 轮动前哨',mid-11,pad.t+7);
+-  g.textAlign='left';  g.fillStyle='rgba(0,113,227,.72)'; g.fillText('涨幅先行 · 资金未跟',mid+11,h-pad.b-20);
+-  g.textAlign='right'; g.fillStyle='rgba(0,0,0,.42)'; g.fillText('双弱 · 回避',mid-11,h-pad.b-20);
+-
+-  var colors=['#e8271a','#0071e3','#f08c00','#6e6e73'], points=[];
+-  rows.forEach(function(b){
+-    var q=quadrantInfo(b), qi=q.label==='双强共振'?0:(q.label==='涨幅先行'?1:(q.label==='资金潜伏'?2:3));
+-    var r=3.4+Math.max(0,Math.min(100,n(b.score))-42)/58*5.4;
+-    var px=X(b.ret1), py=Y(b.fund);
+-    points.push({b:b,x:px,y:py,r:r});
+-    g.beginPath(); g.arc(px,py,r,0,Math.PI*2);
+-    g.fillStyle=colors[qi]+'d9'; g.fill();
+-    g.strokeStyle='rgba(0,0,0,.42)'; g.lineWidth=1; g.stroke();
+-  });
+-  cv._quadPoints=points;
+-
+-  // 只给重点板块做标签，并且逐个尝试四个方向，避免文本互相盖住。
+-  var ranked=rows.slice().sort(function(a,b){return n(b.score)-n(a.score);});
+-  var lab=ranked.slice(0,window.QUAD_MORE?18:8), occupied=[];
+-  g.font='10.5px -apple-system,sans-serif'; g.textBaseline='middle';
+-  function hit(a,b){return !(a.r<b.l||a.l>b.r||a.b<b.t||a.t>b.b);}
+-  lab.forEach(function(b){
+-    var p=points.filter(function(x){return x.b===b;})[0]; if(!p)return;
+-    var tw=Math.min(174,g.measureText(b.name).width+10), th=17;
+-    var opts=p.x<mid
+-      ? [{l:p.x+10,dy:-11,side:'left'},{l:p.x+10,dy:11,side:'left'},
+-         {l:p.x-10-tw,dy:-11,side:'right'},{l:p.x-10-tw,dy:11,side:'right'}]
+-      : [{l:p.x-10-tw,dy:-11,side:'right'},{l:p.x-10-tw,dy:11,side:'right'},
+-         {l:p.x+10,dy:-11,side:'left'},{l:p.x+10,dy:11,side:'left'}];
+-    var placed=null;
+-    opts.some(function(o){
+-      var t=Math.max(pad.t+th/2,Math.min(h-pad.b-th/2,p.y+o.dy));
+-      var box={l:o.l-4,r:o.l+tw+4,t:t-th/2,b:t+th/2};
+-      if(box.l<pad.l||box.r>w-pad.r||occupied.some(function(x){return hit(box,x);}))return false;
+-      placed={o:o,t:t,box:box}; return true;
+-    });
+-    if(!placed)return;
+-    occupied.push(placed.box);
+-    g.strokeStyle='rgba(0,0,0,.20)'; g.lineWidth=1;
+-    g.beginPath();g.moveTo(p.x,p.y);g.lineTo(placed.o.side==='left'?placed.box.l:placed.box.r,placed.t);g.stroke();
+-    g.fillStyle='rgba(255,255,255,.94)';g.fillRect(placed.box.l,placed.box.t,placed.box.r-placed.box.l,th);
+-    g.strokeStyle='rgba(0,0,0,.18)';g.strokeRect(placed.box.l,placed.box.t,placed.box.r-placed.box.l,th);
+-    g.fillStyle='#1d1d1f';g.textAlign=placed.o.side==='left'?'left':'right';
+-    g.fillText(b.name,placed.o.side==='left'?placed.box.l+5:placed.box.r-5,placed.t);
+-  });
+-
+-  var hover=document.getElementById('q-hover');
+-  function resetHover(){
+-    if(hover)hover.innerHTML='将鼠标移到圆点上查看板块名称、涨幅、资金强度和综合分。';
+-    cv.style.cursor='default';
+-  }
+-  function pointAt(ev){
+-    var rr=cv.getBoundingClientRect(), x=ev.clientX-rr.left, y=ev.clientY-rr.top, best=null, bd=1e9;
+-    points.forEach(function(p){var d=Math.hypot(x-p.x,y-p.y), lim=Math.max(9,p.r+5);
+-      if(d<=lim&&d<bd){best=p;bd=d;}}); return best;
+-  }
+-  cv.onmousemove=function(ev){var p=pointAt(ev); if(!p){resetHover();return;}
+-    cv.style.cursor='pointer'; if(hover)hover.innerHTML=quadrantText(p.b)+'　<span style="color:var(--blue)">点击查看板块链路 →</span>';};
+-  cv.onmouseleave=resetHover;
+-  cv.onclick=function(ev){var p=pointAt(ev);if(p&&p.b&&p.b.idx_code)showBoardByName(p.b.idx_code);};
+-}
+-
+ 
+ function renderFilterPanel(){
+   var f=STATE.filters, tc={}, ic={};
+@@ -4460,7 +4245,7 @@
+     return;
+   }
+   initUiNotes();
+-  document.getElementById('ui-attack-rules').innerHTML=uiTag('价格为主','', '原计分：价格进攻85%＋主力资金15%；超大单参考权重7.5%。资金未核验沿用价格分；价格非A不靠资金升A。')+uiTag('风险独立','', '反包与突破单列；距盘中MA5严格超过3.5 ATR标记位置偏热，不抵消风险。')+uiTag('标签可查看注释','', '悬停、点击或键盘聚焦标签可查看依据；完整记录在个股详情中展开。');
++  document.getElementById('ui-attack-rules').innerHTML=uiTag('价格进攻','', '进攻分依据5/10/20日实际价格推进与相对速度；日线资格、盘中观察和成交量结构分别判断。')+uiTag('风险独立','', '反包与突破单列；距盘中MA5严格超过3.5 ATR标记位置偏热，不抵消风险。')+uiTag('标签可查看注释','', '悬停、点击或键盘聚焦标签可查看依据；完整记录在个股详情中展开。');
+   segInit(document.getElementById('seg'),function(p){goPane(p);});
+   segInit(document.getElementById('seg-strategy'),function(s){setStrategy(s);});
+   segInit(document.getElementById('work-switch'),function(mode){setWorkMode(mode,true);});
+@@ -4503,7 +4288,7 @@
+   document.getElementById('tb-boards').addEventListener('click',function(e){
+     var th=e.target.closest('th'); if(!th)return;
+     var map={'板块':'name','今日%':'ret1','5日%':'ret5','20日%':'ret20','5日涨天':'up_days_5',
+-      '60日位置':'position60','量能':'vol_expand','相对强度':'rs','资金强度':'fund',
++      '60日位置':'position60','量能':'vol_expand','相对强度':'rs',
+       '联动':'linkage','动能':'momentum','综合':'score','#':'rank'};
+     var t=th.textContent.trim().replace(/[▲▼]/g,'').trim();
+     if(map[t])setSort('boards',map[t]);
+@@ -4708,8 +4493,7 @@
+     +uiMetric('有效成员',n(b.valid_members),'只','当前归集 '+n(b.pool_members)+'只，日线覆盖 '+fmt(b.valid_coverage_pct,1)+'%。')+'</div>'
+     +'<div class="ui-tags">'+uiTag(boardTodayLabel(b)+' '+pct(b.member_today,1),'','已覆盖有效主板成员的等权涨跌幅；采集 '+(b.member_quote_at||'时间未知')+'。不参与指数日线筛选。')
+     +uiTag('涨停 '+n(b.limit_count)+'只','','已覆盖有效主板成员的当日涨停家数。')
+-    +uiTag('前三贡献 '+(b.positive_top3_share==null?'—':fmt(b.positive_top3_share,0)+'%'),'','上涨前三只的正收益之和 / 全部成员正收益之和；高比例可能由少数成员贡献。')
+-    +uiTag('资金覆盖 '+n(b.fund_today_covered||b.fund_covered)+'/'+n(b.valid_members),'','真实资金覆盖；未知不计中性分，不参与指数趋势资格。')+'</div></section>'
++    +uiTag('前三贡献 '+(b.positive_top3_share==null?'—':fmt(b.positive_top3_share,0)+'%'),'','上涨前三只的正收益之和 / 全部成员正收益之和；高比例可能由少数成员贡献。')+'</div></section>'
+     +'<details class="detail-fold"><summary>数据与判断依据</summary><div class="detail-fold-body">'
+     +'<p>当前来源：'+esc(idx.source||'尚未取得有效的当日指数')+'；实际报价 '+esc(idx.quote_at||'—')+'。'+esc(idx.reason||'当前报价与前一完成日同源昨收一致。')+'</p>'
+     +'<p>完成日线背景：'+esc(daily.asof||'—')+' · '+esc(daily.state||'待核验')+'。历史状态只作背景，主标签及筛选跟随最新有效报价。'
+@@ -4726,8 +4510,7 @@
+     +'本系统主板样本 '+n(b.pool_members)+'只，日线有效 '+n(b.valid_members)+'只；成员核对 '+esc(typeof b.source_checked_at==='number'?new Date(b.source_checked_at*1000).toLocaleString('sv-SE',{timeZone:'Asia/Shanghai'}):(b.source_checked_at||'未知'))+'。'
+     +esc(b.ranking_reason)+'。当前成员的近3日变化仅作扩散观察，不能代表历史全市场成员。'
+     +(b.membership_disagreements!=null?' F10/详情归属差异 '+n(b.membership_disagreements)+'只。':'')+'</p>'
+-    +'<p>资金采集 '+esc(b.fund_observed_at||'未知')+'；来源 '+esc(DATA.fund_source||'未知')+'。'
+-    +(b.fund_today_covered?'已覆盖成员当日净额合计 '+sgn(b.fund_sum_today/1e8,2)+'亿元。':'')+'</p></div></details>';
++    +'</div></details>';
+   if(b.wide){
+     var sub=boardCatalog().filter(function(x){return x.type==='theme'&&x.id!==b.id&&x.valid_members>=5&&x.valid_members<b.valid_members;})
+       .map(function(x){var shared=(x.member_codes||[]).filter(function(c){return b.member_codes.indexOf(c)>=0;}).length;
+--- make_dashboard.py before
++++ make_dashboard.py after
+@@ -60,6 +60,8 @@
+         print("[ERR] 还没有数据快照，请先运行：python scoring.py full")
+         return None
+     snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
++    import price_only
++    price_only.sanitize(snap)
+     attach_klines(snap)
+     import board_trend
+     board_trend.attach(snap, fetch=False)
+--- rebuild_strength.py before
++++ rebuild_strength.py after
+@@ -4,7 +4,7 @@
+ 
+ import config
+ import emotion
+-import fund_confirmation
++import price_only
+ import make_dashboard
+ import radar
+ import report
+@@ -16,6 +16,7 @@
+ 
+ def run():
+     snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
++    price_only.sanitize(snap)
+     pool, series = local_data()
+     profiles = json.loads((config.CACHE_DIR / "ths_stock_profiles.json").read_text(encoding="utf-8")).get("profiles", {})
+     members = json.loads((config.CACHE_DIR / "ths_industry_members.json").read_text(encoding="utf-8")).get("map", {})
+@@ -29,7 +30,6 @@
+     snap["emotion_candidates"] = []
+     emotion.enrich_stocks(rows, {}, {"active_count": 0, "traded": 0})
+     snap["axis_counts"] = {"情绪数据不足": len(rows)}
+-    snap["fund_confirmation"] = fund_confirmation.attach(rows, strength.trading_calendar(series), fetch=False)
+     snap.update(stocks=rows, stock_count=len(rows), strength_model=meta,
+                 factor_model_version=strength.VERSION, mode="local-rebuild",
+                 rebuilt_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+@@ -44,6 +44,7 @@
+     snap["daily_advice"] = strength.daily_advice(snap)
+     # 离线迁移只核验完成日线，不能保留旧版盘中进攻结论为新信号。
+     attack_model.enrich(snap, {}, {})
++    price_only.sanitize(snap)
+     config.atomic_write_text(config.SNAPSHOT_JSON, json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     strength.save_observation(snap)
+     scoring.append_history(snap)
+--- report.py before
++++ report.py after
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-"""均线趋势日报；只陈述完成日线与已取得的资金数据。"""
++"""均线趋势日报；只陈述完成日线、价格和成交量数据。"""
+ import argparse
+ import json
+ import config
+@@ -9,8 +9,6 @@
+     snap = snap or json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+     model = snap.get("strength_model") or {}
+     intraday = snap.get("intraday_model") or {}
+-    funds = snap.get("fund_confirmation") or {}
+-    fund_meta = snap.get("fund_meta") or {}
+     emotion = snap.get("market_emotion") or {}
+     coverage = snap.get("coverage_stats") or {}
+     axes = snap.get("axis_counts") or {}
+@@ -29,8 +27,6 @@
+              f"盘中观察：阶段 {intraday.get('phase_status', snap.get('session', '未知'))}；最新有效逐股报价 {intraday.get('latest_valid_quote_at', '未知')}；有效报价 {intraday.get('valid_quote_count', 0)}/{intraday.get('reference_pool_count', 0)}；主板同期等权涨幅 {intraday.get('mainboard_equal_weight_change_pct', '未知')}%；完整盘中分 {intraday.get('complete_score_count', 0)} 只；历史与报价口径异常 {intraday.get('price_basis_mismatch_count', 0)} 只；当前强势 {model.get('current_strong_count', 0)} 只；转弱／修复 {model.get('turn_weak_repair_count', 0)} 只；初步转强 {sum(bool(s.get('startup_candidate')) for s in visible_rows)} 只。当前强势逐项要求历史强势基础、上一完成日日线趋势、暂态趋势、上涨、跑赢主板、不低于开盘、三项完整评分和风险通过。",
+              f"双轴：情绪活跃且趋势在线 {axes.get('情绪活跃·趋势在线', 0)} 只；情绪活跃但趋势未在线 {axes.get('情绪活跃·趋势未在线', 0)} 只；趋势在线但情绪平稳 {axes.get('趋势在线·情绪平稳', 0)} 只；趋势未在线且情绪平稳 {axes.get('趋势未在线·情绪平稳', 0)} 只；情绪未核验 {axes.get('情绪数据不足', 0)} 只。",
+              f"主板交易情绪：{emotion.get('state', '数据不足')}；同池成交 {emotion.get('traded', '未知')} 只、{'当前接近涨停' if emotion.get('provisional') else '收盘涨停'} {emotion.get('limit_up', '未知')} 只、昨日涨停 {emotion.get('limit_up_yesterday', '未知')} 只；主榜外情绪活跃 {len(snap.get('emotion_candidates') or [])} 只（趋势资格见个股详情）。",
+-             f"当日资金：来源 {snap.get('fund_source', '未知')}；覆盖 {fund_meta.get('coverage', 0)} 只；采集时间 {fund_meta.get('fetched_at', '未知')}。逐股明细保留各自来源与采集时间；多日逐股覆盖不足时显示未知。",
+-             f"同源日级资金历史覆盖 {funds.get('covered', 0)}/{funds.get('total', 0)} 只；其中三期均为正 {funds.get('positive_all', 0)} 只。未覆盖标未知，不据此排除。", "",
+              "| 当前强势 | 逐股报价 | 当日涨幅 | 主板超额百分点 | 日线进攻强度 | 盘中强度 | 相对评分变化 | 趋势状态 | 风险 |",
+              "|---|---|---:|---:|---:|---:|---|---|---|"]
+     for s in live_rows[:30]:
+@@ -105,8 +101,6 @@
+                      f"{'；'.join(r.get('name', '')+':'+r.get('state', '数据不足') for r in s.get('theme_relations', [])) or '数据不足'} |")
+     lines += ["", "## 口径", "",
+               "- 回踩只看最近3个完成交易日；盘中低点可跌破当日MA10，收盘站回才算守住。收盘后继续上涨与仅站回待确认分开。",
+-              "- 主力净额是东财按成交单分类的统计，不代表可识别某个机构；3/5/10日均正只是辅助确认，不加权也不是买入指令。",
+-              "- 日级资金使用本地全池同源历史，按完成日增补；缺口保留逐股原因，资金源故障时不以价量推算代替。",
+               "- 行业广度及相对同行收益单列，缺失不补；个股进攻统一比较5/10/20日绝对推进与相对速度，同行覆盖不改变评分公式。现价距离MA10过远单列风险。",
+               "- 日线进攻研究权重：5日50%、10日30%、20日20%；每周期60%绝对推进、40%相对分位。绝对推进满分对应5日8%、10日12%、20日20%。各项原始依据见看板和CSV；权重与入口阈值尚未做样本外验证。",
+               "- 强度分位变化优先使用真实留档，缺失日期使用最近20个完成日的历史重算参考；每股标注来源。重算采用当前池，不是当时实测名单。",
+--- scoring.py before
++++ scoring.py after
+@@ -2,9 +2,9 @@
+ """打分编排层 —— 组装板块榜 / 个股榜 / 异动告警 / 数据快照
+ 
+ 运行模式：
+-  full  : 全量重建（股票池 + 全部K线 + 板块 + 资金流），收盘后跑，约3-5分钟
+-  quick : 增量（读K线缓存 + 实时行情覆盖当日bar + 板块 + 资金流），盘中每5分钟
+-  close : 正式收盘日线更新，先发布榜单，再由服务后台补采辅助资金
++  full  : 全量重建（股票池 + 全部K线 + 板块），收盘后跑，约3-5分钟
++  quick : 增量（读K线缓存 + 实时行情覆盖当日bar + 板块），盘中每5分钟
++  close : 正式收盘日线更新，正式日线就绪即发布榜单
+ """
+ import json
+ import math
+@@ -25,16 +25,15 @@
+ import wyckoff_structure
+ import session_context
+ import history_reference
+-import fund_history
++import price_only
+ import stock_strength
+ import attack_model
+ import factors as F
+-import fund_confirmation
+ import strength
+ import theme_assist
+ import radar
+ 
+-CLOSE_REFRESH_VERSION = '收盘优先发布1'
++CLOSE_REFRESH_VERSION = '收盘价格优先发布2'
+ 
+ 
+ class DataNotReady(RuntimeError):
+@@ -263,6 +262,8 @@
+     completed_at = datetime.now()
+     snap["scan_completed_at"] = completed_at.isoformat(sep=" ", timespec="seconds")
+     snap["generated_at"] = completed_at.strftime("%Y-%m-%d %H:%M:%S")
++    price_only.sanitize(snap)
++    snap["close_refresh_version"] = CLOSE_REFRESH_VERSION
+     config.atomic_write_text(config.SNAPSHOT_JSON,
+                              json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     print(f"[RUN] 集合竞价有效报价 {len(observed)}/{len(codes)}；沿用完成日线与收盘名单")
+@@ -457,31 +458,9 @@
+     mo_p = dict(zip([r["name"] for r in ths_rows], F.pct_rank([r["momentum_raw"] for r in ths_rows])))
+     # 成交额动量与真实资金分列；缺失资金不能变成中性分位。
+ 
+-    # 2. 东财概念板块实时（push2 被封时自动切 push2delay，再不行才降级）
+-    em_rows, em_ok = [], False
+-    em_meta = {"source": "不可用", "stale": False, "coverage": 0}
+-    try:
+-        em_rows, em_meta = df.fetch_em_boards_resilient(prefer_cache=prefer_cache)
+-        em_ok = len(em_rows) > 0
+-        print(f"[BOARD] 东财概念板块 {len(em_rows)} 个（资金口径={em_meta.get('source')}）")
+-    except Exception as e:
+-        print(f"[WARN] 东财板块实时不可用，板块资金保持未知：{e}")
+-
+-    fund_p = {}
+-    if em_ok and not em_meta.get("stale"):
+-        valid_em = [r for r in em_rows if r.get("main_net") is not None]
+-        fund_p = dict(zip([r["name"] for r in valid_em],
+-                          F.pct_rank([num(r["main_net"]) for r in valid_em])))
+-
+-    # 题材组按归一化名建索引，用于和同花顺板块名对齐
++    # 资金排序已取消；保留同花顺价量和成员联动。
++    em_meta = {"source": "已停用", "stale": False, "coverage": 0}
+     tg_by_key = theme_groups or {}
+-    # 仅在同名且真实资金覆盖达标时，使用主板成员净额分位。
+-    tg_fund_rank = {}
+-    if theme_groups:
+-        ks = [k for k, g in theme_groups.items()
+-              if g.get("main_net_sum") is not None and g.get("fund_coverage", 0) >= 60]
+-        if ks:
+-            tg_fund_rank = dict(zip(ks, F.pct_rank([theme_groups[k]["main_net_sum"] for k in ks])))
+     n_exact_f = n_exact_l = 0
+     cover_min = config.BOARD["min_cover"] * 100
+ 
+@@ -503,20 +482,7 @@
+         rs = rs_p.get(r["name"], 50.0)
+         mo = mo_p.get(r["name"], 50.0)
+ 
+-        # 真实资金缺失保持未知；不会用成交额动量代填。
+-        if nk in fund_p:
+-            fu = fund_p[nk]
+-            fund_src = em_meta.get("source") or "东财主力净流入"
+-            n_exact_f += 1
+-        elif nk in tg_fund_rank and tg_by_key.get(nk, {}).get("n", 0) >= 5:
+-            fu = tg_fund_rank[nk]
+-            fund_src = ("新浪主板成员当日超大单净额（覆盖达标）"
+-                        if any(g.get("fund_period") == "today" for g in tg_by_key.values())
+-                        else "主板成员真实主力净额（覆盖达标）")
+-            n_exact_f += 1
+-        else:
+-            fu = None
+-            fund_src = "未知"
++        fu, fund_src = None, "已停用"
+ 
+         # ── 联动：优先自洽的「题材组内上涨占比」，其次东财板块涨跌家数 ──
+         li, li_src = None, None
+@@ -524,8 +490,6 @@
+             li, li_src = tg_by_key[nk]["up_ratio"], "主板成员上涨占比"
+             n_exact_l += 1
+         components = [(w["rs"], rs), (w["momentum"], mo)]
+-        if fu is not None:
+-            components.append((w["fund"], fu))
+         if li is not None:
+             components.append((w["linkage"], li))
+         score = sum(weight * value for weight, value in components) / sum(weight for weight, _ in components)
+@@ -540,11 +504,6 @@
+         else:
+             gate = 1.0
+         score *= gate
+-        # 口径置信度折扣：成交额动量只是「价量代理」，其分位分与真实资金分位
+-        # 不在同一尺度上。不打折时降级板块会系统性霸占榜首（实测前排被
+-        # 「新型烟草/烟草」等联动与资金都缺失的板块占据），而它们的资金维度
+-        # 其实是空的。这里显式降权，并在展示层逐条标注口径。
+-
+         boards.append({
+             "name": r["name"], "idx_code": r["idx_code"],
+             "ret1": round(r["ret1"] or 0, 2),
+@@ -568,7 +527,7 @@
+     board_index = {b["name"]: b["score"] for b in boards}
+ 
+     n = len(ths_rows) or 1
+-    print(f"[BOARD] 同名核对：真实资金 {n_exact_f}/{n} ｜ 主板成员联动 {n_exact_l}/{n}")
++    print(f"[BOARD] 主板成员联动 {n_exact_l}/{n}")
+ 
+     return boards, {
+         "board_score": board_index,
+@@ -1057,36 +1016,10 @@
+     snap["classification_stats"] = classification_stats
+     print(f"[RUN] F10 归属核对 {classification_stats}")
+ 
+-    # 4. 资金流：东财优先；不可用时用新浪当日超大单，历史周期单独核验。
++    # 不再获取或使用任何资金流入/流出数据。
+     fund_map = {}
+-    fund_meta = {"source": "不可用", "stale": False, "coverage": 0}
+-    try:
+-        ff_all, fund_meta = df.fetch_em_fundflow_all_resilient(
+-            prefer_cache=(mode in ("quick", "close")))
+-        if fund_meta.get("stale"):
+-            raise RuntimeError("东财只有过期缓存")
+-    except Exception as e:
+-        print(f"[WARN] 东财资金流不可用，尝试新浪当日超大单：{e}")
+-        try:
+-            ff_all, fund_meta = df.fetch_sina_fundflow_all(quotes)
+-        except Exception as fallback_error:
+-            ff_all = {}
+-            print(f"[WARN] 新浪当日资金也不可用：{fallback_error}")
+-    if ff_all:
+-        for c, v in ff_all.items():
+-            fmc = (pool.get(c, {}).get("float_mcap_yi") or 0) * 1e8
+-            five = v.get("main_5d")
+-            fund_map[c] = {
+-                "fund5_ratio": (five / fmc * 100) if five is not None and fmc > 0 else None,
+-                "main_ratio": v.get("main_ratio"),
+-                "main_today": v.get("main_today"),
+-                "main_5d": five,
+-            }
+-        print(f"[RUN] 资金流覆盖 {len(fund_map)} 只")
+-    snap["fund_available"] = bool(fund_map)
+-    snap["fund_source"] = (fund_meta.get("source") if fund_map
+-                           else "未知（资金源不可用）")
+-    snap["fund_meta"] = fund_meta
++    fund_meta = {"source": "已停用", "enabled": False, "stale": False, "coverage": 0}
++    snap.update(fund_available=False, fund_source="已停用", fund_meta=fund_meta)
+ 
+     # 4·补、题材分组（含组内主力净额，供板块层资金兜底）
+     theme_groups = build_theme_groups(theme_map, quotes, fund_map,
+@@ -1200,19 +1133,7 @@
+         quote = quotes.get(code) or {}
+         row.update({key: quote[key] for key in quote_fields if key in quote})
+         stocks.append(row)
+-    # 主力资金仅保留真实来源的展示分位，缺失时不使用价量代理。
+-    actual_funds = sorted((v["main_today"], c) for c, v in fund_map.items()
+-                          if v.get("main_today") is not None)
+-    fund_ranks = {c: i / max(len(actual_funds) - 1, 1) * 100 for i, (_, c) in enumerate(actual_funds)}
+-    for s in stocks:
+-        s["factors"] = {"fund": fund_ranks.get(s["code"])}
+-        fund = fund_map.get(s["code"]) or {}
+-        s["fund_today_yi"] = (round(fund["main_today"] / 1e8, 3)
+-                              if fund.get("main_today") is not None else None)
+-        s["fund_today_ratio"] = (round(fund["main_ratio"], 2)
+-                                 if fund.get("main_ratio") is not None else None)
+-        s["fund_today_source"] = fund_meta.get("source") if fund else None
+-        s["fund_today_at"] = fund_meta.get("fetched_at") if fund else None
++    price_only.clear_rows(stocks)
+     for s in stocks:
+         mapping = theme_map.get(s["code"]) or {}
+         s["boards"] = list(mapping.get("themes") or [])
+@@ -1234,8 +1155,7 @@
+     formal_calendar=strength.trading_calendar({c:strength.completed(v) for c,v in formal.items()})
+     if formal_calendar:
+         snap['history_reference']=history_reference.ensure(formal,formal_calendar[-1])
+-        # 日线资格不依赖历史资金；盘后先发布，网络补采由服务在发布后完成。
+-        snap['fund_history']=fund_history.cached_status(list(pool),formal_calendar) if snap['session']=='已收盘' else fund_history.refresh(list(pool),formal_calendar,deadline=180 if mode=='full' else 90)
++        snap["fund_history"] = {"enabled": False, "requested": 0}
+     try:
+         stocks, model = strength.build(stocks, klines, industry_lookup)
+     except ValueError as e:
+@@ -1257,9 +1177,7 @@
+     snap["market_emotion"] = market_emotion
+     snap["emotion_candidates"] = emotion_extra
+     snap["axis_counts"] = dict(Counter(s["axis_group"] for s in stocks))
+-    snap["fund_confirmation"] = fund_confirmation.attach(stocks, strength.trading_calendar(
+-        {c: strength.completed(v) for c, v in klines.items()}), fetch=snap['session']!='已收盘')
+-    print(f"[RUN] 历史资金覆盖 {snap['fund_confirmation']['covered']}/{len(stocks)} 只")
++    price_only.clear_rows(stocks)
+     snap["strength_model"] = model
+     snap["risk_gate"]["passed"] = len(stocks)
+     snap["risk_gate"]["completed_day_dropped"] = model["dropped"]
+@@ -1435,7 +1353,7 @@
+     wyckoff_structure.attach(snap, klines, strength.trading_calendar(completed_bars),
+                             contexts=price_contexts, history=path_history, persist=True,
+                             daily_history_loader=lambda code: df.load_kline(conn,'kline','code',code))
+-    snap['fund_confirmation']=fund_confirmation.attach(stocks+catalog,strength.trading_calendar(completed_bars),fetch=False)
++    price_only.sanitize(snap)
+     session_context.attach(snap,quotes,formal,formal_calendar,contexts=price_contexts)
+ 
+     config.atomic_write_text(
+@@ -1487,7 +1405,7 @@
+ # 生成快照时算一次就好，看板打开时只负责展示，不做重计算。
+ #
+ # 四类（用户 2026-09-18 指定，全部要）：
+-#   mainline   今日主线题材 + 资金流向 —— 区分「资金真进」与「情绪脉冲」
++#   mainline   今日主线题材向 —— 区分「资金真进」与「情绪脉冲」
+ #   watch      明日观察池 —— 低位启动 / 缩量回踩 / 周期共振
+ #   risk       风险提示 —— 高位乖离 / 高位资金背离 / 连板断板
+ #   hold_watch 持仓关注名单 —— 触发减仓信号的个股，看板与本地持仓求交集后落地
+--- serve.py before
++++ serve.py after
+@@ -42,7 +42,7 @@
+ import board_center
+ import board_quote
+ import weekly_members
+-import fund_history
++import price_only
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -89,7 +89,8 @@
+          "code_structure_version": wyckoff_structure.VERSION,
+          "code_session_context_version": session_context.VERSION,
+          "code_intraday_rule_version": config.INTRADAY_RULE_VERSION,
+-         "code_close_refresh_version": scoring.CLOSE_REFRESH_VERSION}
++         "code_close_refresh_version": scoring.CLOSE_REFRESH_VERSION,
++         "code_fund_reference_version": price_only.VERSION}
+ 
+ # 看板「刷新数据」按钮触发的主动刷新状态
+ # cooldown 是必须的：连点会连续打东财/腾讯接口，触发风控后整段被封 20 分钟以上
+@@ -107,44 +108,6 @@
+ 
+ # init_worker 与 refresh_loop 可能同时触发全量扫描，用锁串行化
+ _SCAN_LOCK = threading.Lock()
+-_CLOSE_FUNDS_DAYS = set()
+-CLOSE_FUNDS = dict(running=False, asof=None, result=None, error=None)
+-
+-
+-def start_close_fund_refresh(snapshot):
+-    """先让正式榜单可见，再串行补采辅助资金；每个完成日只调度一次。"""
+-    day = (snapshot.get('strength_model') or {}).get('asof')
+-    if (snapshot.get('session') != '已收盘' or day != datetime.now().date().isoformat()
+-            or not str(snapshot.get('close_daily_verified_at') or '').startswith(day)
+-            or day in _CLOSE_FUNDS_DAYS):
+-        return
+-    _CLOSE_FUNDS_DAYS.add(day)
+-    codes = [s['code'] for s in (snapshot.get('stocks') or []) + (snapshot.get('coverage_catalog') or [])]
+-    def work():
+-        try:
+-            with _SCAN_LOCK:
+-                CLOSE_FUNDS.update(running=True, asof=day, result=None, error=None)
+-                formal = scoring.formal_histories(codes)
+-                calendar = strength.trading_calendar({c: strength.completed(v) for c, v in formal.items()})
+-                if not calendar or calendar[-1] != day:
+-                    return
+-                print(f'[CLOSE] 正式榜单已发布，后台补采 {day} 辅助资金')
+-                result = fund_history.refresh(codes, calendar, deadline=180)
+-                CLOSE_FUNDS['result'] = result
+-                if result.get('updated') and datetime.now().date().isoformat() == day:
+-                    INIT.update(scan_active=True, scan_started_at=datetime.now().isoformat(timespec='seconds'), scan_mode='quick')
+-                    try:
+-                        scoring.run(mode='quick')
+-                        publish_outputs()
+-                    finally:
+-                        INIT.update(scan_active=False, scan_started_at=None, scan_mode=None)
+-                print(f'[CLOSE] 辅助资金补采完成：成功 {result.get("updated", 0)}，缺口 {result.get("failed", 0)}')
+-        except Exception as exc:
+-            CLOSE_FUNDS['error'] = str(exc)
+-            print(f'[CLOSE] 辅助资金补采失败，已发布榜单保留：{exc}')
+-        finally:
+-            CLOSE_FUNDS['running'] = False
+-    threading.Thread(target=work, daemon=True).start()
+ 
+ 
+ def publish_outputs():
+@@ -201,8 +164,6 @@
+         INIT["last_publish_at"] = datetime.now().isoformat(timespec="seconds")
+         INIT["last_publish_ok"] = True
+         INIT["last_publish_error"] = None
+-        if snapshot:
+-            start_close_fund_refresh(snapshot)
+     except Exception as e:
+         INIT["last_publish_at"] = datetime.now().isoformat(timespec="seconds")
+         INIT["last_publish_ok"] = False
+@@ -440,7 +401,8 @@
+                     or (close_confirmation.get("model_version") == intraday.VERSION
+                         and close_confirmation.get("rule_version") == config.INTRADAY_RULE_VERSION)
+                 )
+-                matches = (snapshot.get('close_refresh_version') == scoring.CLOSE_REFRESH_VERSION
++                matches = (snapshot.get('fund_reference_version') == price_only.VERSION
++                           and snapshot.get('close_refresh_version') == scoring.CLOSE_REFRESH_VERSION
+                            and snapshot.get("factor_model_version") == strength.VERSION
+                            and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
+                            and snapshot.get('board_catalog_version') == board_center.VERSION
+@@ -615,7 +577,6 @@
+             body = json.dumps(
+                 {**STATE, **INIT, **SNAPSHOT_META,
+                  'member_refresh': weekly_members.status(),
+-                 'close_funds': dict(CLOSE_FUNDS),
+                  'code_board_quote_version': board_quote.VERSION,
+                  "data_version": data_version(),
+                  "refresh": {**REFRESH,
+--- strength.py before
++++ strength.py after
+@@ -343,7 +343,7 @@
+                  "points": risks or [{"text": "当前观察池未触发既定位置风险阈值。", "tone": "flat"}]},
+                 {"kind": "basis", "icon": "◉", "title": "判断口径", "summary": snap["strength_model"]["asof"] + " 完成日线",
+                  "points": [{"text": "MA5>MA10>MA20且MA20上行；收盘守住MA10。5/10/20日实际进攻评分；整理、反包、突破和风险分别展示。", "tone": "flat"},
+-                            {"text": "回踩允许盘中破10日线，收盘站回；资金3/5/10日只作辅助确认，缺失标未知。", "tone": "flat"}]},
++                            {"text": "回踩允许盘中破10日线，收盘站回；价格推进、量价结构与风险分别判断。", "tone": "flat"}]},
+             ], "hold_watch": hold}
+ 
+ 
+--- test_attack_model.py before
++++ test_attack_model.py after
+@@ -18,13 +18,13 @@
+                     fund_today_ratio=ratio, fund_today_source=source,
+                     fund_today_at='2026-09-30 10:01:00', intraday_quote_at='2026-09-30 10:00:55')
+ 
+-    def test_main_fund_normalized_sign_and_proxy_weight(self):
++    def test_fund_inputs_have_no_weight_or_score(self):
+         for source, weight in [('东财主力净流入', .15), ('新浪当日超大单净额', .075)]:
+             for ratio, score in [(-20, 0), (0, 50), (10, 75), (20, 100)]:
+                 f = attack.fund_confirmation(self.fund_row(source, ratio),
+                     dict(source=source, stale=False, period='today'), '2026-09-30 10:02:00')
+-                self.assertEqual(f['weight'], weight)
+-                self.assertEqual(f['score'], score)
++                self.assertEqual(f['weight'], 0)
++                self.assertIsNone(f['score'])
+ 
+     def test_missing_stale_wrong_date_unknown_source_or_conflicting_sign_not_zero(self):
+         for kind in ('missing', 'stale', 'old', 'yesterday', 'source', 'sign', 'bad_ratio'):
+@@ -41,7 +41,7 @@
+             self.assertIsNone(f['score'], kind)
+             self.assertEqual(f['weight'], 0, kind)
+ 
+-    def test_fund_changes_live_score_not_daily_and_no_fund_fallback(self):
++    def test_fund_does_not_change_live_or_daily_score(self):
+         snap, quotes, contexts = self.live_fixture()
+         attack.enrich(snap, quotes, contexts)
+         price = snap['stocks'][0]['live_attack_score']
+@@ -51,7 +51,7 @@
+         snap.update(generated_at='2026-09-30 10:02:00', fund_meta=dict(source='东财主力净流入', stale=False))
+         attack.enrich(snap, quotes, contexts)
+         row = snap['stocks'][0]
+-        self.assertEqual(row['live_attack_score'], round(price*.85, 2))
++        self.assertEqual(row['live_attack_score'], price)
+         self.assertEqual(row['stock_strength_score'], 66)
+ 
+     def test_fund_cannot_promote_price_b_to_a(self):
+@@ -62,7 +62,7 @@
+         with patch.object(attack, 'momentum_scores', return_value={'600001': item}):
+             attack.enrich(snap, quotes, contexts)
+         row = snap['stocks'][0]
+-        self.assertGreater(row['live_attack_score'], 65)
++        self.assertEqual(row['live_attack_score'], 64)
+         self.assertEqual(row['live_attack_price_tier'], 'B')
+         self.assertEqual(row['live_attack_tier'], 'B')
+         self.assertFalse(row['attack_watch_candidate'])
+--- test_close_refresh.py before
++++ test_close_refresh.py after
+@@ -1,4 +1,4 @@
+-"""收盘更新调度、正式日线隔离以及发布后资金补采的回归。"""
++"""收盘更新调度、正式日线隔离及兼容缓存的回归。"""
+ from copy import deepcopy
+ from datetime import datetime
+ from pathlib import Path
+@@ -93,20 +93,5 @@
+         self.assertEqual(result['complete20'], 0)
+         self.assertTrue(result['deferred'])
+ 
+-    def test_auxiliary_worker_starts_only_after_verified_close_and_once_per_day(self):
+-        now = datetime(2026, 10, 9, 15, 9)
+-        snapshot = dict(session='已收盘', strength_model=dict(asof='2026-10-09'), stocks=[])
+-        with patch.object(serve, '_CLOSE_FUNDS_DAYS', set()), \
+-             patch.object(serve, 'datetime') as clock, patch.object(serve.threading, 'Thread') as thread:
+-            clock.now.return_value = now
+-            serve.start_close_fund_refresh(snapshot)
+-            thread.assert_not_called()
+-            snapshot['close_daily_verified_at'] = '2026-10-09 15:08:30'
+-            serve.start_close_fund_refresh(snapshot)
+-            serve.start_close_fund_refresh(snapshot)
+-            self.assertEqual(thread.call_count, 1)
+-            thread.return_value.start.assert_called_once()
+-
+-
+ if __name__ == '__main__':
+     unittest.main()
+--- trend_consolidation.py before
++++ trend_consolidation.py after
+@@ -312,10 +312,9 @@
+ 
+ def order(item):
+     priority={'初步突破':0,'初步转强':1,'平台突破待确认':2,'回踩企稳观察':4,'强股整理':5}
+-    fund=item.get('fund') or {}
+     return (bool(item.get('reference_only')),bool(item.get('risk_flags') or item.get('needs_repair_confirmation')),
+             3 if item.get('rebound_active') else priority.get(item['stage'],9),-item['quality_score'],-item['impulse5_pct'],
+-            -(fund.get('score') if number(fund.get('score')) else -1),item['code'])
++            item['code'])
+ 
+ 
+ GROUPS = ('rows', 'completed_rows', 'pending_rows', 'withdrawn_rows')
+--- /dev/null
++++ price_only.py
+@@ -0,0 +1,55 @@
++"""当前资金参考退场；保留空字段兼容历史文件，不复用旧资金参与的判断。"""
++import math
++import config
++
++VERSION = '不使用资金流1'
++
++
++def disabled_fund():
++    return dict(score=None, weight=0., ratio=None, status='已停用', source=None, at=None)
++
++
++def clear_rows(rows):
++    for row in rows:
++        row['factors'] = dict(row.get('factors') or {}, fund=None)
++        for key in ('fund_today_yi', 'fund_today_ratio', 'fund_today_source', 'fund_today_at',
++                    'fund3_yi', 'fund5_yi', 'fund10_yi', 'fund_asof', 'fund_positive_all',
++                    'fund_history_source', 'fund_history_reason'):
++            row[key] = None
++        row.update(fund_state='已停用', fund_history_days=0, live_attack_fund=disabled_fund())
++        last = row.get('intraday_last_judgment') or {}
++        if (last.get('fund') or {}).get('weight', 0) > 0:
++            last.update(attack_score=None, attack_tier=None, attack=False, fund=disabled_fund())
++
++
++def sanitize(snap):
++    """发布入口也清理旧快照，防止旧资金缓存通过页面或重建入口重新出现。"""
++    snap.update(fund_reference_version=VERSION, fund_available=False, fund_source='已停用',
++                fund_meta=dict(source='已停用', enabled=False, stale=False, coverage=0),
++                fund_history=dict(enabled=False, requested=0),
++                fund_confirmation=dict(enabled=False, total=0, covered=0, positive_all=0, source_counts={}))
++    rows = (snap.get('stocks') or []) + (snap.get('coverage_catalog') or [])
++    clear_rows(rows)
++    snap['fund_confirmation']['total'] = len(rows)
++    for row in rows + ((snap.get('attack_monitor') or {}).get('rows') or []):
++        if row.get('live_attack_price_score') is not None:
++            row['live_attack_score'] = row['live_attack_price_score']
++            row['live_attack_tier'] = row.get('live_attack_price_tier')
++        else:
++            row['live_attack_score'] = row['live_attack_tier'] = None
++        row['live_attack_fund'] = disabled_fund()
++    monitor = snap.get('attack_monitor') or {}
++    monitor['rows'] = [r for r in monitor.get('rows') or [] if isinstance(r.get('live_attack_score'), (float, int))
++                       and math.isfinite(r['live_attack_score']) and r.get('live_attack_tier') == 'A']
++    for board in (snap.get('boards') or []) + (snap.get('board_catalog') or []):
++        board.update(fund=None, fund_src='已停用', fund_covered=0, fund_today_covered=0,
++                     fund_sum_5d=None, fund_sum_today=None, fund_observed_at=None)
++    # 旧快照的板块综合分也可能混入资金，按原有其余维度比例重算。
++    for board in snap.get('boards') or []:
++        values = [(config.BOARD_WEIGHTS[k], board.get(k)) for k in ('rs', 'momentum', 'linkage')
++                  if isinstance(board.get(k), (int, float)) and math.isfinite(board[k])]
++        board['score'] = round(sum(w*v for w,v in values)/sum(w for w,v in values)*board.get('gate', 1), 2) if values else None
++    snap['boards'] = sorted(snap.get('boards') or [], key=lambda b: -(b.get('score') or 0))
++    for rank, board in enumerate(snap['boards'], 1):
++        board['rank'] = rank
++    return snap
+--- /dev/null
++++ test_price_only.py
+@@ -0,0 +1,52 @@
++"""资金退出后，旧缓存、排序和历史盘中资格不能继续带入资金判断。"""
++from copy import deepcopy
++import unittest
++
++import attack_model
++import intraday_path
++import price_only
++
++
++class PriceOnlyTests(unittest.TestCase):
++    def test_cached_fund_never_changes_price_score_or_board_sort(self):
++        base = dict(stocks=[dict(code='a', live_attack_score=70, live_attack_price_score=80,
++                                live_attack_price_tier='A', fund_today_yi=999, fund_positive_all=True,
++                                factors=dict(rs=88, fund=100))],
++                    boards=[dict(name='a', rs=50, momentum=50, linkage=50, gate=1, fund=100, score=90),
++                            dict(name='b', rs=60, momentum=60, linkage=60, gate=1, fund=0, score=30)])
++        snap = price_only.sanitize(deepcopy(base))
++        self.assertEqual(snap['stocks'][0]['live_attack_score'], 80)
++        self.assertIsNone(snap['stocks'][0]['fund_today_yi'])
++        self.assertIsNone(snap['stocks'][0]['fund_positive_all'])
++        self.assertEqual(snap['stocks'][0]['factors']['rs'], 88)
++        self.assertEqual([b['name'] for b in snap['boards']], ['b', 'a'])
++        self.assertEqual([b['score'] for b in snap['boards']], [60, 50])
++        self.assertEqual(snap, price_only.sanitize(deepcopy(snap)))
++
++    def test_old_weighted_reference_is_not_relabelled_price_only(self):
++        point = dict(valid=True, attack=True, attack_score=80, attack_tier='A', price=10,
++                     fund=dict(score=90, weight=.15))
++        row = dict(code='a', intraday_last_judgment=point)
++        price_only.clear_rows([row])
++        self.assertIsNone(point['attack_score'])
++        self.assertFalse(point['attack'])
++        self.assertEqual(point['price'], 10)
++
++    def test_weighted_history_cannot_create_current_attack_reference(self):
++        record = [None]*41
++        record[1] = '2026-10-09 10:00:00'; record[2] = 10
++        record[31] = True; record[33] = 80; record[34] = 'A'; record[36] = True
++        record[37] = dict(weight=.15, score=100)
++        old = intraday_path.point(record, '2026-10-09 10:00:01')
++        self.assertTrue(old['valid'])
++        self.assertEqual(old['price'], 10)
++        self.assertIsNone(old['attack_score'])
++        self.assertFalse(old['attack'])
++        record[37] = dict(weight=0, score=None)
++        new = intraday_path.point(record, '2026-10-09 10:00:01')
++        self.assertEqual(new['attack_score'], 80)
++        self.assertTrue(new['attack'])
++
++
++if __name__ == '__main__':
++    unittest.main()

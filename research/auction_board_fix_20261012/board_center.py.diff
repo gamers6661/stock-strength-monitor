@@ -1,0 +1,63 @@
+--- board_center.py.before
++++ board_center.py
+@@ -1,12 +1,59 @@
+ """统一板块成员图和板块内候选名单。指数走势与主板成员观察分列。"""
+ import json
++import math
++from datetime import datetime
+ from collections import defaultdict
+ from statistics import mean, median
+ 
+ import config
+ import stock_strength
+ 
+-VERSION = '板块成员完整3'
++VERSION = '板块成员竞价4'
++
++
++def attach_auction(snapshot):
++    """竞价只聚合当前主板成员报价，不改完成日线及官方指数收益。"""
++    now = datetime.fromisoformat(snapshot['quote_capture_at'])
++    quotes = {}
++    for row in (snapshot.get('stocks') or []) + (snapshot.get('coverage_catalog') or []):
++        q = row.get('auction_observation') or {}
++        try:
++            at = datetime.fromisoformat(q['quote_at'])
++            change, price = float(q['change_pct']), float(q['price'])
++            age = (now-at).total_seconds()
++            minute = at.hour*60+at.minute
++            if (at.date() == now.date() and 9*60+15 <= minute <= 9*60+25
++                    and -config.INTRADAY['max_quote_future_seconds'] <= age <= config.INTRADAY['max_quote_age_seconds']
++                    and math.isfinite(change) and math.isfinite(price) and price > 0):
++                quotes[str(row['code'])] = dict(change_pct=change, quote_at=q['quote_at'])
++        except (KeyError, TypeError, ValueError):
++            continue
++    latest = max((q['quote_at'] for q in quotes.values()), default=None)
++    if latest:
++        last = datetime.fromisoformat(latest)
++        quotes = {c: q for c, q in quotes.items() if
++                  (last-datetime.fromisoformat(q['quote_at'])).total_seconds() <= config.INTRADAY['max_quote_batch_skew_seconds']}
++    for board in snapshot.get('board_catalog') or []:
++        codes = sorted(set(board.get('member_codes') or []))
++        current = [quotes[c] for c in codes if c in quotes]
++        count = len(current)
++        ready = count >= board.get('ranking_min_members', 6)
++        board['member_auction'] = dict(
++            ready=ready, date=now.date().isoformat(), captured_at=snapshot['quote_capture_at'],
++            change_pct=round(mean(q['change_pct'] for q in current), 2) if ready else None,
++            up_pct=round(sum(q['change_pct'] > 0 for q in current)/count*100, 1) if ready else None,
++            quote_at=max((q['quote_at'] for q in current), default=None),
++            earliest_quote_at=min((q['quote_at'] for q in current), default=None),
++            valid_count=count, pool_count=len(codes),
++            coverage_pct=round(count/len(codes)*100, 1) if codes else 0,
++            basis='已覆盖主板成员竞价等权；不代表官方指数',
++            reason=None if ready else '有效竞价成员不足6只')
++        # 明细独立字段，不覆盖上轮收益或日线情绪。
++        for member in board.get('members') or []:
++            q = quotes.get(str(member['code']))
++            member['auction_change_pct'] = q['change_pct'] if q else None
++            member['auction_quote_at'] = q['quote_at'] if q else None
++    snapshot['board_catalog_version'] = VERSION
+ 
+ 
+ def _catalog():

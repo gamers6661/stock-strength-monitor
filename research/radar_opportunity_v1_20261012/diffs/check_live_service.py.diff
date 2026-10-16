@@ -1,0 +1,21 @@
+--- before/check_live_service.py
++++ check_live_service.py
+@@ -14,6 +14,7 @@
+ import board_trend
+ import board_center
+ import board_opportunity
++import radar_opportunity
+ import board_quote
+ import weekly_members
+ import scoring
+@@ -29,6 +30,10 @@
+ def run(base="http://127.0.0.1:8848"):
+     status = json.loads(get(base + "/__status"))
+     snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
++    assert status.get('code_radar_opportunity_version')==radar_opportunity.VERSION
++    assert status.get('snapshot_radar_opportunity_version')==radar_opportunity.VERSION
++    assert status.get('code_radar_opportunity_hash')==status.get('snapshot_radar_opportunity_hash')==radar_opportunity.IMPLEMENTATION_HASH
++    radar_opportunity.validate(snapshot)
+     html = get(base + "/dashboard.html").decode("utf-8")
+     text_report = (config.ROOT / "snapshot_report.md").read_text(encoding="utf-8")
+     marker = "var DATA = "

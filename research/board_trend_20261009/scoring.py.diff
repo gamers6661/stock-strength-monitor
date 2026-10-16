@@ -1,0 +1,41 @@
+--- scoring.py.before
++++ scoring.py
+@@ -252,6 +252,9 @@
+             "pending_count": 0,
+             "price_basis_version": intraday.PRICE_BASIS_VERSION,
+             "reason": f"竞价报价不用于 MA{period} 回踩判断，等待正常交易"}
++    # 竞价沿用完成日线；板块新增观察只读本地，不拖延当日报价采集。
++    import board_trend
++    board_trend.attach(snap, fetch=False)
+     completed_at = datetime.now()
+     snap["scan_completed_at"] = completed_at.isoformat(sep=" ", timespec="seconds")
+     snap["generated_at"] = completed_at.strftime("%Y-%m-%d %H:%M:%S")
+@@ -396,6 +399,13 @@
+     def work(ic):
+         try:
+             nm, ks = df.fetch_ths_board_kline(ic)
++            if nm == ths_map.get(ic) and ks:
++                # 新板块观察独立落库，不改变下方既有评分输入。
++                import board_trend
++                try:
++                    board_trend.save(ic, ks)
++                except Exception as error:
++                    print(f"[WARN] 板块日线落库失败 {ic}: {error}")
+             if nm and len(ks) >= 25:
+                 m = F.board_raw_metrics(ks)
+                 m["name"] = nm
+@@ -1229,10 +1239,14 @@
+     snap["board_catalog"] = board_center.build(stocks, quotes, theme_map, boards, fund_map,
+                                                model["asof"])
+     for item in snap["board_catalog"]:
++        item["member_quote_at"] = snap["quote_capture_at"]
+         item["fund_observed_at"] = (fund_meta.get("fetched_at") or snap["generated_at"])
+         if not (item["fund_covered"] or item["fund_today_covered"]):
+             item["fund_observed_at"] = None
+     completed_bars = {c: strength.completed(v) for c, v in klines.items()}
++    import board_trend
++    snap["board_trend_model"] = board_trend.attach(
++        snap, strength.trading_calendar(completed_bars), fetch=True)
+     catalog, catalog_stats = coverage.build(
+         quotes, klines, {s["code"] for s in stocks}, raw_reasons,
+         {m["code"]: m for m in raw_all}, model["asof"],

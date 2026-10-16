@@ -1,0 +1,14 @@
+--- before/serve.py
++++ after/serve.py
+@@ -708,7 +708,10 @@
+                 if not 0 < size <= 8 * 1024 * 1024:
+                     raise ValueError('Invalid body size')
+                 request = json.loads(self.rfile.read(size))
+-                body = ui_payload.export_csv(request.get('version'), request.get('codes'), request.get('contexts'))
++                if request.get('kind') == 'board':
++                    body = ui_payload.export_board_csv(request.get('version'), request.get('ids'))
++                else:
++                    body = ui_payload.export_csv(request.get('version'), request.get('codes'), request.get('contexts'))
+                 self._send_body(body, 'text/csv; charset=utf-8')
+             except LookupError:
+                 self.send_error(409, 'Generation expired')

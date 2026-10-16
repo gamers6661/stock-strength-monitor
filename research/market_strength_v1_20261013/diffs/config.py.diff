@@ -1,0 +1,27 @@
+--- before/config.py
++++ after/config.py
+@@ -12,6 +12,24 @@
+ import threading
+ 
+ ROOT = Path(__file__).resolve().parent
++MARKET_STRENGTH = {
++    'version': 'market-strength-2026-10-13.1',
++    'periods': [5, 10, 20], 'strong_min': 65, 'very_strong_min': 80, 'normal_min': 45,
++    'stock_full_returns': {5: 8, 10: 12, 20: 20},
++    'board_full_returns': {5: 5, 10: 8, 20: 12},
++    'absolute_weight': .60, 'relative_weight': .40,
++    'drawdown_shallow_atr': 1.50, 'drawdown_max_atr': 2.50,
++    'structure_factors': {'intact': 1., 'pullback': .85, 'damaged': .50},
++    'emotion_attack_weight': .70, 'emotion_hold_weight': .30,
++    'hold_position_weight': .70, 'hold_open_weight': .30, 'open_full_limit_ratio': .30,
++    'board_trim_ratio': .10, 'board_min_valid_members': 6, 'board_min_coverage_pct': 80,
++    'board_today_full_return': 2., 'board_emotion_weights': {'attack': .40, 'hot_share': .35, 'hold': .25},
++    'board_structure_base': .50, 'board_structure_weight': .50,
++    'phase_history_days': 3, 'phase_mature_strong_days': 2,
++    'phase_consolidation_share': .50, 'tie_epsilon': 1e-9,
++    'breakout_days': 20, 'restart_days': 3, 'event_priority': ['再启动', '突破', '反包'],
++    'quote_tick_default': .01, 'limit_tick_tolerance': .50,
++}
+ CACHE_DIR = ROOT / "cache"
+ CACHE_DIR.mkdir(exist_ok=True)
+ 

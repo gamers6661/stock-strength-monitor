@@ -1,0 +1,1800 @@
+--- make_dashboard.py.before
++++ make_dashboard.py
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-"""把 snapshot.json 注入模板，产出可双击打开的独立看板 dashboard.html"""
++"""发布轻量看板及同版本地详情；完整离线看板由服务端按需导出。"""
+ import json
+ import sys
+ 
+@@ -75,9 +75,20 @@
+     if PLACEHOLDER not in tpl:
+         print("[ERR] 模板缺少数据占位符")
+         return None
+-    payload = config.script_json(snap)
++    lazy = '/*__UI_SCRIPT__*/' in tpl
++    if lazy:
++        import ui_payload
++        snap['runtime_contract']['code_ui_payload_version'] = ui_payload.VERSION
++        tpl = tpl.replace('/*__CSV_SCRIPT__*/', (config.ROOT / 'csv_export.js').read_text(encoding='utf-8'))
++        tpl = tpl.replace('/*__UI_SCRIPT__*/', (config.ROOT / 'ui_client.js').read_text(encoding='utf-8'))
++        package, generation = ui_payload.prepare(snap, tpl, OUT)
++        payload = config.script_json(package)
++    else:
++        payload = config.script_json(snap)
+     html = tpl.replace(PLACEHOLDER, payload)
+     config.atomic_write_text(OUT, html)   # 原子写：避免浏览器读到半截页面
++    if lazy:
++        ui_payload.activate(generation, OUT)
+     print(f"[OK] 看板已生成：{OUT}  ({len(html)/1024:.0f} KB)")
+     return OUT
+ 
+--- serve.py.before
++++ serve.py
+@@ -15,6 +15,7 @@
+        python serve.py --no-loop    # 只起服务，不自动刷新
+ """
+ import json
++import gzip
+ import html as html_module
+ import os
+ import sys
+@@ -22,7 +23,7 @@
+ import time
+ import traceback
+ import urllib.request
+-from urllib.parse import urlsplit
++from urllib.parse import urlsplit, parse_qs
+ import webbrowser
+ from datetime import datetime
+ from functools import partial
+@@ -45,6 +46,7 @@
+ import board_quote
+ import weekly_members
+ import price_only
++import ui_payload
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -613,6 +615,8 @@
+                 {**STATE, **INIT, **SNAPSHOT_META,
+                  'member_refresh': weekly_members.status(),
+                  'code_board_quote_version': board_quote.VERSION,
++                 'code_ui_payload_version': ui_payload.VERSION,
++                 'ui_generation': ui_payload.active_generation(),
+                  "data_version": data_version(),
+                  "refresh": {**REFRESH,
+                              "running_seconds": round(time.time() - REFRESH["started_at"], 1)
+@@ -621,17 +625,50 @@
+                 ensure_ascii=False).encode("utf-8")
+             self._send_body(body, "application/json; charset=utf-8")
+             return
++        if path.startswith('/__ui/'):
++            self._ui_get(path)
++            return
+         # 初始化期间看板文件还不存在：返回自动刷新等待页，而不是 404/拒绝
+         if (path in ("/", "/dashboard.html", "/index.html")
+                 and INIT["phase"] not in ("ready",)
+                 and (INIT["needs_model_refresh"] or not (config.ROOT / "dashboard.html").exists())):
+             self._send_init_page()
+             return
++        if path in ('/', '/dashboard.html', '/index.html') and ui_payload.active_generation():
++            body = ui_payload.blob(ui_payload.active_generation(), 'page.gz')
++            compressed = 'gzip' in self.headers.get('Accept-Encoding', '')
++            if not compressed:
++                body = gzip.decompress(body)
++            self.send_response(200)
++            self.send_header('Content-Type', 'text/html; charset=utf-8')
++            self.send_header('Content-Length', str(len(body)))
++            self.send_header('Vary', 'Accept-Encoding')
++            if compressed:
++                self.send_header('Content-Encoding', 'gzip')
++            self.end_headers()
++            self.wfile.write(body)
++            return
+         super().do_GET()
+ 
+     def do_POST(self):
+         if not self._local_request_allowed(mutation=True):
+             self.send_error(403, 'Local requests only')
++            return
++        if self.path.split('?')[0] == '/__ui/export':
++            try:
++                size = int(self.headers.get('Content-Length', '0'))
++                if not 0 < size <= 8 * 1024 * 1024:
++                    raise ValueError('Invalid body size')
++                request = json.loads(self.rfile.read(size))
++                body = ui_payload.export_csv(request.get('version'), request.get('codes'), request.get('contexts'))
++                self._send_body(body, 'text/csv; charset=utf-8')
++            except LookupError:
++                self.send_error(409, 'Generation expired')
++            except (ValueError, TypeError):
++                self.send_error(400, 'Invalid request')
++            except Exception:
++                traceback.print_exc()
++                self.send_error(500, 'Export failed')
+             return
+         # 看板「刷新数据」按钮：主动触发一次扫描并重建看板。
+         # 用 POST 而不是 GET：它有副作用（会去抓数据源），不能被浏览器预取/缓存命中
+@@ -641,6 +678,40 @@
+                             "application/json; charset=utf-8")
+             return
+         self.send_error(404, "Not Found")
++
++    def _ui_get(self, path):
++        query = parse_qs(urlsplit(self.path).query)
++        try:
++            version = query.get('version', [''])[0]
++            if path == '/__ui/detail':
++                item = ui_payload.detail(version, query.get('kind', [''])[0], query.get('id', [''])[0])
++                self._send_body(ui_payload.dumps({'version': version, 'item': item}).encode('utf-8'),
++                                'application/json; charset=utf-8')
++            elif path == '/__ui/summary':
++                compressed = 'gzip' in self.headers.get('Accept-Encoding', '')
++                body = ui_payload.blob(version, 'summary.gz' if compressed else 'summary')
++                self.send_response(200)
++                self.send_header('Content-Type', 'application/json; charset=utf-8')
++                self.send_header('Content-Length', str(len(body)))
++                self.send_header('Vary', 'Accept-Encoding')
++                if compressed:
++                    self.send_header('Content-Encoding', 'gzip')
++                self.end_headers()
++                self.wfile.write(body)
++            elif path == '/__ui/offline':
++                body = ui_payload.offline_html(version)
++                self.send_response(200)
++                self.send_header('Content-Type', 'text/html; charset=utf-8')
++                self.send_header('Content-Disposition', 'attachment; filename="dashboard-offline.html"')
++                self.send_header('Content-Length', str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++            else:
++                self.send_error(404, 'Unknown UI endpoint')
++        except LookupError:
++            self.send_error(409, 'Generation expired')
++        except (ValueError, TypeError):
++            self.send_error(400, 'Invalid request')
+ 
+     def _send_init_page(self):
+         phase = INIT["phase"]
+--- dashboard_template.html.before
++++ dashboard_template.html
+@@ -1163,7 +1163,10 @@
+ <div class="ui-note-tip" id="ui-note-tip" role="tooltip" hidden></div>
+ 
+ <script>
++/*__CSV_SCRIPT__*/
++/*__UI_SCRIPT__*/
+ var DATA = /*__DATA__*/null;
++DATA=decodeDashboardPackage(DATA);
+ 
+ /* ── 渲染错误兜底 ──
+    一个 JS 异常就会让某个页签整页空白，而控制台之外没有任何提示 ——
+@@ -1468,6 +1471,7 @@
+   document.getElementById('dr-b').innerHTML=html;
+   document.getElementById('dr-b').scrollTop=0;
+   var d=document.getElementById('drawer');
++  d.scrollTop=0;
+   d.classList.toggle('wide',!!wide);
+   d.classList.add('open');
+   document.getElementById('scrim').classList.add('on');
+@@ -1746,9 +1750,8 @@
+        if(PAGE_VERSION===null)PAGE_VERSION=s.data_version||null;
+        if(s.data_version&&PAGE_VERSION&&s.data_version!==PAGE_VERSION){
+          RF.versionChanged=true;
+-         PAGE_VERSION=s.data_version;
+          rfLabel('载入中…',true);
+-         setTimeout(function(){ location.reload(); },300);
++         updateDashboardData(s).catch(function(){});
+          return;
+        }
+        if(RF.followBackground){
+@@ -1766,7 +1769,7 @@
+            return;
+          }
+          rfLabel('载入中…',true);
+-         setTimeout(function(){ location.reload(); },300);
++         updateDashboardData(s).catch(function(){});
+          return;
+        }
+        if(rf.running){
+@@ -1791,7 +1794,7 @@
+          // 本轮跑完 → 重新载入拿到新数据。finished_at 是服务进程全局状态，
+          // 必须确认它属于本次请求，不能拿上一次手动刷新时间误判。
+          rfLabel('载入中…',true);
+-         setTimeout(function(){ location.reload(); },600);
++         updateDashboardData(s).catch(function(){});
+          return;
+       }
+       if(sec>20){ rfDone(); toast('刷新状态异常，请稍后手动刷新页面'); }
+@@ -1872,11 +1875,10 @@
+      var loaded=DATA.scan_completed_at||DATA.generated_at;
+      var newer=s.snapshot_generated_at&&loaded&&s.snapshot_generated_at>loaded;
+      if(PAGE_VERSION===null&&!newer){PAGE_VERSION=v;return;}
+-     if(v!==PAGE_VERSION||newer){
++     if(v!==PAGE_VERSION||newer||(DATA.ui_lazy&&s.ui_generation!==DATA.ui_generation)){
+        if(RF.busy){RF.versionChanged=true;return;}
+-       PAGE_VERSION=v;
+        toast('数据已更新，正在载入…');
+-       setTimeout(function(){location.reload();},300);
++       updateDashboardData(s).catch(function(){});
+      }
+    }).catch(function(){
+      var el=document.getElementById('update-state');
+@@ -3440,59 +3442,28 @@
+ /* ── 导出 ── */
+ 
+ function exportCSV(){
+-  var res=stockViewRows(STOCK_VIEW,true);
+-  var head=['代码','名称','判断日','日线进攻强度','日线强度分位','日线近期变化','综合状态','分位较前日变化','分位较前五日变化','5日攻击速度分','10日推进分','20日涨幅基础分','结构不计分','5日进攻依据','10日进攻依据','20日进攻依据','结构与量价依据','绝对方向','主要强项','主要短板','近10日跑赢主板天数','近3日收盘位置%','放量滞涨','当前距20日高点%','历史最大回撤修复%','5日相对优势变化百分点','20日涨幅%','20日涨幅分位','逐股报价时间','现价','今日涨跌%','双轴分类','趋势阶段','情绪热度','量价表现','行业状态','个股行业关系','趋势助攻','情绪助攻','个股角色','日线MA5','日线MA10','日线MA20','三线排列','日线趋势在线','完成日回踩形态','MA20近5日斜率%','20日最大回撤%','有方向20日路径效率','5日对市场超额百分点','20日对市场超额百分点','5日对同行超额百分点','20日对同行超额百分点','同行趋势在线%','同行趋势变化百分点','剔除前两名后趋势在线%','同行情绪活跃%','同行涨停数','行业','行业广度%','有效同伴','日线与历史风险'];
+-  head.push('扫描完成时间','盘中强度','相对评分变化','盘中趋势状态','盘中暂态MA5','盘中暂态MA10','盘中暂态MA20','日内位置%','距日内高点%','盘中风险等级','盘中风险标记','行业同期涨幅%','本股对同行超额点','历史回踩形态','当前回踩资格','报价是否有效','行情阶段','报价状态','最后有效报价时间','当日相对主板超额百分点','主板等权涨幅%','开盘后表现%','盘中评分完整项数','盘中观察分类','扫描状态变化','当前强势资格','初步启动资格','转弱修复资格','报价日前固定MA5','报价日前固定MA10','报价日前固定MA20','暂态MA20参考基准');
+-  head=head.map(function(name){return ({'当前回踩资格':'扫描时当前回踩资格',
+-    '当前强势资格':'扫描时当前强势资格','初步启动资格':'扫描时初步启动资格',
+-    '转弱修复资格':'扫描时转弱修复资格'})[name]||name;});
+-  function cell(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
+-  var lines=[head.map(cell).join(',')];
+-  res.forEach(function(s){var p=s.stock_strength_parts||{},e=s.stock_strength_evidence||{};
+-    lines.push([s.code,s.name,s.signal_date,s.stock_strength_score,s.stock_strength_percentile,s.daily_motion||s.stock_strength_motion,s.stock_strength_display_state,s.strength_delta1,s.strength_delta5,p.attack5,p.attack10,p.attack20,'',e.attack5,e.attack10,e.attack20,s.structure_evidence,s.strength_direction,s.stock_strength_main_good,s.stock_strength_main_weak,s.beat_days10,s.close_location3_pct,s.volume_spike_stall?'是':'否',s.current_drawdown_pct,s.drawdown_repair_pct,s.strength_accel5_pp,s.ret20,s.ret20_percentile,s.intraday_quote_at,s.price,s.change_pct,s.axis_group,s.trend_stage,s.emotion_heat,s.emotion_acceptance,s.industry_trend_state,s.industry_stock_relation,s.trend_assist,s.emotion_assist,(s.roles||[]).join('、'),s.ma5,s.ma10,s.ma20,s.trend_aligned?'是':'否',s.trend_online?'是':'否',s.touch_state,s.ma20_slope5_pct,s.max_dd20_pct,s.path_eff20,s.ret5_ex_market,s.ret20_ex_market,s.ret5_ex_industry,s.ret20_ex_industry,s.industry_peer_trend_pct,s.industry_peer_trend_delta_pp,s.industry_ex_top2_trend_pct,s.emotion_peer_active_pct,s.emotion_peer_limit,s.primary_industry,s.industry_breadth,s.industry_peers,(s.risk_notes||[s.reason_text||'']).join('；'),DATA.scan_completed_at||DATA.generated_at,s.intraday_score,s.intraday_score_delta,s.intraday_trend_state,s.intraday_ma5,s.intraday_ma10,s.intraday_ma20,s.intraday_position_pct,s.intraday_drawdown_from_high_pct,s.intraday_risk_level,(s.intraday_risk_flags||[]).join('；'),s.industry_intraday_change_pct,s.industry_intraday_excess_pct,s.historical_pullback_shape?'是':'否',s.current_pullback_candidate?'是':'否',s.intraday_quote_fresh?'是':'否',s.intraday_phase_status,s.intraday_quote_status,s.last_valid_quote_at,s.intraday_relative_return_pct,s.intraday_market_return_pct,s.intraday_open_return_pct,s.intraday_score_available_components,s.intraday_observation_state,s.intraday_transition,s.current_strong_candidate?'是':'否',s.startup_candidate?'是':'否',s.turn_weak_repair_candidate?'是':'否',s.daily_ma5_fixed,s.daily_ma10_fixed,s.daily_ma20_fixed,s.intraday_previous_completed_ma20].map(cell).join(','));});
+-  lines[0]+=',10日涨幅%,日线价格形态,盘中暂态进攻分,盘中暂态进攻档,盘中价格形态,进攻监测候选,进攻状态时间口径';
+-  res.forEach(function(s,i){lines[i+1]+=','+[s.ret10,s.daily_attack_stage,s.live_attack_score,s.live_attack_tier,s.live_attack_stage,s.attack_watch_candidate?'是':'否',s.live_attack_status].map(cell).join(',');});
+-  lines[0]+=',同花顺题材关系,题材关系状态,题材有效同伴覆盖,题材归属依据,全体强度名次,趋势池名次,趋势池分位,关注层级,行业归属来源,历史报价口径差异百分点,历史报价口径状态,扫描转换核验,当前强势未通过项';
+-  res.forEach(function(s,i){lines[i+1]+=','+[(s.theme_relations||[]).map(function(t){return t.name;}).join('、'),(s.theme_relations||[]).map(function(t){return t.name+':'+t.state;}).join('；'),(s.theme_relations||[]).map(function(t){return t.name+' '+t.peers+'只';}).join('；'),s.theme_basis,s.stock_strength_rank,s.trend_pool_rank,s.trend_pool_percentile,s.trend_tier,s.industry_basis,s.intraday_price_basis_gap_pct,s.intraday_price_basis_status,s.intraday_transition_state,(s.current_strong_missing||[]).join('；')].map(cell).join(',');});
+-  lines[0]+=',当前报价状态,当前强势候选,当前回踩候选,当前初步启动候选,当前转弱修复候选';
+-  res.forEach(function(s,i){lines[i+1]+=','+[
+-    quoteFreshAtClientNow(s)?'报价有效':quoteStatusAtClientNow(s),
+-    currentCandidateActive(s,'current_strong_candidate')?'是':'否',
+-    currentCandidateActive(s,'current_pullback_candidate')?'是':'否',
+-    currentCandidateActive(s,'startup_candidate')?'是':'否',
+-    currentCandidateActive(s,'turn_weak_repair_candidate')?'是':'否'
+-  ].map(cell).join(',');});
+-  lines[0]+=',最近完成日日期,最近完成日收盘价,最近完成日涨跌幅%,页面展示口径,页面展示时间,页面展示价格,页面展示涨跌幅%';
+-  res.forEach(function(s,i){
+-    var bridge=afternoonBridgeQuote(s);
+-    var openBridge=morningOpenBridgeQuote(s),auction=auctionDisplayQuote(s);
+-    var shown=useCompletedClose()?closeDisplayQuote(s):lunchDisplayQuote(s)||bridge||openBridge||auction;
+-    lines[i+1]+=','+[s.last_completed_date,s.last_completed_close,s.last_completed_change_pct,
+-      bridge?'午后报价待更新·11:30参考':openBridge?'开盘报价待更新·'+openBridge.kind:shown?shown.kind:'当日报价',shown?shown.at:s.intraday_quote_at,
+-      shown?shown.price:s.price,shown?shown.change:s.change_pct].map(cell).join(',');
++  var res=stockViewRows(STOCK_VIEW,true),contexts={useCompletedClose:useCompletedClose()};
++  res.forEach(function(s){var candidates={};
++    ['current_strong_candidate','current_pullback_candidate','startup_candidate','turn_weak_repair_candidate']
++      .forEach(function(k){candidates[k]=currentCandidateActive(s,k);});
++    contexts[s.code]={fresh:quoteFreshAtClientNow(s),status:quoteStatusAtClientNow(s),candidates:candidates,
++      bridge:afternoonBridgeQuote(s),openBridge:morningOpenBridgeQuote(s),auction:auctionDisplayQuote(s),
++      close:closeDisplayQuote(s),lunch:lunchDisplayQuote(s)};
+   });
+-  lines[0]+=','+['价格进攻分','价格进攻档位','距盘中MA5_ATR'].map(cell).join(',');
+-  res.forEach(function(s,i){var f=s.live_attack_fund||{};lines[i+1]+=','+[s.live_attack_price_score,s.live_attack_price_tier,s.live_overheat_dist_atr].map(cell).join(',');});
+-  lines[0]+=','+['盘中判断截至','盘中本轮判断可用','日内路径状态','累计获取次数','有效获取次数','MA10扫描变化记录'].map(cell).join(',');
+-  res.forEach(function(s,i){var p=s.intraday_path||{};lines[i+1]+=','+[s.intraday_judgment_at,s.intraday_observation_available?'是':'否',p.state,p.acquired_count,p.valid_count,(p.events||[]).map(function(e){return e.at+' '+e.kind;}).join('；')].map(cell).join(',');});
+-  lines[0]+=','+['整理资格','整理状态','整理结构标签','此前5日进攻%','进攻窗口截至','整理开始日','整理完成日数','整理形态','整理日线回撤ATR','整理量对上涨量','整理振幅变化','整理固定平台上沿','整理转强确认次数','整理突破确认次数','整理判断截至','整理未通过原因'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.completion_confirmed?(c.trend_exited?'已转强，MA20失守退出':c.reference_only&&String(c.stage||'').indexOf('待核验')>=0?'已转强，待核验':'已完成整理，进入转强跟踪'):c.eligible===true?'日线资格通过':c.eligible===false?'未通过':'未重判',c.stage,c.trend_label,c.impulse5_pct,c.impulse_end,c.consolidation_start,c.days,c.shape,c.pullback_atr,c.volume_ratio,c.contraction_ratio,c.platform_high,c.turn_samples,c.breakout_samples,c.quote_at,c.reason].map(cell).join(',');});
+-  lines[0]+=','+['此前10日进攻%','整理进攻达标周期','整理进攻达标涨幅%','整理后再突破日数','整理历史放量分歧日','整理MA10历史失守已修复','整理修复价','整理修复有效采样次数','整理结构说明'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.impulse10_pct,c.attack_period,c.attack_gain_pct,c.post_breakout_days,(c.expanded_down_dates||[]).join('；'),c.ma10_repaired?'是':'否',c.repair_trigger_price,c.repair_samples,c.structure_note].map(cell).join(',');});
+-  lines[0]+=','+['历史转强确认','历史转强确认时间','转强后当前状态','本轮进攻确认','跟踪MA10边界','MA10连续失守次数','MA10连续收复次数','MA20退出时间','MA20修复时间','收盘复核日','收盘复核价（日线口径）','收盘MA10（日线口径）','收盘复核价格口径'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.completion_confirmed===true?'是':'否',c.completed_at,c.tracking_state,c.current_breakout_confirmed===true?'是':c.completion_confirmed?'否':'',c.tracking_ma10,c.ma10_below_samples,c.ma10_recovery_samples,c.trend_exit_at,c.trend_recovered_at,c.close_review_day,c.close_review_price,c.close_review_ma10,c.close_review_price_basis].map(cell).join(',');});
+-  lines[0]+=','+['已整理完成交易日数','整理天数截至','当日整理序号','回踩反弹参考均线','回踩靠线日期时间','回踩反弹确认日期时间','回踩反弹证据','回踩反弹当前保持'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.consolidation_elapsed_days,c.consolidation_elapsed_asof,c.consolidation_day_number,c.rebound_line?'MA'+c.rebound_line:'',c.rebound_touch_at,c.rebound_confirmed_at,c.rebound_evidence,c.rebound_active===true?'是':c.rebound_confirmed?'否':''].map(cell).join(',');});
+-  lines[0]+=','+['跟踪MA20边界','MA20连续失守次数','MA20连续收复次数','收盘MA20（日线口径）','MA10降级','支撑位置提示','提示截至','提示价格口径','平台底部（提示口径）','旧规则MA10退出留档'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.tracking_ma20,c.ma20_below_samples,c.ma20_recovery_samples,c.close_review_ma20,c.ma10_downgraded===true?'是':'否',(c.support_alerts||[]).map(function(a){return a.label+' ¥'+a.price+' 距'+a.distance_atr+'ATR';}).join('；'),c.support_alert_at,c.reference_only&&c.close_review_day&&c.support_alert_at===c.close_review_day+' 15:00:00'?'同源正式日线':'已核验报价',c.support_platform_low,c.legacy_ma10_exit_at].map(cell).join(',');});
+-  lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
+-  res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,w.volume0,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
+-  lines[0]+=','+['衔接模型','昨收基准日','昨收主榜','昨日日线档位','当日综合判断','衔接报价截至','当前价格进攻分','价格距昨收ATR','衔接风险','ATR算法','前日变化来源','前五日变化来源','威科夫特征'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
+-  lines[0]+=','+['最新价格判断','当前平台状态','报价判断模式','整理条件状态','整理条件依据','本地日线数','历史窗口核验','当前原平台突破门槛','已完成整理日数'].map(cell).join(',');
+-  res.forEach(function(s,i){var c=s.session_context||{},e=c.history_evidence||{};lines[i+1]+=','+[c.current_label,c.structure_state,c.observation_mode,c.setup_state,c.setup_reason,e.count,e.valid===true?'已核验':e.reason,c.breakout_threshold,c.completed_consolidation_days].map(cell).join(',');});
+-  var blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
+-  a.href=URL.createObjectURL(blob);a.download='强势观察_'+String(DATA.quote_capture_at||DATA.generated_at||'').slice(0,10)+'_日线基准_'+((DATA.strength_model||{}).asof||'')+'.csv';a.click();toast('已导出 '+res.length+' 条');
++  function save(text){
++    var blob=new Blob([text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
++    a.href=URL.createObjectURL(blob);a.download='强势观察_'+String(DATA.quote_capture_at||DATA.generated_at||'').slice(0,10)+'_日线基准_'+((DATA.strength_model||{}).asof||'')+'.csv';
++    a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},10000);toast('已导出 '+res.length+' 条');
++  }
++  if(!DATA.ui_lazy){save(buildStockCSV(res,DATA,contexts));return Promise.resolve();}
++  if(!res.length){toast('当前没有符合筛选的个股');return Promise.resolve();}
++  var generation=DATA.ui_generation;
++  toast('正在导出 '+res.length+' 条…');
++  return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},
++    body:JSON.stringify({version:generation,codes:res.map(function(s){return s.code;}),contexts:contexts})})
++    .then(function(r){if(!r.ok)throw new Error(r.status===409?'数据版本已过期，请先更新页面':'导出失败 '+r.status);return r.text();})
++    .then(function(text){return text.charAt(0)==='\ufeff'?text:'\ufeff'+text;})
++    .then(save).catch(function(e){toast(e.message);throw e;});
+ }
+ 
+ /* ── 个股详情 ── */
+@@ -4571,6 +4542,7 @@
+   if(!name)return toast('概念名称为空，无法查看');
+   pickBoardMembers('theme:'+name);
+ }
++installLazyDetails();
+ init();
+ 
+ 
+--- check_dashboard.py.before
++++ check_dashboard.py
+@@ -11,6 +11,13 @@
+ html = Path('dashboard.html').read_text(encoding='utf-8')
+ start = html.index('var DATA = ') + len('var DATA = ')
+ snap, _ = json.JSONDecoder().raw_decode(html[start:].lstrip())
++import ui_payload
++snap = ui_payload.unpack(snap)
++if snap.get('ui_lazy'):
++    brief = snap
++    snap = ui_payload.full(brief['ui_generation'])
++    expected = ui_payload.summary(snap, brief['ui_generation'])
++    assert brief == expected, '页面轻量数据与同版详情库不一致'
+ rows = snap['stocks']
+ saved = json.loads(config.SNAPSHOT_JSON.read_text(encoding='utf-8'))
+ assert saved['generated_at'] == snap['generated_at'], '页面与快照时间不一致'
+--- check_live_service.py.before
++++ check_live_service.py
+@@ -33,6 +33,19 @@
+     marker = "var DATA = "
+     assert marker in html, "服务送出的页面没有模型数据"
+     served, _ = json.JSONDecoder().raw_decode(html.split(marker, 1)[1].lstrip())
++    import ui_payload
++    served = ui_payload.unpack(served)
++    if served.get('ui_lazy'):
++        assert status.get('code_ui_payload_version') == ui_payload.VERSION
++        assert served['ui_generation'] == status.get('ui_generation')
++        brief = served
++        served = ui_payload.full(brief['ui_generation'])
++        assert brief == ui_payload.summary(served, brief['ui_generation']), '轻量页面与同版完整数据不一致'
++        first = served['stocks'][0]
++        from urllib.parse import urlencode
++        response = json.loads(get(base + '/__ui/detail?' + urlencode(
++            {'version': brief['ui_generation'], 'kind': 'stock', 'id': first['code']})))
++        assert response['version'] == brief['ui_generation'] and response['item'] == first
+     assert status["phase"] == "ready" and status["last_scan_ok"], "服务未就绪或上次扫描失败"
+     assert status["code_model_version"] == strength.VERSION
+     assert status["code_strength_version"] == stock_strength.VERSION
+--- /dev/null
++++ ui_payload.py
+@@ -0,0 +1,253 @@
++"""Immutable local UI generations. Lists, details and exports share one token."""
++import gzip
++import hashlib
++import json
++import re
++import shutil
++import sqlite3
++import subprocess
++import tempfile
++from contextlib import closing
++from pathlib import Path
++
++import config
++
++VERSION = 'local-ui-2'
++
++
++def dumps(value):
++    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
++
++
++def pack(value):
++    keys, strings, shapes, ki, si, shape_index = [], [], [], {}, {}, {}
++
++    def base36(n):
++        chars = '0123456789abcdefghijklmnopqrstuvwxyz'
++        result = ''
++        while n:
++            n, r = divmod(n, 36)
++            result = chars[r] + result
++        return result or '0'
++
++    def visit(x):
++        if isinstance(x, dict):
++            shape = []
++            for k, v in x.items():
++                if k not in ki:
++                    ki[k] = len(keys)
++                    keys.append(k)
++                shape.append(ki[k])
++            identity = tuple(shape)
++            if identity not in shape_index:
++                shape_index[identity] = len(shapes)
++                shapes.append(shape)
++            return ['^' + base36(shape_index[identity])] + [visit(v) for v in x.values()]
++        if isinstance(x, list):
++            return [visit(v) for v in x]
++        if isinstance(x, str) and (len(x) >= 4 or x.startswith(('~', '^'))):
++            if x not in si:
++                si[x] = len(strings)
++                strings.append(x)
++            return '~' + base36(si[x])
++        return x
++    root = visit(value)
++    return {'format': VERSION, 'keys': keys, 'strings': strings, 'shapes': shapes, 'root': root}
++
++
++def unpack(packet):
++    if packet.get('format') not in ('local-ui-1', VERSION):
++        return packet
++
++    def visit(x):
++        if isinstance(x, dict):
++            return {packet['keys'][int(k)]: visit(v) for k, v in x.items()}
++        if isinstance(x, list):
++            if x and isinstance(x[0], str) and x[0].startswith('^'):
++                shape = packet['shapes'][int(x[0][1:], 36)]
++                return {packet['keys'][key]: visit(v) for key, v in zip(shape, x[1:])}
++            return [visit(v) for v in x]
++        if isinstance(x, str) and x.startswith('~'):
++            return packet['strings'][int(x[1:], 36)]
++        if isinstance(x, str) and x.startswith('\x01') and 'shapes' not in packet:
++            return packet['strings'][int(x[1:])]
++        return x
++    return visit(packet['root'])
++
++
++def summary(full, token):
++    result = dict(full)
++    list_fields = set(json.loads((config.ROOT / 'stock_list_fields.json').read_text(encoding='utf-8')))
++    for group in ('stocks', 'coverage_catalog'):
++        rows = []
++        for s in full.get(group, []):
++            row = {k: v for k, v in s.items() if k in list_fields and k not in ('k', 'kd', 'theme_relations', 'stock_strength_evidence')}
++            if isinstance(row.get('intraday_path'), dict):
++                row['intraday_path'] = {k: v for k, v in row['intraday_path'].items() if k != 'recent'}
++            rows.append(row)
++        result[group] = rows
++    result['board_catalog'] = [dict(b, members=[{'code': r['code'], 'change_pct': r.get('change_pct')}
++                                                 for r in b.get('members', [])])
++                               for b in full.get('board_catalog', [])]
++    result['ui_generation'] = token
++    result['ui_lazy'] = True
++    result.setdefault('runtime_contract', {})['code_ui_payload_version'] = VERSION
++    return result
++
++
++def store_root(page=None):
++    return (Path(page).parent if page else config.ROOT) / 'cache' / 'ui_payloads'
++
++
++def db_path(token, page=None):
++    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{24}', token):
++        raise ValueError('Invalid generation')
++    path = store_root(page) / (token + '.db')
++    if not path.is_file():
++        raise LookupError('This generation has expired. Update the page first.')
++    return path
++
++
++def connect(token, page=None):
++    return sqlite3.connect(db_path(token, page).as_uri() + '?mode=ro', uri=True)
++
++
++def csv_row(row):
++    source = (config.ROOT / 'csv_export.js').read_text(encoding='utf-8')
++    fields = set(re.findall(r'\bs\.([A-Za-z_][A-Za-z0-9_]*)', source))
++    result = {k: v for k, v in row.items() if k in fields}
++    if 'theme_relations' in result:
++        result['theme_relations'] = [{k: t.get(k) for k in ('name', 'state', 'peers')} for t in result['theme_relations']]
++    if isinstance(result.get('intraday_path'), dict):
++        result['intraday_path'] = {k: v for k, v in result['intraday_path'].items() if k != 'recent'}
++    return result
++
++
++def prepare(full, template, page):
++    # Content hash also includes rendering/export implementation, not just market time.
++    digest = hashlib.sha256()
++    text = dumps(full)
++    digest.update(text.encode('utf-8'))
++    digest.update(template.encode('utf-8'))
++    for name in ('ui_payload.py', 'ui_client.js', 'csv_export.js', 'csv_runner.js', 'stock_list_fields.json'):
++        digest.update((config.ROOT / name).read_bytes())
++    token = digest.hexdigest()[:24]
++    brief = summary(full, token)
++    packet = pack(brief)
++    directory = store_root(page)
++    directory.mkdir(parents=True, exist_ok=True)
++    path = directory / (token + '.db')
++    if not path.exists():
++        fd, tmp = tempfile.mkstemp(prefix='ui-', suffix='.tmp', dir=str(directory))
++        import os
++        os.close(fd)
++        try:
++            with closing(sqlite3.connect(tmp)) as con:
++                con.execute('CREATE TABLE detail(kind TEXT,id TEXT,value TEXT,PRIMARY KEY(kind,id))')
++                con.execute('CREATE TABLE meta(id TEXT PRIMARY KEY,value BLOB)')
++                for group in ('stocks', 'coverage_catalog'):
++                    con.executemany('INSERT INTO detail VALUES(?,?,?)',
++                                    [('stock', s['code'], dumps(s)) for s in full.get(group, [])])
++                    con.executemany('INSERT INTO detail VALUES(?,?,?)',
++                                    [('csv', s['code'], dumps(csv_row(s))) for s in full.get(group, [])])
++                con.executemany('INSERT INTO detail VALUES(?,?,?)',
++                                [('board', b['id'], dumps(b)) for b in full.get('board_catalog', [])])
++                for key, value in [('summary', dumps(packet).encode('utf-8')),
++                                   ('full', text.encode('utf-8'))]:
++                    con.execute('INSERT INTO meta VALUES(?,?)', (key, value))
++                    con.execute('INSERT INTO meta VALUES(?,?)', (key + '.gz', gzip.compress(value, compresslevel=1)))
++                con.execute('INSERT INTO meta VALUES(?,?)', ('template', template.encode('utf-8')))
++                con.execute('INSERT INTO meta VALUES(?,?)', ('csv_formatter', (config.ROOT / 'csv_export.js').read_bytes()))
++                con.execute('INSERT INTO meta VALUES(?,?)', ('csv_meta', dumps({k: full.get(k) for k in
++                            ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model')}).encode('utf-8')))
++                html = template.replace('/*__DATA__*/null', config.script_json(packet)).encode('utf-8')
++                con.execute('INSERT INTO meta VALUES(?,?)', ('page.gz', gzip.compress(html, compresslevel=1)))
++                con.commit()
++            Path(tmp).replace(path)
++        finally:
++            Path(tmp).unlink(missing_ok=True)
++    return packet, token
++
++
++def detail(token, kind, identity, page=None):
++    if kind not in ('stock', 'board') or not isinstance(identity, str) or len(identity) > 160:
++        raise ValueError('Invalid detail request')
++    with closing(connect(token, page)) as con:
++        row = con.execute('SELECT value FROM detail WHERE kind=? AND id=?', (kind, identity)).fetchone()
++    if not row:
++        raise KeyError('Unknown item')
++    return json.loads(row[0])
++
++
++def blob(token, key, page=None):
++    with closing(connect(token, page)) as con:
++        row = con.execute('SELECT value FROM meta WHERE id=?', (key,)).fetchone()
++    if not row:
++        raise KeyError('Unknown payload')
++    return row[0]
++
++
++def active_generation():
++    try:
++        return (store_root() / 'active.txt').read_text(encoding='ascii').strip()
++    except OSError:
++        return None
++
++
++def activate(token, page):
++    directory = store_root(page)
++    config.atomic_write_text(directory / 'active.txt', token)
++    # Only managed immutable generations, retain current plus latest prior backup.
++    others = sorted((p for p in directory.glob('*.db') if p.name != token + '.db'),
++                    key=lambda p: p.stat().st_mtime_ns, reverse=True)
++    for path in others[1:]:
++        if re.fullmatch(r'[a-f0-9]{24}\.db', path.name):
++            try:
++                path.unlink()
++            except PermissionError:
++                pass  # A reader may still be exporting this generation on Windows.
++
++
++def full(token, page=None):
++    return json.loads(blob(token, 'full', page))
++
++
++def export_csv(token, codes, contexts):
++    if not isinstance(codes, list) or not 0 < len(codes) <= 10000 or len(set(codes)) != len(codes):
++        raise ValueError('Invalid export selection')
++    if not isinstance(contexts, dict):
++        raise ValueError('Invalid display context')
++    # Indexed rows only; do not parse the full market snapshot for each export.
++    with closing(connect(token)) as con:
++        rows = []
++        for code in codes:
++            if not isinstance(code, str) or not re.fullmatch(r'\d{6}', code):
++                raise ValueError('Invalid code')
++            row = con.execute("SELECT value FROM detail WHERE kind='csv' AND id=?", (code,)).fetchone()
++            if not row:
++                raise ValueError('Unknown code')
++            rows.append(json.loads(row[0]))
++        meta = json.loads(con.execute("SELECT value FROM meta WHERE id='csv_meta'").fetchone()[0])
++        formatter = con.execute("SELECT value FROM meta WHERE id='csv_formatter'").fetchone()
++        if not formatter:
++            raise LookupError('This formatter generation has expired')
++    node = shutil.which('node')
++    if not node:
++        raise RuntimeError('Node.js is required for the shared CSV formatter')
++    # Formatting is shared with the existing offline page, retaining all 228 columns.
++    request = dumps({'rows': rows, 'data': {k: meta.get(k) for k in
++                     ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model')},
++                     'contexts': contexts, 'formatter': formatter[0].decode('utf-8')})
++    result = subprocess.run([node, str(config.ROOT / 'csv_runner.js')], input=request.encode('utf-8'),
++                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,
++                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
++    if result.returncode:
++        raise RuntimeError('CSV formatting failed')
++    return result.stdout
++
++
++def offline_html(token):
++    template = blob(token, 'template').decode('utf-8')
++    data = full(token)
++    data['ui_generation'] = token
++    return template.replace('/*__DATA__*/null', config.script_json(data)).encode('utf-8')
+--- /dev/null
++++ ui_client.js
+@@ -0,0 +1,129 @@
++/* Local payload transport; all screening and judgment functions remain in the template. */
++function decodeDashboardPackage(packet){
++  if(!packet||['local-ui-1','local-ui-2'].indexOf(packet.format)<0)return packet;
++  function visit(v){
++    if(Array.isArray(v)){
++      if(v.length&&typeof v[0]==='string'&&v[0].charAt(0)==='^'){
++        var out={},shape=packet.shapes[parseInt(v[0].slice(1),36)];
++        shape.forEach(function(key,i){out[packet.keys[key]]=visit(v[i+1]);});return out;
++      }return v.map(visit);
++    }
++    if(v&&typeof v==='object'){
++      var out={};Object.keys(v).forEach(function(k){out[packet.keys[Number(k)]]=visit(v[k]);});return out;
++    }
++    if(typeof v==='string'&&v.charAt(0)==='~')return packet.strings[parseInt(v.slice(1),36)];
++    return v;
++  }
++  return visit(packet.root);
++}
++var UI_CACHE={},UI_PENDING={},UI_REQUEST=0,UI_DRAWER=null,UI_UPDATING=null;
++var UI_COMPOSING=false;
++document.addEventListener('compositionstart',function(){UI_COMPOSING=true;});
++document.addEventListener('compositionend',function(){UI_COMPOSING=false;});
++function uiLocal(){return location.protocol==='http:'||location.protocol==='https:';}
++function uiFetch(kind,id,version){
++  var key=version+'|'+kind+'|'+id;
++  if(UI_CACHE[key])return Promise.resolve(UI_CACHE[key]);
++  if(UI_PENDING[key])return UI_PENDING[key];
++  if(!uiLocal())return Promise.reject(new Error('详情需要本地服务。请使用「打开看板.bat」，或打开导出的完整离线看板。'));
++  UI_PENDING[key]=fetch('/__ui/detail?version='+encodeURIComponent(version)+'&kind='+kind+'&id='+encodeURIComponent(id))
++    .then(function(r){if(!r.ok)throw new Error(r.status===409?'此版本已过期，请先更新页面再查看详情':'详情读取失败 '+r.status);return r.json();})
++    .then(function(j){if(j.version!==version)throw new Error('详情版本不一致');UI_CACHE[key]=j.item;return j.item;})
++    .finally(function(){delete UI_PENDING[key];});
++  return UI_PENDING[key];
++}
++function uiPut(kind,item){
++  var groups=kind==='board'?['board_catalog']:['stocks','coverage_catalog'];
++  groups.forEach(function(group){var rows=DATA[group]||[];
++    for(var i=0;i<rows.length;i++)if((kind==='board'?rows[i].id:rows[i].code)===(kind==='board'?item.id:item.code)){rows[i]=item;return;}
++  });
++}
++function installLazyDetails(){
++  if(!DATA)return;
++  var renderStock=showStock,renderBoard=showBoardById,oldClose=closeDrawer,oldOpen=openDrawer,rendering=false;
++  openDrawer=function(){
++    if(!rendering){UI_REQUEST++;UI_DRAWER=null;}
++    return oldOpen.apply(null,arguments);
++  };
++  function display(fn){rendering=true;try{return fn();}finally{rendering=false;}}
++  closeDrawer=function(){UI_REQUEST++;UI_DRAWER=null;return oldClose();};
++  function open(kind,id,boardId){
++    if(!DATA.ui_lazy)return kind==='board'?renderBoard(id):renderStock(id,boardId);
++    var request=++UI_REQUEST,version=DATA.ui_generation;
++    UI_DRAWER={kind:kind,id:id,boardId:boardId};
++    var existing=kind==='board'?boardById(id):stockPoolRows().filter(function(s){return s.code===id;})[0];
++    display(function(){openDrawer(esc(existing&&existing.name||id),'','<p class="flat">正在读取本地详情…</p>',kind==='board');});
++    var tasks=[uiFetch(kind,id,version)];
++    if(kind==='stock'&&boardId)tasks.push(uiFetch('board',boardId,version));
++    return Promise.all(tasks).then(function(items){
++      if(request!==UI_REQUEST||version!==DATA.ui_generation)return;
++      uiPut(kind,items[0]);if(items[1])uiPut('board',items[1]);
++      return display(function(){return kind==='board'?renderBoard(id):renderStock(id,boardId);});
++    }).catch(function(e){
++      if(request===UI_REQUEST)display(function(){openDrawer(esc(existing&&existing.name||id),'','<p class="flat">'+esc(e.message)+'</p>',kind==='board');});
++    });
++  }
++  showStock=function(code,boardId){return open('stock',code,boardId);};
++  showBoardById=function(id){return open('board',id);};
++  var exportButton=document.getElementById('btn-export');
++  if(exportButton&&DATA.ui_lazy){
++    var button=document.createElement('button');button.className='btn';button.textContent='完整离线看板';
++    button.title='保存同一版全部详情、图表和导出功能，双击即可离线查看';
++    button.onclick=function(){
++      if(!uiLocal()){toast('请先通过打开看板.bat启动本地服务');return;}
++      var a=document.createElement('a');a.href='/__ui/offline?version='+encodeURIComponent(DATA.ui_generation);
++      a.download='股票看板_完整离线_'+String(DATA.generated_at||'').slice(0,10)+'.html';a.click();
++    };exportButton.parentNode.insertBefore(button,exportButton.nextSibling);
++  }
++}
++function updateDashboardData(status){
++  if(!DATA.ui_lazy){location.reload();return Promise.resolve();}
++  if(UI_UPDATING)return UI_UPDATING;
++  var version=status&&status.ui_generation;
++  if(!version)return Promise.reject(new Error('后台尚未载入新版页面接口'));
++  if(version===DATA.ui_generation){PAGE_VERSION=status.data_version;rfDone();return Promise.resolve();}
++  UI_UPDATING=fetch('/__ui/summary?version='+encodeURIComponent(version),{cache:'no-store'})
++    .then(function(r){if(!r.ok)throw new Error('新数据读取失败 '+r.status);return r.json();})
++    .then(function(packet){
++      if(!UI_COMPOSING)return packet;
++      return new Promise(function(resolve){
++        document.addEventListener('compositionend',function finish(){
++          document.removeEventListener('compositionend',finish);resolve(packet);
++        });
++      });
++    })
++    .then(function(packet){
++      var next=decodeDashboardPackage(packet);
++      if(next.ui_generation!==version||!next.ui_lazy)throw new Error('列表版本不一致');
++      var focus=document.activeElement,focusId=focus&&focus.id,selection=null;
++      if(focus&&typeof focus.selectionStart==='number')selection=[focus.selectionStart,focus.selectionEnd];
++      var scrolls=Array.from(document.querySelectorAll('[id],.tw,.chips')).filter(function(el){return el.scrollTop||el.scrollLeft;})
++        .map(function(el){
++          var parts=[],node=el;
++          while(node&&!node.id){
++            parts.unshift(node.tagName.toLowerCase()+':nth-child('+(Array.prototype.indexOf.call(node.parentNode.children,node)+1)+')');
++            node=node.parentNode;
++          }
++          return [node?'#'+CSS.escape(node.id)+(parts.length?' > '+parts.join(' > '):''):null,el.scrollTop,el.scrollLeft];
++        });
++      function restoreScrolls(){scrolls.forEach(function(s){var el=s[0]&&document.querySelector(s[0]);if(el){el.scrollTop=s[1];el.scrollLeft=s[2];}});}
++      var folds=Array.from(document.querySelectorAll('#dr-b details[open]')).map(function(el){return el.querySelector('summary').textContent;});
++      var x=window.scrollX,y=window.scrollY,drawer=UI_DRAWER;
++      UI_REQUEST++;UI_CACHE={};UI_PENDING={};DATA=next;PAGE_VERSION=status.data_version;
++      RENDERED={};renderOverview();RENDERED.overview=true;
++      var render={stocks:renderStocks,radar:renderRadar,boards:renderBoards,themes:renderThemesPage,hold:renderHold}[STATE.pane];
++      if(render){render();RENDERED[STATE.pane]=true;}renderFresh();
++      var drawerPromise=drawer?(drawer.kind==='stock'?showStock(drawer.id,drawer.boardId):showBoardById(drawer.id)):Promise.resolve();
++      restoreScrolls();
++      window.scrollTo(x,y);
++      var target=focusId&&document.getElementById(focusId);
++      if(target){target.focus({preventScroll:true});if(selection&&target.setSelectionRange)target.setSelectionRange(selection[0],selection[1]);}
++      rfDone();toast('数据已更新，已保留当前筛选与页面位置');
++      return Promise.resolve(drawerPromise).then(function(){
++        document.querySelectorAll('#dr-b details').forEach(function(el){if(folds.indexOf(el.querySelector('summary').textContent)>=0)el.open=true;});
++        restoreScrolls();
++      });
++    }).catch(function(e){rfDone();toast(e.message);throw e;})
++    .finally(function(){UI_UPDATING=null;});
++  return UI_UPDATING;
++}
+--- /dev/null
++++ csv_export.js
+@@ -0,0 +1,71 @@
++function buildStockCSV(res,DATA,contexts){
++  function context(s){return contexts[s.code]||{};}
++  function quoteFreshAtClientNow(s){return context(s).fresh;}
++  function quoteStatusAtClientNow(s){return context(s).status;}
++  function currentCandidateActive(s,key){return (context(s).candidates||{})[key];}
++  function afternoonBridgeQuote(s){return context(s).bridge;}
++  function morningOpenBridgeQuote(s){return context(s).openBridge;}
++  function auctionDisplayQuote(s){return context(s).auction;}
++  function closeDisplayQuote(s){return context(s).close;}
++  function lunchDisplayQuote(s){return context(s).lunch;}
++  function useCompletedClose(){return !!contexts.useCompletedClose;}
++  var head=['代码','名称','判断日','日线进攻强度','日线强度分位','日线近期变化','综合状态','分位较前日变化','分位较前五日变化','5日攻击速度分','10日推进分','20日涨幅基础分','结构不计分','5日进攻依据','10日进攻依据','20日进攻依据','结构与量价依据','绝对方向','主要强项','主要短板','近10日跑赢主板天数','近3日收盘位置%','放量滞涨','当前距20日高点%','历史最大回撤修复%','5日相对优势变化百分点','20日涨幅%','20日涨幅分位','逐股报价时间','现价','今日涨跌%','双轴分类','趋势阶段','情绪热度','量价表现','行业状态','个股行业关系','趋势助攻','情绪助攻','个股角色','日线MA5','日线MA10','日线MA20','三线排列','日线趋势在线','完成日回踩形态','MA20近5日斜率%','20日最大回撤%','有方向20日路径效率','5日对市场超额百分点','20日对市场超额百分点','5日对同行超额百分点','20日对同行超额百分点','同行趋势在线%','同行趋势变化百分点','剔除前两名后趋势在线%','同行情绪活跃%','同行涨停数','行业','行业广度%','有效同伴','日线与历史风险'];
++  head.push('扫描完成时间','盘中强度','相对评分变化','盘中趋势状态','盘中暂态MA5','盘中暂态MA10','盘中暂态MA20','日内位置%','距日内高点%','盘中风险等级','盘中风险标记','行业同期涨幅%','本股对同行超额点','历史回踩形态','当前回踩资格','报价是否有效','行情阶段','报价状态','最后有效报价时间','当日相对主板超额百分点','主板等权涨幅%','开盘后表现%','盘中评分完整项数','盘中观察分类','扫描状态变化','当前强势资格','初步启动资格','转弱修复资格','报价日前固定MA5','报价日前固定MA10','报价日前固定MA20','暂态MA20参考基准');
++  head=head.map(function(name){return ({'当前回踩资格':'扫描时当前回踩资格',
++    '当前强势资格':'扫描时当前强势资格','初步启动资格':'扫描时初步启动资格',
++    '转弱修复资格':'扫描时转弱修复资格'})[name]||name;});
++  function cell(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
++  var lines=[head.map(cell).join(',')];
++  res.forEach(function(s){var p=s.stock_strength_parts||{},e=s.stock_strength_evidence||{};
++    lines.push([s.code,s.name,s.signal_date,s.stock_strength_score,s.stock_strength_percentile,s.daily_motion||s.stock_strength_motion,s.stock_strength_display_state,s.strength_delta1,s.strength_delta5,p.attack5,p.attack10,p.attack20,'',e.attack5,e.attack10,e.attack20,s.structure_evidence,s.strength_direction,s.stock_strength_main_good,s.stock_strength_main_weak,s.beat_days10,s.close_location3_pct,s.volume_spike_stall?'是':'否',s.current_drawdown_pct,s.drawdown_repair_pct,s.strength_accel5_pp,s.ret20,s.ret20_percentile,s.intraday_quote_at,s.price,s.change_pct,s.axis_group,s.trend_stage,s.emotion_heat,s.emotion_acceptance,s.industry_trend_state,s.industry_stock_relation,s.trend_assist,s.emotion_assist,(s.roles||[]).join('、'),s.ma5,s.ma10,s.ma20,s.trend_aligned?'是':'否',s.trend_online?'是':'否',s.touch_state,s.ma20_slope5_pct,s.max_dd20_pct,s.path_eff20,s.ret5_ex_market,s.ret20_ex_market,s.ret5_ex_industry,s.ret20_ex_industry,s.industry_peer_trend_pct,s.industry_peer_trend_delta_pp,s.industry_ex_top2_trend_pct,s.emotion_peer_active_pct,s.emotion_peer_limit,s.primary_industry,s.industry_breadth,s.industry_peers,(s.risk_notes||[s.reason_text||'']).join('；'),DATA.scan_completed_at||DATA.generated_at,s.intraday_score,s.intraday_score_delta,s.intraday_trend_state,s.intraday_ma5,s.intraday_ma10,s.intraday_ma20,s.intraday_position_pct,s.intraday_drawdown_from_high_pct,s.intraday_risk_level,(s.intraday_risk_flags||[]).join('；'),s.industry_intraday_change_pct,s.industry_intraday_excess_pct,s.historical_pullback_shape?'是':'否',s.current_pullback_candidate?'是':'否',s.intraday_quote_fresh?'是':'否',s.intraday_phase_status,s.intraday_quote_status,s.last_valid_quote_at,s.intraday_relative_return_pct,s.intraday_market_return_pct,s.intraday_open_return_pct,s.intraday_score_available_components,s.intraday_observation_state,s.intraday_transition,s.current_strong_candidate?'是':'否',s.startup_candidate?'是':'否',s.turn_weak_repair_candidate?'是':'否',s.daily_ma5_fixed,s.daily_ma10_fixed,s.daily_ma20_fixed,s.intraday_previous_completed_ma20].map(cell).join(','));});
++  lines[0]+=',10日涨幅%,日线价格形态,盘中暂态进攻分,盘中暂态进攻档,盘中价格形态,进攻监测候选,进攻状态时间口径';
++  res.forEach(function(s,i){lines[i+1]+=','+[s.ret10,s.daily_attack_stage,s.live_attack_score,s.live_attack_tier,s.live_attack_stage,s.attack_watch_candidate?'是':'否',s.live_attack_status].map(cell).join(',');});
++  lines[0]+=',同花顺题材关系,题材关系状态,题材有效同伴覆盖,题材归属依据,全体强度名次,趋势池名次,趋势池分位,关注层级,行业归属来源,历史报价口径差异百分点,历史报价口径状态,扫描转换核验,当前强势未通过项';
++  res.forEach(function(s,i){lines[i+1]+=','+[(s.theme_relations||[]).map(function(t){return t.name;}).join('、'),(s.theme_relations||[]).map(function(t){return t.name+':'+t.state;}).join('；'),(s.theme_relations||[]).map(function(t){return t.name+' '+t.peers+'只';}).join('；'),s.theme_basis,s.stock_strength_rank,s.trend_pool_rank,s.trend_pool_percentile,s.trend_tier,s.industry_basis,s.intraday_price_basis_gap_pct,s.intraday_price_basis_status,s.intraday_transition_state,(s.current_strong_missing||[]).join('；')].map(cell).join(',');});
++  lines[0]+=',当前报价状态,当前强势候选,当前回踩候选,当前初步启动候选,当前转弱修复候选';
++  res.forEach(function(s,i){lines[i+1]+=','+[
++    quoteFreshAtClientNow(s)?'报价有效':quoteStatusAtClientNow(s),
++    currentCandidateActive(s,'current_strong_candidate')?'是':'否',
++    currentCandidateActive(s,'current_pullback_candidate')?'是':'否',
++    currentCandidateActive(s,'startup_candidate')?'是':'否',
++    currentCandidateActive(s,'turn_weak_repair_candidate')?'是':'否'
++  ].map(cell).join(',');});
++  lines[0]+=',最近完成日日期,最近完成日收盘价,最近完成日涨跌幅%,页面展示口径,页面展示时间,页面展示价格,页面展示涨跌幅%';
++  res.forEach(function(s,i){
++    var bridge=afternoonBridgeQuote(s);
++    var openBridge=morningOpenBridgeQuote(s),auction=auctionDisplayQuote(s);
++    var shown=useCompletedClose()?closeDisplayQuote(s):lunchDisplayQuote(s)||bridge||openBridge||auction;
++    lines[i+1]+=','+[s.last_completed_date,s.last_completed_close,s.last_completed_change_pct,
++      bridge?'午后报价待更新·11:30参考':openBridge?'开盘报价待更新·'+openBridge.kind:shown?shown.kind:'当日报价',shown?shown.at:s.intraday_quote_at,
++      shown?shown.price:s.price,shown?shown.change:s.change_pct].map(cell).join(',');
++  });
++  lines[0]+=','+['价格进攻分','价格进攻档位','距盘中MA5_ATR'].map(cell).join(',');
++  res.forEach(function(s,i){var f=s.live_attack_fund||{};lines[i+1]+=','+[s.live_attack_price_score,s.live_attack_price_tier,s.live_overheat_dist_atr].map(cell).join(',');});
++  lines[0]+=','+['盘中判断截至','盘中本轮判断可用','日内路径状态','累计获取次数','有效获取次数','MA10扫描变化记录'].map(cell).join(',');
++  res.forEach(function(s,i){var p=s.intraday_path||{};lines[i+1]+=','+[s.intraday_judgment_at,s.intraday_observation_available?'是':'否',p.state,p.acquired_count,p.valid_count,(p.events||[]).map(function(e){return e.at+' '+e.kind;}).join('；')].map(cell).join(',');});
++  lines[0]+=','+['整理资格','整理状态','整理结构标签','此前5日进攻%','进攻窗口截至','整理开始日','整理完成日数','整理形态','整理日线回撤ATR','整理量对上涨量','整理振幅变化','整理固定平台上沿','整理转强确认次数','整理突破确认次数','整理判断截至','整理未通过原因'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.completion_confirmed?(c.trend_exited?'已转强，MA20失守退出':c.reference_only&&String(c.stage||'').indexOf('待核验')>=0?'已转强，待核验':'已完成整理，进入转强跟踪'):c.eligible===true?'日线资格通过':c.eligible===false?'未通过':'未重判',c.stage,c.trend_label,c.impulse5_pct,c.impulse_end,c.consolidation_start,c.days,c.shape,c.pullback_atr,c.volume_ratio,c.contraction_ratio,c.platform_high,c.turn_samples,c.breakout_samples,c.quote_at,c.reason].map(cell).join(',');});
++  lines[0]+=','+['此前10日进攻%','整理进攻达标周期','整理进攻达标涨幅%','整理后再突破日数','整理历史放量分歧日','整理MA10历史失守已修复','整理修复价','整理修复有效采样次数','整理结构说明'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.impulse10_pct,c.attack_period,c.attack_gain_pct,c.post_breakout_days,(c.expanded_down_dates||[]).join('；'),c.ma10_repaired?'是':'否',c.repair_trigger_price,c.repair_samples,c.structure_note].map(cell).join(',');});
++  lines[0]+=','+['历史转强确认','历史转强确认时间','转强后当前状态','本轮进攻确认','跟踪MA10边界','MA10连续失守次数','MA10连续收复次数','MA20退出时间','MA20修复时间','收盘复核日','收盘复核价（日线口径）','收盘MA10（日线口径）','收盘复核价格口径'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.completion_confirmed===true?'是':'否',c.completed_at,c.tracking_state,c.current_breakout_confirmed===true?'是':c.completion_confirmed?'否':'',c.tracking_ma10,c.ma10_below_samples,c.ma10_recovery_samples,c.trend_exit_at,c.trend_recovered_at,c.close_review_day,c.close_review_price,c.close_review_ma10,c.close_review_price_basis].map(cell).join(',');});
++  lines[0]+=','+['已整理完成交易日数','整理天数截至','当日整理序号','回踩反弹参考均线','回踩靠线日期时间','回踩反弹确认日期时间','回踩反弹证据','回踩反弹当前保持'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.consolidation_elapsed_days,c.consolidation_elapsed_asof,c.consolidation_day_number,c.rebound_line?'MA'+c.rebound_line:'',c.rebound_touch_at,c.rebound_confirmed_at,c.rebound_evidence,c.rebound_active===true?'是':c.rebound_confirmed?'否':''].map(cell).join(',');});
++  lines[0]+=','+['跟踪MA20边界','MA20连续失守次数','MA20连续收复次数','收盘MA20（日线口径）','MA10降级','支撑位置提示','提示截至','提示价格口径','平台底部（提示口径）','旧规则MA10退出留档'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.tracking_ma20,c.ma20_below_samples,c.ma20_recovery_samples,c.close_review_ma20,c.ma10_downgraded===true?'是':'否',(c.support_alerts||[]).map(function(a){return a.label+' ¥'+a.price+' 距'+a.distance_atr+'ATR';}).join('；'),c.support_alert_at,c.reference_only&&c.close_review_day&&c.support_alert_at===c.close_review_day+' 15:00:00'?'同源正式日线':'已核验报价',c.support_platform_low,c.legacy_ma10_exit_at].map(cell).join(',');});
++  lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
++  res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,w.volume0,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
++  lines[0]+=','+['衔接模型','昨收基准日','昨收主榜','昨日日线档位','当日综合判断','衔接报价截至','当前价格进攻分','价格距昨收ATR','衔接风险','ATR算法','前日变化来源','前五日变化来源','威科夫特征'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
++  lines[0]+=','+['最新价格判断','当前平台状态','报价判断模式','整理条件状态','整理条件依据','本地日线数','历史窗口核验','当前原平台突破门槛','已完成整理日数'].map(cell).join(',');
++  res.forEach(function(s,i){var c=s.session_context||{},e=c.history_evidence||{};lines[i+1]+=','+[c.current_label,c.structure_state,c.observation_mode,c.setup_state,c.setup_reason,e.count,e.valid===true?'已核验':e.reason,c.breakout_threshold,c.completed_consolidation_days].map(cell).join(',');});
++  return '\ufeff'+lines.join('\n');
++}
++if(typeof module!=='undefined'&&module.exports){
++  module.exports=buildStockCSV;
++  if(require.main===module){
++    var input='';process.stdin.setEncoding('utf8');
++    process.stdin.on('data',function(s){input+=s;});
++    process.stdin.on('end',function(){var j=JSON.parse(input);process.stdout.write(buildStockCSV(j.rows,j.data,j.contexts));});
++  }
++}
+--- /dev/null
++++ csv_runner.js
+@@ -0,0 +1,10 @@
++/* Run the formatter stored with the requested immutable generation. */
++const vm=require('vm');
++let input='';process.stdin.setEncoding('utf8');
++process.stdin.on('data',chunk=>input+=chunk);
++process.stdin.on('end',()=>{
++  const request=JSON.parse(input),context={};
++  vm.createContext(context);
++  vm.runInContext(request.formatter,context,{timeout:5000});
++  process.stdout.write(context.buildStockCSV(request.rows,request.data,request.contexts));
++});
+--- /dev/null
++++ stock_list_fields.json
+@@ -0,0 +1,894 @@
++[
++  "A",
++  "ATR",
++  "ATR20",
++  "Escape",
++  "MA",
++  "MA10",
++  "MA20",
++  "MA5",
++  "Max",
++  "Min",
++  "PI",
++  "POST",
++  "T",
++  "__err",
++  "__stickyOff",
++  "_bcComposing",
++  "_observation",
++  "_source",
++  "_tm",
++  "a",
++  "above20",
++  "above60",
++  "abs",
++  "active",
++  "activeElement",
++  "add",
++  "addColorStop",
++  "addEventListener",
++  "advance",
++  "advance_pct",
++  "alert",
++  "alerts",
++  "all",
++  "ambient",
++  "amount_wan",
++  "and",
++  "ani",
++  "appendChild",
++  "apply",
++  "ar",
++  "arc",
++  "asc",
++  "asof",
++  "assign",
++  "at",
++  "atr0",
++  "atr20",
++  "atr_method",
++  "attack_monitor",
++  "attack_observation_candidate",
++  "attack_score",
++  "attack_stage",
++  "attack_tier",
++  "attack_watch",
++  "attack_watch_candidate",
++  "auction",
++  "auction_final",
++  "auction_latest_quote_at",
++  "auction_observation",
++  "auction_phase",
++  "auction_quote_count",
++  "auction_rows",
++  "avg",
++  "avg_chg",
++  "axis",
++  "axis_both",
++  "axis_emotion",
++  "axis_group",
++  "axis_trend",
++  "axis_weak",
++  "b",
++  "background",
++  "background_asof",
++  "bar",
++  "bars",
++  "base",
++  "baseline_asof",
++  "baseline_source",
++  "bat",
++  "bc",
++  "bd",
++  "bdg",
++  "beginPath",
++  "big",
++  "blue",
++  "board",
++  "boardFilterId",
++  "boardId",
++  "board_catalog",
++  "board_chain",
++  "board_limit",
++  "board_limit_by_name",
++  "board_mix",
++  "board_name",
++  "board_trend_model",
++  "board_type",
++  "boards",
++  "body",
++  "both",
++  "bottom",
++  "boundary_prices",
++  "boxShadow",
++  "brand",
++  "breadth",
++  "breakout",
++  "breakout_samples",
++  "breakout_threshold",
++  "btn",
++  "bu",
++  "bull_count",
++  "busy",
++  "button",
++  "cache",
++  "call",
++  "cap",
++  "capMax",
++  "capMin",
++  "captured_at",
++  "card",
++  "catch",
++  "cd",
++  "center",
++  "chain",
++  "change",
++  "change_pct",
++  "chart",
++  "chg",
++  "chgMax",
++  "chgMin",
++  "children",
++  "chip",
++  "chips",
++  "classList",
++  "className",
++  "clearRect",
++  "click",
++  "clickable",
++  "clientHeight",
++  "clientWidth",
++  "close",
++  "closePath",
++  "close_refresh_version",
++  "close_review_day",
++  "close_strong_board",
++  "closest",
++  "code",
++  "colno",
++  "cols",
++  "completed_at",
++  "completed_daily",
++  "completed_rows",
++  "completion_confirmed",
++  "completion_evidence",
++  "completion_trigger_price",
++  "completion_type",
++  "composite",
++  "compositionend",
++  "compositionstart",
++  "concat",
++  "concept",
++  "concepts",
++  "confirmation",
++  "confirmation_samples",
++  "console",
++  "consolidation_day_number",
++  "consolidation_elapsed_days",
++  "consolidation_start",
++  "contains",
++  "context",
++  "continued_board",
++  "contraction_confirmed",
++  "contraction_ratio",
++  "cooldown",
++  "cos",
++  "cost",
++  "count",
++  "coverage",
++  "coverage_catalog",
++  "coverage_only",
++  "createElement",
++  "createLinearGradient",
++  "createObjectURL",
++  "created_at",
++  "criterion",
++  "cssText",
++  "csv",
++  "current",
++  "current_label",
++  "current_pattern",
++  "current_pullback_candidate",
++  "current_ready",
++  "current_strong_candidate",
++  "cutoff",
++  "cycle_id",
++  "daily",
++  "data",
++  "data_sources",
++  "data_version",
++  "dataset",
++  "date",
++  "day",
++  "days",
++  "dbody",
++  "default_strategy",
++  "desc",
++  "detail",
++  "devicePixelRatio",
++  "dh",
++  "diffusion",
++  "disabled",
++  "display",
++  "display_boards",
++  "dist",
++  "distMax",
++  "distMin",
++  "distance_atr",
++  "distance_pct",
++  "div",
++  "dn",
++  "dot",
++  "down",
++  "download",
++  "drawer",
++  "dropped",
++  "elapsed",
++  "emotion",
++  "emotion_acceptance",
++  "emotion_candidates",
++  "emotion_heat",
++  "emotion_limit",
++  "emotion_pct",
++  "emotion_peer_active_pct",
++  "emotion_provisional",
++  "emotion_risk",
++  "emotion_yesterday_limit",
++  "empty",
++  "entry_state",
++  "episode_start",
++  "error",
++  "events",
++  "every",
++  "evidence_asof",
++  "excess",
++  "excess20",
++  "excess5",
++  "exit_date",
++  "extra",
++  "factor_model_version",
++  "factors",
++  "fading_strength",
++  "failed",
++  "failed10",
++  "fbar",
++  "fchip",
++  "fclear",
++  "fcount",
++  "fetch_error",
++  "fgrp",
++  "filename",
++  "fill",
++  "fillStyle",
++  "fillText",
++  "filter",
++  "filters",
++  "finished_at",
++  "first_board",
++  "first_ma10_break",
++  "flags",
++  "flat",
++  "float_mcap",
++  "floor",
++  "focus",
++  "focusin",
++  "focusout",
++  "followBackground",
++  "followers",
++  "font",
++  "forEach",
++  "ft",
++  "full",
++  "fund",
++  "fund10_yi",
++  "fund3_yi",
++  "fund5_yi",
++  "fund_reference_version",
++  "g2",
++  "g3",
++  "g4",
++  "gap_atr",
++  "gap_pct",
++  "gate",
++  "gem",
++  "generated_at",
++  "getAttribute",
++  "getBoundingClientRect",
++  "getContext",
++  "getDate",
++  "getDay",
++  "getElementById",
++  "getFullYear",
++  "getHours",
++  "getItem",
++  "getMinutes",
++  "getMonth",
++  "getTime",
++  "ghost",
++  "global_rank",
++  "good",
++  "gr",
++  "grid",
++  "group",
++  "hard",
++  "hasOwnProperty",
++  "head",
++  "height",
++  "hero",
++  "hi",
++  "hidden",
++  "high",
++  "high20",
++  "high_fading",
++  "high_fading_count",
++  "historical_pullback_shape",
++  "history_asof",
++  "history_evidence",
++  "hm",
++  "hold",
++  "hold_samples",
++  "hook",
++  "hot",
++  "hot_tags",
++  "href",
++  "html",
++  "ic",
++  "id",
++  "idx_code",
++  "ign_pass",
++  "ignition",
++  "img",
++  "ind",
++  "indexOf",
++  "index_current",
++  "index_trend",
++  "indices",
++  "industries",
++  "industry",
++  "industry_breadth",
++  "industry_peer_change_pct",
++  "industry_peer_count",
++  "industry_supported",
++  "innerHTML",
++  "innerHeight",
++  "innerWidth",
++  "inp",
++  "input",
++  "intra",
++  "intraMax",
++  "intraMin",
++  "intraday",
++  "intraday_close_confirmation",
++  "intraday_display_retained",
++  "intraday_judgment_at",
++  "intraday_last_judgment",
++  "intraday_model",
++  "intraday_observation_available",
++  "intraday_observation_state",
++  "intraday_path",
++  "intraday_price_basis_reason",
++  "intraday_quote_at",
++  "intraday_quote_fresh",
++  "intraday_quote_status",
++  "intraday_risk_flags",
++  "intraday_risk_level",
++  "intraday_score",
++  "intraday_score_available_components",
++  "intraday_trade_restriction",
++  "intraday_transition",
++  "intraday_trend_ok",
++  "intraday_trend_state",
++  "isArray",
++  "isComposing",
++  "is_new",
++  "items",
++  "join",
++  "json",
++  "k",
++  "key",
++  "keydown",
++  "keys",
++  "kind",
++  "l",
++  "label",
++  "last_close",
++  "last_completed_change_pct",
++  "last_completed_close",
++  "last_completed_date",
++  "last_publish_error",
++  "last_publish_ok",
++  "last_result",
++  "last_scan_error",
++  "last_scan_ok",
++  "last_valid_change_pct",
++  "last_valid_price",
++  "last_valid_quote_at",
++  "latest_judgment_at",
++  "latest_valid_quote_at",
++  "lbl",
++  "lead",
++  "leader",
++  "left",
++  "length",
++  "level",
++  "limit",
++  "limit1",
++  "limit_count",
++  "limit_down",
++  "limit_streak",
++  "limit_today",
++  "limit_up",
++  "limit_up_yesterday",
++  "lineJoin",
++  "lineTo",
++  "lineWidth",
++  "line_value",
++  "lineno",
++  "linkage",
++  "linkage_src",
++  "list_criteria",
++  "list_days",
++  "lists",
++  "live",
++  "live_at",
++  "live_attack_fund",
++  "live_attack_score",
++  "live_attack_stage",
++  "live_attack_status",
++  "live_attack_tier",
++  "live_dist_atr",
++  "live_overheat_dist_atr",
++  "localeCompare",
++  "log",
++  "low",
++  "ma10",
++  "ma10_break_days",
++  "ma10_distance_atr",
++  "ma10_downgraded",
++  "ma20",
++  "ma20_below_samples",
++  "ma20_support_established",
++  "ma5",
++  "main",
++  "main_net_sum",
++  "main_rows",
++  "map",
++  "mapped",
++  "market",
++  "marketAvg",
++  "marketCount",
++  "market_emotion",
++  "match",
++  "max",
++  "max_quote_age_seconds",
++  "max_quote_future_seconds",
++  "median",
++  "member_codes",
++  "member_count",
++  "member_diffusion",
++  "member_only",
++  "member_quote_at",
++  "member_refresh",
++  "member_ret5",
++  "member_today",
++  "members",
++  "membership_disagreements",
++  "membership_stale",
++  "message",
++  "metric",
++  "mid",
++  "midday",
++  "middle",
++  "min",
++  "min_trading_days",
++  "mini",
++  "mode",
++  "model",
++  "momentum",
++  "monitor_candidate",
++  "mono",
++  "more",
++  "motion",
++  "mouseout",
++  "mouseover",
++  "moveTo",
++  "ms",
++  "muted",
++  "n",
++  "name",
++  "nav",
++  "near",
++  "needs_model_refresh",
++  "new_stock_days",
++  "next_update_at",
++  "ni",
++  "nm",
++  "no_trade",
++  "nokline",
++  "none",
++  "normal",
++  "not_ready",
++  "note",
++  "notrade",
++  "now",
++  "number",
++  "observation_mode",
++  "observed_at",
++  "observing",
++  "offsetHeight",
++  "offsetLeft",
++  "offsetWidth",
++  "ok",
++  "on",
++  "once",
++  "onclick",
++  "open",
++  "or",
++  "outer",
++  "overheated",
++  "overview",
++  "padStart",
++  "pane",
++  "parentNode",
++  "parse",
++  "passed",
++  "peer_change_pct",
++  "peer_count",
++  "pending",
++  "pending_reason",
++  "pending_rows",
++  "percentile",
++  "period",
++  "persistent_strength",
++  "persistent_strong",
++  "persistent_strong_count",
++  "phase_status",
++  "pill",
++  "platform_high",
++  "platform_low",
++  "pointerout",
++  "pointerover",
++  "poll",
++  "pool",
++  "pool_boards",
++  "pool_in",
++  "pool_members",
++  "pool_percentile",
++  "pool_size",
++  "pop",
++  "pos",
++  "pos60",
++  "pos60Max",
++  "pos60Min",
++  "position60",
++  "positive_top3_share",
++  "preset",
++  "preventDefault",
++  "previous_close_asof",
++  "previous_close_board",
++  "price",
++  "price_attack_score",
++  "price_attack_tier",
++  "price_basis",
++  "price_basis_mismatch_count",
++  "price_basis_valid",
++  "prices",
++  "primary",
++  "primary_industry",
++  "prior_daily_tier",
++  "priority_observation",
++  "protocol",
++  "prototype",
++  "provisional",
++  "provisional_ma",
++  "pta",
++  "pullback",
++  "pullback_atr",
++  "pullback_atr_asof",
++  "pullback_kind",
++  "pullback_observe",
++  "push",
++  "px",
++  "q",
++  "querySelector",
++  "querySelectorAll",
++  "quiet",
++  "quoteAt",
++  "quote_aligned",
++  "quote_at",
++  "quote_capture_at",
++  "quote_valid",
++  "radar",
++  "rank",
++  "ranking_eligible",
++  "ranking_reason",
++  "ready",
++  "reason",
++  "recent",
++  "recent_improving",
++  "recent_improving_count",
++  "recent_strength",
++  "reclaim",
++  "reclaim_minutes",
++  "reclaim_rows",
++  "recover10",
++  "reduce",
++  "reference",
++  "reference_only",
++  "reference_pool_count",
++  "reference_reason",
++  "reference_version",
++  "refresh",
++  "relatedTarget",
++  "remove",
++  "removeAttribute",
++  "removeItem",
++  "replace",
++  "replaceWith",
++  "replay_start",
++  "resize",
++  "resline",
++  "reso",
++  "resolve",
++  "restrictions",
++  "ret1",
++  "ret20",
++  "ret20_percentile",
++  "ret5",
++  "ret5Max",
++  "ret5Min",
++  "ret60",
++  "retained",
++  "revokeObjectURL",
++  "right",
++  "rising_concepts",
++  "risk",
++  "risk_flags",
++  "risk_gate",
++  "risk_hi",
++  "risk_notes",
++  "risk_reason",
++  "risks",
++  "rk",
++  "rng",
++  "role",
++  "roles",
++  "round",
++  "row",
++  "rows",
++  "rs",
++  "rsub",
++  "running",
++  "runtime_contract",
++  "s",
++  "sample_changed_since_previous",
++  "scale",
++  "scan_active",
++  "scan_completed_at",
++  "scan_started_at",
++  "scope",
++  "score",
++  "scoreMax",
++  "scoreMin",
++  "scrim",
++  "scroll",
++  "scrollTo",
++  "scrollTop",
++  "search",
++  "sect",
++  "sector",
++  "seg",
++  "sep",
++  "session",
++  "session_context",
++  "setAttribute",
++  "setItem",
++  "setup_reason",
++  "setup_state",
++  "sh_main",
++  "shared",
++  "short",
++  "shown",
++  "shrink_ratio",
++  "shrink_volume",
++  "signal_close",
++  "signal_date",
++  "sin",
++  "sl",
++  "slice",
++  "sm_hold",
++  "smooth",
++  "snapshot_generated_at",
++  "some",
++  "sort",
++  "sortK",
++  "sort_basis",
++  "sorted",
++  "source",
++  "sourceAt",
++  "source_at",
++  "source_basis",
++  "source_checked_at",
++  "source_complete",
++  "source_members",
++  "splice",
++  "split",
++  "st",
++  "stage",
++  "stale",
++  "stale_cache",
++  "stamp",
++  "star",
++  "startup",
++  "startup_candidate",
++  "state",
++  "stateMode",
++  "states",
++  "status",
++  "stock",
++  "stock_strength_percentile",
++  "stock_strength_score",
++  "stocks",
++  "stopImmediatePropagation",
++  "stopPropagation",
++  "stratbar",
++  "strategies",
++  "strategy",
++  "strategy_factors",
++  "streak",
++  "strength_accel5_pp",
++  "strength_model",
++  "strength_motion",
++  "string",
++  "stringify",
++  "stroke",
++  "strokeStyle",
++  "strong",
++  "strong_advance",
++  "structure_note",
++  "structure_state",
++  "style",
++  "sub",
++  "support",
++  "support_alert_at",
++  "support_alerts",
++  "support_observation",
++  "sz_main",
++  "t",
++  "t0",
++  "t1",
++  "t2",
++  "t3",
++  "tag",
++  "tags",
++  "target",
++  "tcard",
++  "tcloud",
++  "td",
++  "tencent_quotes",
++  "test",
++  "text",
++  "textAlign",
++  "textBaseline",
++  "textContent",
++  "th",
++  "theme",
++  "theme_index",
++  "theme_rank",
++  "theme_source",
++  "themes",
++  "then",
++  "ths_concepts",
++  "tier",
++  "tier_name",
++  "tiers",
++  "tip",
++  "tipbox",
++  "title",
++  "tk",
++  "tn",
++  "toDateString",
++  "toFixed",
++  "toLocaleString",
++  "toLowerCase",
++  "toast",
++  "today",
++  "today_change_pct",
++  "today_pending",
++  "toggle",
++  "tone",
++  "toolbar",
++  "tooltip",
++  "top",
++  "total",
++  "touch_state",
++  "touched_unsealed",
++  "tp",
++  "tr",
++  "tracking_pending",
++  "trade_recovered_wait_daily",
++  "trade_status",
++  "traded",
++  "transform",
++  "trend",
++  "trend_aligned",
++  "trend_consolidation",
++  "trend_delta1_pp",
++  "trend_exited",
++  "trend_ma",
++  "trend_online",
++  "trend_pct",
++  "trend_rank",
++  "trend_stage",
++  "trend_state",
++  "trend_tier",
++  "trend_vs_market_pp",
++  "trim",
++  "true",
++  "tu",
++  "turn",
++  "turnMax",
++  "turnMin",
++  "turn_samples",
++  "turn_weak_repair_candidate",
++  "turnover",
++  "tw",
++  "tw2",
++  "tx",
++  "type",
++  "ui",
++  "ui_generation",
++  "ui_lazy",
++  "unconfirmed",
++  "unit",
++  "unshift",
++  "up",
++  "upPct",
++  "up_days_5",
++  "up_ratio",
++  "v",
++  "val",
++  "valid",
++  "valid_coverage_pct",
++  "valid_members",
++  "valid_quote_count",
++  "value",
++  "version",
++  "versionChanged",
++  "viewport",
++  "visibilitychange",
++  "vol_expand",
++  "vol_ratio5",
++  "vol_ratio_rt",
++  "volume_ratio",
++  "volume_ratio_closed",
++  "volume_shou",
++  "vr",
++  "vrMax",
++  "vrMin",
++  "wa",
++  "wait",
++  "warm",
++  "warn",
++  "warned",
++  "watch",
++  "watch_candidate",
++  "watch_count",
++  "weak",
++  "weight",
++  "why",
++  "wide",
++  "width",
++  "withdrawn_rows",
++  "work",
++  "wrap",
++  "wyckoff_evidence",
++  "wyckoff_structure",
++  "x",
++  "yesterday_limit_gap_median_pct",
++  "yesterday_limit_intraday_median_pct",
++  "yesterday_limit_median_pct",
++  "yesterday_strong_count",
++  "yesterday_strong_median_pct",
++  "zero"
++]--- /dev/null
++++ test_ui_payload.py
+@@ -0,0 +1,76 @@
++"""Transport boundaries must preserve facts, versions and export selection."""
++import copy
++import gzip
++import json
++from pathlib import Path
++from tempfile import TemporaryDirectory
++import unittest
++import shutil
++from unittest.mock import patch
++
++import config
++import ui_payload
++
++
++class PayloadTests(unittest.TestCase):
++    def test_lossless_dictionary_pack_handles_marker_collisions(self):
++        data = {'<name>': '种植业与林业', 'b': ['^0', '~0', -1, True, None, {}, []],
++                'nested': {'string': '\x01literal', 'float': 1.2345, 'short': '中'}}
++        self.assertEqual(ui_payload.unpack(ui_payload.pack(data)), data)
++        self.assertNotIn('</script>', config.script_json(ui_payload.pack({'s': '</script>'})))
++
++    def test_generations_pin_details_and_expire_without_falling_forward(self):
++        with TemporaryDirectory() as tmp:
++            page = Path(tmp) / 'dashboard.html'
++            full = {'stocks': [{'code': '600241', 'name': '时代万恒', 'price': 10, 'k': [1, 2, 3],
++                                'theme_relations': [{'name': '电池'}], 'intraday_path': {'state': '保留', 'recent': [1]}}],
++                    'board_catalog': [{'id': 'industry:电池', 'members': [{'code': '600241', 'name': '时代万恒', 'change_pct': 2}],
++                                       'member_codes': ['600241']}], 'runtime_contract': {}}
++            original = copy.deepcopy(full)
++            packet, token = ui_payload.prepare(full, 'var DATA=/*__DATA__*/null;', page)
++            brief = ui_payload.unpack(packet)
++            self.assertEqual(brief['stocks'][0]['price'], 10)
++            self.assertEqual(brief['stocks'][0]['intraday_path'], {'state': '保留'})
++            self.assertEqual(brief['board_catalog'][0]['member_codes'], ['600241'])
++            self.assertEqual(ui_payload.detail(token, 'stock', '600241', page), original['stocks'][0])
++            self.assertEqual(gzip.decompress(ui_payload.blob(token, 'summary.gz', page)),
++                             ui_payload.blob(token, 'summary', page))
++            ui_payload.activate(token, page)
++            full['stocks'][0]['price'] = 11
++            _, newer = ui_payload.prepare(full, 'var DATA=/*__DATA__*/null;', page)
++            ui_payload.activate(newer, page)
++            self.assertEqual(ui_payload.detail(token, 'stock', '600241', page)['price'], 10)
++            self.assertEqual(ui_payload.detail(newer, 'stock', '600241', page)['price'], 11)
++            full['stocks'][0]['price'] = 12
++            _, third = ui_payload.prepare(full, 'var DATA=/*__DATA__*/null;', page)
++            ui_payload.activate(third, page)
++            with self.assertRaises(LookupError):
++                ui_payload.detail(token, 'stock', '600241', page)
++            with self.assertRaises(ValueError):
++                ui_payload.detail('../outside', 'stock', '600241', page)
++
++    def test_export_rejects_duplicate_or_noncode_selections(self):
++        with self.assertRaises(ValueError):
++            ui_payload.export_csv('0' * 24, ['600241', '600241'], {})
++        with self.assertRaises(ValueError):
++            ui_payload.export_csv('../outside', ['600241'], {})
++
++    def test_export_uses_frozen_formatter_and_requested_order(self):
++        with TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            for name in ('ui_payload.py', 'ui_client.js', 'csv_export.js', 'csv_runner.js', 'stock_list_fields.json'):
++                shutil.copy2(config.ROOT / name, root / name)
++            data = {'stocks': [{'code': '600241', 'name': '时代万恒'}, {'code': '603867', 'name': '新华股份'}],
++                    'generated_at': '2026-10-09 15:00:00', 'runtime_contract': {}}
++            with patch.object(config, 'ROOT', root):
++                _, token = ui_payload.prepare(data, '/*__DATA__*/null', root / 'dashboard.html')
++                # Changes after publication cannot change this generation's CSV format.
++                (root / 'csv_export.js').write_text('throw new Error("new formatter");', encoding='utf-8')
++                result = ui_payload.export_csv(token, ['603867', '600241'], {}).decode('utf-8-sig').splitlines()
++                self.assertTrue(result[1].startswith('"603867","新华股份"'))
++                self.assertTrue(result[2].startswith('"600241","时代万恒"'))
++                self.assertEqual(len(result[0].split(',')), 228)
++
++
++if __name__ == '__main__':
++    unittest.main()

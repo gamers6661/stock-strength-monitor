@@ -1,0 +1,137 @@
+"""只读前向研究：真实事件与当时股票池；参考报价收益，不模拟成交。"""
+import json
+import sqlite3
+from collections import Counter
+from pathlib import Path
+from statistics import mean,median
+
+import config
+import datafeed
+import intraday
+import radar_opportunity as ro
+import strength
+
+
+def future_returns(record,observation,at,horizon,histories,calendar):
+    """以真实触发报价为起点；未来日线只用于结果评估，不重写信号。"""
+    dates=[d for d in calendar if d>at[:10]]
+    if len(dates)<horizon:return dict(status='未来完成交易日尚未齐备')
+    target=dates[horizon-1]
+    def change(code,point):
+        bars={b['date']:b for b in histories.get(code,[])}
+        if not point.get('reference_date') or point['reference_date']>=at[:10]:return None
+        ref=bars.get(point.get('reference_date'));end=bars.get(target)
+        if not ref or not end or not ro.number(point.get('price')) or not ro.number(point.get('last_close')) or point['last_close']<=0:return None
+        modes={(b.get('price_basis'),b.get('price_basis_source')) for b in (ref,end)}
+        allowed={('qfq',s) for s in intraday._QFQ_HISTORY_SOURCES}|{('raw',s) for s in intraday._RAW_HISTORY_SOURCES}
+        if len(modes)!=1 or not modes.issubset(allowed) or not all(intraday._valid_historical_price_bar(b) for b in (ref,end)):return None
+        basis,source=next(iter(modes))
+        if (basis=='qfq' and source not in intraday._QFQ_HISTORY_SOURCES) or (basis=='raw' and source not in intraday._RAW_HISTORY_SOURCES):return None
+        # 当前研究日线尺度下的真实入点；只同比例换算，不改原始事件报价。
+        entry=point['price']*ref['close']/point['last_close']
+        return 100*(end['close']/entry-1)
+    baseline=record.get('benchmark_prices') or {}
+    code=observation['code'];point=baseline.get(code)
+    if not point:return dict(status='真实触发轮的前向报价基线未记录')
+    own=change(code,point);bench=[change(c,v) for c,v in baseline.items()]
+    effective=[v for v in bench if v is not None];expected=len(record.get('pool') or [])
+    coverage=len(effective)/expected*100 if expected else None
+    if own is None or coverage is None or coverage<config.RADAR_OPPORTUNITY['market_coverage_pct']:
+        return dict(status='同尺度历史/冻结股票池结果覆盖待核验',coverage_pct=coverage)
+    bars={b['date']:b for b in histories.get(code,[])};ref=bars.get(point['reference_date']);entry=point['price']*ref['close']/point['last_close']
+    lows=[100*(b['low']/entry-1) for d,b in bars.items() if at[:10]<d<=target and intraday._valid_historical_price_bar(b)
+          and (b.get('price_basis'),b.get('price_basis_source'))==(ref.get('price_basis'),ref.get('price_basis_source'))]
+    return dict(status='可计算',target_day=target,return_pct=own,benchmark_pct=mean(effective),
+                excess_pp=own-mean(effective),coverage_pct=coverage,
+                subsequent_completed_ohlc_max_adverse_pct=min([0]+lows) if lows else None,
+                same_day_path_note='不使用信号当日最低价；当日只采用信号之后的有效采样')
+
+
+def summarize(items,horizon):
+    # 整体组按代码/触发时刻/阶段去重；分类组保留类别归属。
+    unique={}
+    for r in items:unique.setdefault((r['code'],r['at'],r.get('stage') or r['kind']),r)
+    selected=list(unique.values());outcomes=[r['outcomes'][str(horizon)] for r in selected]
+    values=[r['excess_pp'] for r in outcomes if r['status']=='可计算']
+    delays=[r['confirmation_delay_seconds'] for r in selected if ro.number(r.get('confirmation_delay_seconds'))]
+    adverse=[r['same_day_sample_max_adverse_pct'] for r in selected if ro.number(r.get('same_day_sample_max_adverse_pct'))]
+    return dict(total=len(selected),category_rows=len(items),overlap_rows=len(items)-len(selected),valid=len(values),
+                mean_excess_pp=mean(values) if values else None,median_excess_pp=median(values) if values else None,
+                positive_pct=sum(v>0 for v in values)/len(values)*100 if values else None,
+                median_confirmation_delay_seconds=median(delays) if delays else None,
+                median_sample_adverse_pct=median(adverse) if adverse else None,
+                unavailable=Counter(r['status'] for r in outcomes if r['status']!='可计算'))
+
+
+def build_report():
+    records=[]
+    for file in sorted(ro.directory().glob('????-??-??.jsonl')):
+        with file.open(encoding='utf-8') as stream:
+            records.extend(json.loads(line) for line in stream if line.strip())
+    codes={c for r in records for c in (r.get('pool') or [])}
+    con=sqlite3.connect(config.KLINE_DB.resolve().as_uri()+'?mode=ro',uri=True)
+    try:histories={c:datafeed.load_kline(con,'kline','code',c,limit=160) for c in codes}
+    finally:con.close()
+    calendar=strength.trading_calendar({c:strength.completed(b) for c,b in histories.items()})
+    signals={};old_signals={}
+    for record in records:
+        for row in record.get('observations',[]):
+            for event in row.get('events',[]):
+                for kind,field in [('正式触发','first_formal_at'),('采样确认','first_confirmed_at')]:
+                    at=event.get(field)
+                    if not at or row.get('source_at')!=at:continue
+                    key=(event['event_id'],kind)
+                    signals.setdefault(key,(record,row,event,at))
+        benchmark=record.get('benchmark_prices') or {}
+        categories=dict(record.get('original_lists') or {},daily_A=record.get('daily_A') or [])
+        for category,pool in categories.items():
+            for code in pool:
+                point=benchmark.get(code)
+                if point:old_signals.setdefault((code,category,record['day']),(record,{'code':code},category,point['source_at']))
+    result=[]
+    for key,(record,row,event,at) in signals.items():
+        formal=event.get('first_formal_at');confirmed=event.get('first_confirmed_at')
+        delay=(ro.stamp(confirmed)-ro.stamp(formal)).total_seconds() if formal and confirmed else None
+        point=record.get('benchmark_prices',{}).get(row['code']);path_returns=[]
+        for future in records:
+            for sample in future.get('observations',[]):
+                if sample['code']!=row['code'] or not sample.get('price_basis_comparable') or not sample.get('source_at') or sample['source_at']<=at:continue
+                if sample['source_at'][:10]!=at[:10]:continue
+                if not point or not ro.number(point.get('price')) or not ro.number(sample.get('price')) or point['price']<=0:continue
+                if point.get('reference_date')==sample.get('reference_date') and point.get('last_close')==sample.get('last_close'):
+                    path_returns.append(100*(sample['price']/point['price']-1))
+        result.append(dict(event_id=key[0],stage=key[1],code=row['code'],kind=event['kind'],at=at,
+                           half_day=ro.part(ro.stamp(at)),market_environment=(record.get('market',{}).get('environment') or {}).get('label'),
+                           peer_reference=any(b.get('peers_qualified') is True for b in row.get('boards',[])),
+                           board_relations_known=bool(row.get('boards')),risk=row.get('risk'),confirmation_delay_seconds=delay,
+                           same_day_sample_max_adverse_pct=min([0]+path_returns) if path_returns else None,
+                           valid_followup_samples=len(path_returns),baseline_present=bool(point),
+                           outcomes={str(n):future_returns(record,row,at,n,histories,calendar) for n in (1,3,5)}))
+    legacy=[]
+    for (code,kind,day),(record,row,_,at) in old_signals.items():
+        legacy.append(dict(code=code,kind=kind,day=day,at=at,outcomes={str(n):future_returns(record,row,at,n,histories,calendar) for n in (1,3,5)}))
+    aggregates={}
+    for stage in ('正式触发','采样确认'):
+        stage_rows=[r for r in result if r['stage']==stage]
+        groups={'整体':stage_rows}
+        for dimension in ('kind','half_day','market_environment','peer_reference','board_relations_known'):
+            for value in sorted({str(r.get(dimension)) for r in stage_rows}):
+                groups[dimension+'='+value]=[r for r in stage_rows if str(r.get(dimension))==value]
+        for label,group in groups.items():
+            for n in (1,3,5):aggregates['新雷达|'+stage+'|'+label+'|'+str(n)]=summarize(group,n)
+    for group in sorted({r['kind'] for r in legacy}):
+        for n in (1,3,5):aggregates['旧机制|'+group+'|'+str(n)]=summarize([r for r in legacy if r['kind']==group],n)
+    breakdown=Counter((r['kind'],r['half_day'],r['market_environment'],str(r['peer_reference']),r['stage']) for r in result)
+    return dict(version=ro.VERSION,new_signals=result,old_signals=legacy,aggregates=aggregates,
+                unique_code_time_stage_count=len({(r['code'],r['at'],r['stage']) for r in result}),
+                breakdown={'|'.join(map(str,k)):v for k,v in breakdown.items()},
+                missing_baselines=sum(not r['baseline_present'] for r in result),
+                notes=['真实逐轮记录，禁止用当前成员回填历史','整体统计按代码与时刻及阶段去重；分类分组保留重叠，并报告重叠行数',
+                       '结果为参考报价收益，不代表可成交或策略收益','信号前的当日最低价不作为信号后回撤',
+                       '尚未完成20/60个交易日观察；分组样本充足性待实际积累'])
+
+
+if __name__=='__main__':
+    result=build_report();target=config.ROOT/'research'/'radar_opportunity_v1_20261012'/'forward_report.json'
+    target.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+    print('前向研究：新事件观察',len(result['new_signals']),'旧机制观察',len(result['old_signals']))

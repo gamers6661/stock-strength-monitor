@@ -1,0 +1,191 @@
+--- before/radar_opportunity.py
++++ radar_opportunity.py
+@@ -17,6 +17,56 @@
+ _DEFAULT_DIRECTORY=DIRECTORY
+ _DEFAULT_SNAPSHOT=config.SNAPSHOT_JSON
+ LABELS = {'restart': '强势再启动', 'breakout': '突破启动', 'sustained': '持续进攻'}
++REPAIR_VERSION = '雷达验收修复2026-10-13.1'
++
++
++def presentation(session, sampling):
++    deferred=session in ('非交易日','盘前','集合竞价','竞价结束')
++    return dict(default_view='follow' if session in ('集合竞价','竞价结束') else 'close' if session=='已收盘' else 'daily' if session in ('非交易日','盘前') else 'current',
++                confirmation_enabled=sampling,market_enabled=not deferred,
++                market_reason='竞价阶段连续竞价基准尚未启用；E0及环境待核验' if session in ('集合竞价','竞价结束') else '连续竞价基准尚未启用' if deferred else None,
++                current_empty_message='暂无符合条件的股票，空池为有效结果。' if sampling else '当前非连续竞价，尚未进入确认时段；本时段不新增采样确认。')
++
++
++def close_bundle(snap, review, events):
++    """投影真实已计算收盘结果，不重新计算资格或回填历史成员。"""
++    names={r['code']:r.get('name') for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
++    identities={e['event_id']:e for e in events.values()}
++    records=[]
++    for identity,item in review.get('events',{}).items():
++        e=identities.get(identity)
++        if not e:raise ValueError('收盘记录缺少原事件身份：'+identity)
++        records.append(dict(item,event_id=identity,code=e['code'],name=names.get(e['code']),kind=e['kind'],label=LABELS[e['kind']],day=review['day'],
++                            platform=e.get('platform'),atr=e.get('atr'),background_date=e.get('background_date'),first_observed_at=e.get('first_observed_at'),first_confirmed_at=e.get('first_confirmed_at')))
++    grouped={}
++    for item in records:grouped.setdefault(item['code'],[]).append(item)
++    rows=[]
++    for code,items in grouped.items():
++        confirmed=[r for r in items if r['status']=='收盘确认']
++        if not confirmed:continue
++        labels=[LABELS[k] for k in LABELS if any(r['kind']==k for r in confirmed)]
++        rows.append(dict(code=code,name=names.get(code),day=review['day'],labels=labels,event_count=len(confirmed),R0=confirmed[0].get('R0'),E0=confirmed[0].get('E0'),M0=confirmed[0].get('M0'),events=items))
++    rows.sort(key=lambda r:(-r['E0'] if number(r['E0']) else math.inf,-r['R0'] if number(r['R0']) else math.inf,r['code']))
++    return dict(review,version=VERSION,generated_at=snap.get('generated_at'),records=records,stock_rows=rows,
++                event_counts={s:sum(r['status']==s for r in records) for s in ('收盘确认','收盘未确认','待收盘核验')},
++                stock_counts={s:len({r['code'] for r in records if r['status']==s}) for s in ('收盘确认','收盘未确认','待收盘核验')})
++
++
++def attach_close_archive(model, bundle=None, persist=False):
++    folder=directory()/'close_reviews'
++    if bundle and bundle.get('ready') and persist:
++        folder.mkdir(parents=True,exist_ok=True)
++        config.atomic_write_text(folder/(bundle['day']+'.json'),json.dumps(bundle,ensure_ascii=False,separators=(',',':')))
++    saved=[]
++    if folder.exists():
++        for path in sorted(folder.glob('*.json'),reverse=True):
++            try:item=json.loads(path.read_text(encoding='utf-8'))
++            except (OSError,ValueError):continue
++            if (item.get('version')==VERSION and item.get('ready') and item.get('day','')<=model['day']
++                    and (not model.get('judged_at') or item.get('generated_at','')<=model['judged_at'])):
++                saved.append(item);break
++    if bundle and bundle.get('ready'):saved.append(bundle)
++    if saved:model['last_close_review']=max(saved,key=lambda r:r['day'])
+ 
+ 
+ def number(v):
+@@ -188,7 +238,8 @@
+                 e=c.get('event');key=str(r['code'])+'|'+kind
+                 if e and e.get('version')==VERSION and key not in saved:saved[key]=copy.deepcopy(e)
+     if session=='午间休市' and previous_model.get('version')==VERSION and previous_model.get('day')==day:
+-        model=copy.deepcopy(previous_model);model.update(phase='午休冻结上午结果',frozen=True)
++        model=copy.deepcopy(previous_model);model.update(phase='午休冻结上午结果',frozen=True,presentation=presentation(session,False))
++        attach_close_archive(model)
+         prior_rows={r['code']:r for r in (previous or {}).get('stocks',[])+(previous or {}).get('coverage_catalog',[])}
+         for code in model.get('by_code',{}):
+             if code in rows: rows[code]['radar_opportunity']=copy.deepcopy(prior_rows[code]['radar_opportunity'])
+@@ -209,7 +260,8 @@
+         if q.get('last_close_semantics')!='previous_trade_day_raw_close' or q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES:
+             continue
+         valid[code]=dict(value,part=quote_part)
+-    coverage=len(valid)/len(eligible)*100 if eligible else None
++    market_enabled=session not in ('非交易日','盘前','集合竞价','竞价结束')
++    coverage=len(valid)/len(eligible)*100 if eligible and market_enabled else None
+     market_ready=bool(valid and coverage>=p['market_coverage_pct'])
+     m0=mean(v['change_pct'] for v in valid.values()) if market_ready else None
+     up=sum(v['change_pct']>0 for v in valid.values())/len(valid)*100 if market_ready else None
+@@ -230,6 +282,8 @@
+     for b in snap.get('board_catalog') or []:
+         for code in set(b.get('member_codes') or []):board_index.setdefault(str(code),[]).append(b)
+     sampling=bool(part(now) and session in ('早盘','午盘','尾盘'))
++    market['enabled']=presentation(session,sampling)['market_enabled']
++    market['reason']=presentation(session,sampling)['market_reason']
+     for code,row in rows.items():
+         q=quotes.get(code) or {}; context=contexts.get(code) or {}; bars=histories.get(code) or []
+         auction=session in ('盘前','集合竞价','竞价结束')
+@@ -333,24 +387,33 @@
+                 same_period=seq.get('day')==day and seq.get('part')==part(at) and part(at)==part(now)
+                 last_effective=stamp(event.get('last_source_at')) or last
+                 contiguous=bool(last_effective and at and 0<=(at-last_effective).total_seconds()<=p['max_sample_gap_seconds'])
++                event['continuity']=dict(previous_source_at=str(last_effective) if last_effective else None,source_at=str(at) if at else None,
++                    gap_seconds=(at-last_effective).total_seconds() if at and last_effective else None,same_period=same_period,sampling=sampling,contiguous=contiguous)
++                reset_reason=None
+                 active=False
+                 if expired:
++                    reset_reason='事件分类窗口已结束'
+                     status='突破后跟踪' if kind=='breakout' else '再启动后跟踪';event['sequence']={}
+                     if maintain is False:event['ended_at']=event.get('ended_at') or str(at)
+                 elif not sampling:
++                    reset_reason='本时段不新增连续竞价确认'
+                     status='竞价观察' if session in ('盘前','集合竞价','竞价结束') else '待收盘核验' if session=='已收盘' else '判断暂停'
+                     # 14:57后仅撤销，不能新确认；保留最后连续竞价事实。
+                     if session in ('尾盘','已收盘') and now.strftime('%H:%M:%S')>=p['continuous_pm'][1] and seq.get('confirmed') and seq.get('day')==day and contiguous and seq.get('part')=='PM' and maintain is True:
+-                        status='当前已确认·待收盘核验';active=True
++                        status='当前已确认·待收盘核验';active=True;reset_reason=None
+                     elif session not in ('午间休市',): event['sequence']={}
+                 elif row.get('intraday_serious_weakness') is True and code in valid:
++                    reset_reason='严重转弱'
+                     status='严重转弱';event['sequence']={};event['ended_at']=event.get('ended_at') or str(at)
+-                elif scale_changed or any(c['passed'] is None for c in maintenance):status='判断暂停';event['sequence']={}
++                elif scale_changed or any(c['passed'] is None for c in maintenance):
++                    status='判断暂停';event['sequence']={};reset_reason='数据或尺度待核验：'+'、'.join(c['key'] for c in maintenance if c['passed'] is None)
+                 elif at and stamp(event.get('high_water_at')) and at < stamp(event['high_water_at']):
+-                    status='判断暂停';event['sequence']={}
++                    status='判断暂停';event['sequence']={};reset_reason='源报价时间倒退'
+                 elif seq.get('confirmed') and same_period and contiguous and maintain is True:
+                     status='当前已确认' if official is True else '已确认，进攻减速';active=True
+                 elif official is True:
++                    if seq.get('count') and not same_period:reset_reason='跨日或跨半日重新确认'
++                    elif seq.get('count') and not contiguous:reset_reason='相邻源报价间隔超限或倒退'
+                     event['first_formal_at']=event.get('first_formal_at') or str(at)
+                     if not event.get('first_formal_price'):event['first_formal_price']=price
+                     can_sample=not event.get('high_water_at') or at>stamp(event['high_water_at']) or bool(seq.get('count'))
+@@ -362,11 +425,12 @@
+                             event['first_confirmed_at']=str(at);event['first_confirmed_price']=price
+                         event['last_reconfirmed_at']=str(at)
+                 else:
++                    reset_reason='有效条件未成立：'+'、'.join(c['key'] for c in maintenance if c['passed'] is False)
+                     status='突破预警' if warning else '价格越界，超额待核验' if price_alert else '突破回落' if kind!='sustained' and number(price) and number(h) and price<=h else '进攻暂停'
+                     event['sequence']={}
+                     if not warning and not price_alert: event['ended_at']=event.get('ended_at') or str(at)
+                 event.update(status=status,last_price=price,last_source_at=str(at) if at else None,
+-                             last_M0=m0,last_E0=e0,active=active,expired=expired)
++                             last_M0=m0,last_E0=e0,active=active,expired=expired,reset_reason=reset_reason)
+                 if code in valid and context.get('valid') is True:
+                     event['last_valid_price']=price;event['last_valid_quote_at']=str(at)
+                 if active:event['ended_at']=None
+@@ -375,7 +439,7 @@
+                     event['history']=event['history'][-p['history_in_state']:]
+                 if previous_status!=status or not event.get('history'):
+                     point=dict(at=str(at) if at else str(now),status=status,price=price,M0=m0,E0=e0,
+-                               reasons=[c['key'] for c in checks if c['passed'] is not True])
++                               reasons=[c['key'] for c in checks if c['passed'] is not True],reset_reason=reset_reason,continuity=copy.deepcopy(event['continuity']))
+                     event['history'].append(point)
+                     transitions.append(dict(event=copy.deepcopy(event),transition=point))
+                 events[key]=event;category['event']=copy.deepcopy(event)
+@@ -404,10 +468,12 @@
+                warning=[r['code'] for r in ordered if r['code'] in warning_codes],
+                tracking=[r['code'] for r in ordered if not r['current'] and r['code'] not in warning_codes and any(v.get('event') for v in r['categories'].values()) and r['status']!='待采样确认'])
+     model=dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,parameters=copy.deepcopy(p),day=day,daily_asof=asof,judged_at=str(now),source_at=market['source_at'],phase=session,
+-               market=market,by_code=outputs,lists=lists,counts={k:len(v) for k,v in lists.items()},frozen=False)
++               market=market,by_code=outputs,lists=lists,counts={k:len(v) for k,v in lists.items()},frozen=False,presentation=presentation(session,sampling),repair_version=REPAIR_VERSION)
+     model['counts']['confirmed_total']=len(lists['current'])+len(lists['limited'])
+     snap['radar_opportunity']=model
+     review_close(snap,model,events,histories,calendar,contexts,quotes,day)
++    bundle=close_bundle(snap,model['close_review'],events) if model.get('close_review') else None
++    attach_close_archive(model,bundle,persist)
+     for row in (snap.get('stocks') or [])+(snap.get('coverage_catalog') or []):
+         row['radar_opportunity']=copy.deepcopy(outputs[str(row['code'])])
+     model['by_code']={code:list_record(item) for code,item in outputs.items()}
+@@ -416,7 +482,7 @@
+         folder=directory();folder.mkdir(parents=True,exist_ok=True)
+         config.atomic_write_text(folder/'state.json',json.dumps(state,ensure_ascii=False,separators=(',',':')))
+         # Immutable transition observations, same generation/stock pool/relationships as this scan.
+-        record=dict(version=VERSION,day=day,generated_at=snap.get('generated_at'),market=market,transitions=transitions,
++        record=dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,repair_version=REPAIR_VERSION,day=day,generated_at=snap.get('generated_at'),market=market,transitions=transitions,
+                     original_lists={key:[r['code'] for r in rows.values() if r.get(key)] for key in ('attack_watch_candidate','startup_candidate')},
+                     daily_A=[r['code'] for r in rows.values() if r.get('trend_tier')=='A'],
+                     lists=lists,pool=sorted(eligible),board_members={b.get('id'):b.get('member_codes') for b in snap.get('board_catalog') or []},
+@@ -429,7 +495,7 @@
+                                        last_close=(quotes.get(r['code']) or {}).get('last_close'),
+                                        reference_date=(contexts.get(r['code']) or {}).get('expected_history_date') or max((d for d in calendar if r['source_at'] and d<r['source_at'][:10]),default=None),
+                                        events=[dict(event_id=v['event']['event_id'],kind=k,status=v['event']['status'],first_formal_at=v['event']['first_formal_at'],
+-                                                    first_confirmed_at=v['event']['first_confirmed_at'],close_review=v.get('close_review')) for k,v in r['categories'].items() if v.get('event')])
++                                                    first_confirmed_at=v['event']['first_confirmed_at'],close_review=v.get('close_review'),sequence=v['event'].get('sequence'),continuity=v['event'].get('continuity'),reset_reason=v['event'].get('reset_reason')) for k,v in r['categories'].items() if v.get('event')])
+                                   for r in ordered if any(c.get('event') for c in r['categories'].values())])
+         with (folder/(day+'.jsonl')).open('a',encoding='utf-8') as stream:stream.write(json.dumps(record,ensure_ascii=False,separators=(',',':'))+'\n')
+     return model
+@@ -548,4 +614,10 @@
+     assert model['lists']['current']==[r['code'] for r in ordered if r['current'] and not r['trade_restriction']]
+     assert model['lists']['limited']==[r['code'] for r in ordered if r['current'] and r['trade_restriction']]
+     for key,codes in model['lists'].items():assert len(codes)==len(set(codes)) and len(codes)==model['counts'][key]
++    if model.get('last_close_review'):
++        review=model['last_close_review'];confirmed=[r for r in review['records'] if r['status']=='收盘确认']
++        assert review['day']<=model['day'] and review['version']==VERSION
++        assert len(confirmed)==review['event_counts']['收盘确认']
++        assert len({r['code'] for r in confirmed})==review['stock_counts']['收盘确认']==len(review['stock_rows'])
++        assert len({r['event_id'] for r in review['records']})==len(review['records'])
+     return model['counts']

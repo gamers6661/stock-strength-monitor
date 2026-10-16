@@ -1,0 +1,158 @@
+--- baseline/radar_ui.js
++++ radar_ui.js
+@@ -1,5 +1,5 @@
+ /* Rankings and strength judgments are backend results. UI only selects confirmed members. */
+-function msStockDefaults(){return {axis:'trend',scope:'trend',sort:'trend',phase:'',q:'',limit:100,industryIds:[],themeIds:[],boardQuery:'',openKinds:{}};}
++function msStockDefaults(){return {axis:'trend',scope:'trend',sort:'trend',phase:'',q:'',limit:100,industryIds:[],themeIds:[],boardQuery:'',openKinds:{},browseOpen:false};}
+ var MS_VIEW={stocks:msStockDefaults(),industry:{scope:'focus',sort:'trend',phase:'',q:'',limit:100},theme:{scope:'focus',sort:'trend',phase:'',q:'',limit:100}};
+ var MS_REL_DATA=null,MS_REL={};
+ function msModel(){return DATA.market_strength||{};}
+@@ -42,11 +42,12 @@
+  h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" oninput="msUpdate(\''+key+'\',\'q\',this.value)"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
+ }
+ function msDirectionPicker(){var v=MS_VIEW.stocks,selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
+- var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同类多选取并集，行业与题材同时选择取交集 · 同花顺确认成员</p></div><button class="btn" onclick="msClearDirections()">清除方向</button></div><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" oninput="MS_VIEW.stocks.boardQuery=this.value;msRender(\'stocks\')">';
+- h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向：展示沪深主板强势股票</span>')+'</div>';
++ var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺确认成员 · 同类多选取并集，行业与题材取交集</p></div><button class="btn ms-clear-button" onclick="msClearDirections()">清除方向</button></div><div class="ms-direction-search-wrap"><span aria-hidden="true">⌕</span><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" oninput="MS_VIEW.stocks.boardQuery=this.value;msRender(\'stocks\')"></div>';
++ h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向 · 按当前筛选范围展示股票</span>')+'</div>';
++ h+='<details class="ms-direction-browser" '+(q||v.browseOpen?'open':'')+'><summary onclick="MS_VIEW.stocks.browseOpen=!this.parentNode.open">浏览行业 / 题材 <span>展开目录</span></summary><div class="ms-direction-browser-content">';
+  ['industry','theme'].forEach(function(kind){var rows=(DATA.board_catalog||[]).filter(function(b){return b.type===kind&&(!q||b.name.indexOf(q)>=0);}),rank=((msModel().boards||{}).sorts||{}).trend||[],order={};rank.forEach(function(id,i){order[id]=i;});rows.sort(function(a,b){return (order[a.id]==null?1e9:order[a.id])-(order[b.id]==null?1e9:order[b.id]);});
+   h+='<details '+(q||v.openKinds[kind]?'open':'')+' class="ms-direction-options"><summary onclick="MS_VIEW.stocks.openKinds[\''+kind+'\']=!this.parentNode.open">'+ (kind==='industry'?'行业':'题材')+' · '+rows.length+' 个方向</summary><div class="ms-chip-list">'+rows.map(function(b){var on=selected.indexOf(b.id)>=0;return '<button aria-pressed="'+on+'" class="ms-chip '+(on?'selected':'')+'" onclick="msToggleBoard(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
+- });return h+'</section>';
++ });return h+'</div></details></section>';
+ }
+ function msScore(m,axis){return m[axis+'_score']==null?'—':fmt(m[axis+'_score'],1)+' · '+esc(m[axis+'_level']||'—');}
+ function msBadge(m,axis){return '<span class="ms-badge ms-'+axis+' '+(m[axis+'_score']>=65?'ms-hot':'')+'">'+(axis==='trend'?'趋势 ':'情绪 ')+msScore(m,axis)+'</span>';}
+@@ -61,16 +62,16 @@
+ }
+ function msMore(rows,shown,key){return (rows.length>shown.length?'<button class="btn" onclick="MS_VIEW[\''+key+'\'].limit+=100;msRender(\''+key+'\')">加载更多（完整 '+rows.length+' 项）</button>':'')+(!rows.length?'<p class="empty">暂无符合条件的股票或方向，可调整当前筛选。</p>':'');}
+ function msTable(rows,key,limit){var boards=key==='industry'||key==='theme',shown=limit?rows.slice(0,limit):rows,axis=key==='stocks'?MS_VIEW.stocks.axis:null;
+- var h='<div class="tw"><table class="market-strength-table ms-research-table"><thead><tr><th class="l">名称 / 所属方向</th><th>当日涨幅</th><th>趋势强度</th><th>情绪强度</th><th>'+ (axis==='emotion'?'进攻 / 保持 / 活跃':'历史5 / 10 / 20日')+'</th><th class="l">结构 / 个性标签</th></tr></thead><tbody>';
+- shown.forEach(function(r){var m=r.market_strength||{},chg=boards?(m.emotion_parts||{}).R0:r.change_pct,ev=m.display_evidence||{},recent=m.recent_emotion||{};
++ var ranked=key==='stocks',h='<div class="tw"><table class="market-strength-table ms-research-table"><thead><tr>'+(ranked?'<th class="ms-rank-heading">排名</th>':'')+'<th class="l">名称 / 所属方向</th><th>当日涨幅</th><th>趋势强度</th><th>情绪强度</th><th>'+ (axis==='emotion'?'进攻 / 保持 / 活跃':'历史5 / 10 / 20日')+'</th><th class="l">结构 / 个性标签</th></tr></thead><tbody>';
++ shown.forEach(function(r,i){var m=r.market_strength||{},chg=boards?(m.emotion_parts||{}).R0:r.change_pct,ev=m.display_evidence||{},recent=m.recent_emotion||{};
+  var metric=axis==='emotion'?'<b>'+fmt(m.day_attack,1)+' / '+fmt(ev.hold,1)+' / '+(recent.active_days==null?'—':recent.active_days+'/5')+'</b><span class="cd">完成日5日 '+msHistory(m,5)+'</span>':[5,10,20].map(function(n){return '<span class="ms-return '+(m.dominant_period===n?'dominant':'')+'">'+n+'日 '+msHistory(m,n)+'</span>';}).join('');
+- h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'"><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span>'+(boards?'':msAffiliation(r,key))+'</td><td>'+pct(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td class="ms-metric-cell">'+metric+'</td><td class="l"><span class="cd">'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</span><div class="ms-tag-list">'+msTags(m)+'</div><span class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
++ h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'">'+(ranked?'<td class="ms-rank-cell"><span class="ms-rank '+(i<3?'podium rank-'+(i+1):'')+'">'+(i+1)+'</span></td>':'')+'<td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span>'+(boards?'':msAffiliation(r,key))+'</td><td>'+pct(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td class="ms-metric-cell">'+metric+'</td><td class="l"><span class="cd">'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</span><div class="ms-tag-list">'+msTags(m)+'</div><span class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
+  });return h+'</tbody></table></div>'+msMore(rows,shown,key);
+ }
+ function msStamp(){var m=msModel();return esc(m.mode||'')+' · 行情截至 '+esc(String((DATA.direction_changes||{}).source_at||m.at||'—').slice(0,19))+' · 沪深主板';}
+ function msDelta(value,digits){return value==null?'—':(value>0?'+':'')+fmt(value,digits);}
+-function msRender(key){var v=MS_VIEW[key],rows=msRows(key),html=msTools(key);
+- if(key==='stocks')html+=msDirectionPicker();
++function msRender(key){var v=MS_VIEW[key],rows=msRows(key),html=key==='stocks'?msDirectionPicker():'';
++ html+=msTools(key);
+  var description=key==='stocks'?(v.scope==='day_attack'?'按当日进攻强度排序；当日异动不等于趋势强或情绪强。':v.axis==='trend'?'历史上涨力度与结构决定趋势排名；当天大涨不是入榜要求。':'当日进攻、区间保持与近期活跃决定情绪排名；不要求历史趋势强。'):'同花顺确认成员共振；官方指数在详情中单列。';
+  html+='<p class="ms-muted">'+description+' 当前 '+rows.length+' 项。</p>'+msTable(rows,key,v.limit);
+  var host=document.getElementById(key==='industry'?'board-center':key==='theme'?'theme-center':'ms-stock-host');
+@@ -79,7 +80,8 @@
+ function renderBoards(){document.getElementById('bd-metrics').innerHTML='<div class="card"><h3>行业强度</h3><p>'+msStamp()+'</p></div>';msRender('industry');}
+ function renderThemesPage(){msRender('theme');}
+ function renderStocks(){document.getElementById('stk-sub').textContent=msStamp();var stockHeading=document.querySelector('#p-stocks h1');if(stockHeading)stockHeading.textContent='个股强度榜';var oldSearch=document.querySelector('#p-stocks .search');if(oldSearch)oldSearch.style.display='none';var table=document.getElementById('tb-stocks'),res=document.getElementById('stk-res');
+- if(!document.getElementById('ms-stock-host')){var host=document.createElement('div');host.id='ms-stock-host';table.parentNode.insertBefore(host,table);table.style.display='none';}
++ if(!document.getElementById('ms-stock-host')){var host=document.createElement('div');host.id='ms-stock-host';var tableWrap=table.parentNode;tableWrap.parentNode.insertBefore(host,tableWrap);tableWrap.style.display='none';}
++ var legacyToolbar=document.querySelector('#p-stocks .toolbar');if(legacyToolbar)legacyToolbar.style.display='none';
+  res.innerHTML='沪深主板 · 趋势与情绪独立排名 · 行业 / 题材多选筛选';
+  ['stk-more','stock-view-tabs','stock-views','stk-view-tabs','btn-filter','btn-export','q'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});
+  var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.style.display='none';only.onclick=clearMSMembers;}
+--- baseline/dashboard_template.html
++++ dashboard_template.html
+@@ -911,7 +911,65 @@
+ .ms-summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}.ms-stat{display:block;font-size:32px;margin-top:9px;color:#263246}.ms-card-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.ms-discovery-card{border:1px solid #e6eaf0;border-radius:14px;background:#fff;padding:18px;transition:box-shadow .15s,border-color .15s}.ms-discovery-card:hover{border-color:#bccddd;box-shadow:0 6px 20px #2632460d}.ms-card-head{display:flex;justify-content:space-between;gap:10px;align-items:center}.ms-card-head b{font-size:16px}.ms-axis{display:flex;gap:8px;flex-wrap:wrap;margin:13px 0}.ms-badge{display:inline-block;border-radius:8px;padding:5px 9px;background:#f1f4f8;color:#617084;font-size:12px;white-space:nowrap}.ms-hot{background:#fceeea;color:#b64333}.ms-mini-metrics{display:flex;justify-content:space-between;font-size:12px;color:#7a8494;gap:12px}.ms-mini-metrics b{display:block;margin-top:5px;font-size:14px;color:#354052}.ms-muted,.ms-card-context{color:#7a8494;font-size:12px;line-height:1.65}.ms-card-signal{font-size:12px;color:#47617e;margin:13px 0 7px}.ms-card-risk{font-size:11px;color:#a87844;min-height:16px;margin:6px 0 0}.ms-overview-section{margin-bottom:20px;padding:22px}.ms-overview-section h3{margin:0 0 5px}.ms-toolbar{flex-wrap:wrap;margin:12px 0}.ms-research-table td{padding-top:13px;padding-bottom:13px}.market-strength-detail details{margin-top:14px}.market-strength-detail summary{cursor:pointer;color:#667a93}.market-strength-detail pre{font-size:11px;max-height:420px;overflow:auto;background:#f5f7fa;padding:12px}.ms-research-table .cd{display:block;margin-top:5px}@media(max-width:1050px){.ms-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:640px){.ms-card-grid{grid-template-columns:1fr}.ms-summary-grid{grid-template-columns:repeat(2,1fr)}}
+ .ms-trend.ms-hot{background:#eaf1ff;color:#31689c}.ms-toolbar{display:flex;align-items:center;gap:8px}.ms-toolbar select,.ms-toolbar input:not([type=checkbox]){min-height:36px;padding:7px 11px;border:1px solid #dfe4ec;border-radius:9px;background:#fff;color:#4b586b;font:inherit;font-size:12px;outline:none}.ms-toolbar select{min-width:106px}.ms-toolbar input:not([type=checkbox]){min-width:166px}.ms-toolbar select:focus,.ms-toolbar input:focus{border-color:#80a8cf;box-shadow:0 0 0 3px #eaf1ff}.ms-toolbar .btn{margin:0}
+ .ms-style-tabs{display:flex;gap:8px;margin:10px 0 18px}.ms-tab{border:1px solid #e1e6ee;border-radius:12px;padding:12px 28px;background:#fff;color:#718092;font:inherit;font-weight:600;cursor:pointer}.ms-tab.on{background:#eaf1ff;color:#31689c;border-color:#bdd0e9}.ms-tab.emotion.on{background:#fceeea;color:#b64333;border-color:#efc9be}.ms-check{display:flex;align-items:center;gap:7px;color:#617084;font-size:12px}.ms-check input{accent-color:#4177a8}.ms-section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.ms-temperature-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin:22px 0}.ms-temperature-grid span{display:block;color:#7a8494;font-size:12px}.ms-temperature-grid strong{display:block;font-size:27px;margin-top:8px;color:#263246}.ms-direction-columns{display:grid;grid-template-columns:1fr 1fr;gap:26px}.ms-direction-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.ms-direction-card{background:#fff;border:1px solid #e2e8f0;border-radius:13px;padding:16px}.ms-direction-card.emotion{border-top:3px solid #e7c5bc}.ms-direction-card.trend{border-top:3px solid #bfd1e8}.ms-name-link{border:0;background:none;padding:0;color:#263246;font:inherit;font-size:15px;font-weight:600;cursor:pointer;text-align:left}.ms-detail-link{border:0;background:none;padding:2px;color:#7a8494;font-size:11px;cursor:pointer;white-space:nowrap}.ms-leaders{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}.ms-leaders button{border:0;border-radius:5px;background:#f2f5fa;color:#5e7086;padding:4px 6px;font-size:11px;cursor:pointer}.ms-turning-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.ms-turning-card{text-align:left;background:#f6f9fd;border:1px solid #e1e8f1;border-radius:12px;padding:15px;cursor:pointer;color:#34485f}.ms-turning-card.emotion{background:#fdf7f4}.ms-turning-card b,.ms-turning-card span,.ms-turning-card small{display:block;margin-bottom:6px}.ms-turning-card small{font-size:11px;color:#7a8494}.ms-direction-picker{padding:22px;margin-bottom:22px}.ms-direction-picker h3{margin:0}.ms-direction-search{width:100%;padding:11px 14px;border:1px solid #dde4ee;border-radius:10px;font:inherit;font-size:13px}.ms-selected-directions{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0}.ms-direction-options{padding:10px 0;border-top:1px solid #edf0f4;font-size:13px;color:#52657a}.ms-direction-options summary{cursor:pointer}.ms-direction-options .ms-chip-list{max-height:190px;overflow:auto}.ms-chip-list{display:flex;gap:7px;flex-wrap:wrap;padding:12px 0}.ms-chip{border:1px solid #e3e8ef;background:#f7f9fc;color:#60728b;border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer}.ms-chip.selected{background:#eaf1ff;color:#31689c;border-color:#b9cde6}.ms-chip.small{padding:3px 6px;font-size:10px;margin:3px 3px 0 0}.ms-affiliation{font-size:11px;color:#718092;margin:6px 0}.ms-industry{display:block;font-weight:500;margin-bottom:4px}.ms-affiliation details{display:inline-block;margin-top:4px}.ms-affiliation summary{cursor:pointer;font-size:10px}.ms-affiliation details[open]{display:block}.ms-match{color:#31689c;margin:5px 0}.ms-tag-list{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0}.ms-tag{background:#eef4f7;color:#537484;padding:4px 7px;border-radius:6px;font-size:10px}.ms-tag.risk{background:#fff0e9;color:#af593c}.ms-return{display:block;font-size:11px;color:#718092;margin:5px 0;white-space:nowrap}.ms-return.dominant{font-weight:600;color:#31689c}.ms-metric-cell{min-width:135px}.ms-research-table td:first-child{min-width:180px;max-width:260px}.ms-research-table td:last-child{min-width:170px}.ms-radar-group{margin:26px 0 35px}.ms-radar-group h3{margin-bottom:14px}.ms-chart-tools{display:flex;align-items:center;gap:14px;color:#718092;font-size:11px;margin:10px 0}.ms-chart-tools select{border:1px solid #dfe4ec;border-radius:6px;padding:4px;color:#52657a}.ms-chart-tools #k-readout{flex:1}
+-@media(max-width:1100px){.ms-direction-columns{grid-template-columns:1fr}.ms-turning-grid{grid-template-columns:1fr 1fr}}@media(max-width:640px){.ms-direction-grid,.ms-turning-grid{grid-template-columns:1fr}.ms-temperature-grid{grid-template-columns:1fr 1fr}.ms-section-head{align-items:flex-start}.ms-tab{flex:1;padding:11px}.ms-chart-tools{flex-wrap:wrap}}</style>
++@media(max-width:1100px){.ms-direction-columns{grid-template-columns:1fr}.ms-turning-grid{grid-template-columns:1fr 1fr}}@media(max-width:640px){.ms-direction-grid,.ms-turning-grid{grid-template-columns:1fr}.ms-temperature-grid{grid-template-columns:1fr 1fr}.ms-section-head{align-items:flex-start}.ms-tab{flex:1;padding:11px}.ms-chart-tools{flex-wrap:wrap}}
++/* Stock discovery: direction first, independent ranking controls below. */
++#p-stocks .hero{padding:28px 28px 20px!important}
++#p-stocks .hero h1{font-size:clamp(28px,3vw,40px)!important;letter-spacing:-.04em;line-height:1.15}
++.ms-stock-hero-row{display:flex;align-items:center;justify-content:space-between;gap:20px}
++.ms-stock-actions{flex:none;display:flex;align-items:center}
++.ms-offline-button{padding:10px 16px;border-radius:12px;background:rgba(255,255,255,.82);border-color:#dbe5f0;color:#4b6784;box-shadow:0 3px 12px #29466708;font-size:12px}
++.ms-offline-button:hover{background:#edf4ff;border-color:#bbd1ec;box-shadow:0 5px 16px #29466712}
++#p-stocks .stocks-meta{margin-bottom:14px}
++#ms-stock-host .ms-direction-picker{padding:20px 22px;margin-bottom:18px;background:linear-gradient(120deg,#f8fbff,#fbfbfd);border:1px solid #e5ebf3;border-radius:18px;box-shadow:0 4px 18px #20375405}
++#ms-stock-host .ms-section-head{margin-bottom:14px}
++#ms-stock-host .ms-section-head h3{font-size:15px;font-weight:600;color:#30455d}
++#ms-stock-host .ms-section-head p{margin-top:5px;font-size:11px;color:#8190a2}
++.ms-clear-button{background:transparent;border-color:#e1e7ef;color:#7b8a9d;font-size:11px;padding:6px 10px;border-radius:8px}
++.ms-direction-search-wrap{position:relative}
++.ms-direction-search-wrap>span{position:absolute;left:14px;top:7px;font-size:24px;line-height:1;color:#8ca0b9;pointer-events:none}
++#ms-stock-host .ms-direction-search{padding:11px 15px 11px 40px;background:#fff;border-color:#dfe7f2;outline:none;border-radius:11px;transition:border-color .15s,box-shadow .15s}
++#ms-stock-host .ms-direction-search:focus{border-color:#86afd5;box-shadow:0 0 0 3px #eaf2ff}
++#ms-stock-host .ms-selected-directions{margin:11px 0 8px;min-height:23px;align-items:center}
++.ms-direction-browser>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:7px;width:max-content;margin-left:auto;color:#7890aa;font-size:11px;padding:3px 0}
++.ms-direction-browser>summary::-webkit-details-marker{display:none}
++.ms-direction-browser>summary:after{content:'⌄';font-size:14px;transition:transform .15s}
++.ms-direction-browser[open]>summary:after{transform:rotate(180deg)}
++.ms-direction-browser>summary span{color:#a0acbb;font-size:10px}
++.ms-direction-browser-content{margin-top:10px;padding:4px 14px;background:#fff;border:1px solid #e8edf5;border-radius:12px}
++.ms-direction-browser-content .ms-direction-options{font-size:12px;padding:9px 0}
++.ms-direction-browser-content .ms-direction-options:first-child{border-top:0}
++#ms-stock-host .ms-chip{border-radius:8px;transition:background .15s,border-color .15s}
++#ms-stock-host .ms-chip:hover{background:#edf4ff;border-color:#c5d7ed}
++#ms-stock-host .ms-style-tabs{display:inline-flex;gap:3px;padding:4px;margin:0 0 12px;background:#f0f3f8;border-radius:12px}
++#ms-stock-host .ms-tab{border:0;background:transparent;padding:9px 24px;border-radius:9px;font-size:13px;color:#8793a4}
++#ms-stock-host .ms-tab.on{background:#fff;color:#316a9f;box-shadow:0 2px 7px #2e4a7010}
++#ms-stock-host .ms-tab.emotion.on{color:#ba6248}
++#ms-stock-host .ms-toolbar{margin:0 0 16px;gap:9px}
++#ms-stock-host .ms-toolbar select,#ms-stock-host .ms-toolbar input:not([type=checkbox]){min-height:38px;border-color:#e3e9f1;border-radius:10px;background:#fff}
++#ms-stock-host .ms-toolbar .btn{background:#f5f7fb;border-color:#e2e8f1;color:#5a7088;padding:9px 13px;font-size:12px}
++#ms-stock-host>.ms-muted{margin:0 0 12px;font-size:11px;color:#8a97a8}
++#ms-stock-host .tw{overflow-x:auto!important;border:1px solid #e6ebf2;border-radius:15px;box-shadow:0 3px 15px #233b5c04}
++#ms-stock-host .ms-research-table th{background:#f8fafc;color:#8a98aa;font-size:11px;padding:13px 12px;font-weight:500;white-space:nowrap}
++#ms-stock-host .ms-research-table td{padding:15px 12px;border-color:#eef2f7}
++#ms-stock-host .ms-research-table td:first-child{min-width:54px;max-width:none;width:54px;text-align:center}
++#ms-stock-host .ms-research-table td:nth-child(2){min-width:190px;max-width:260px}
++#ms-stock-host .ms-research-table tr:hover td{background:#f8fbff}
++.ms-rank{display:inline-flex;align-items:center;justify-content:center;min-width:27px;height:27px;border-radius:8px;color:#a0aab8;font-size:12px;font-variant-numeric:tabular-nums}
++.ms-rank.podium{font-weight:600;background:#f0f5fc;color:#5e81ad}
++.ms-rank.rank-1{background:#fcf4e7;color:#ad8750}
++.ms-rank.rank-2{background:#eef2f7;color:#71839d}
++.ms-rank.rank-3{background:#f8efeb;color:#b28a75}
++@media(max-width:700px){
++ #p-stocks .hero{padding:22px 16px 16px!important}
++ .ms-stock-hero-row{align-items:flex-start;gap:12px}
++ .ms-offline-button{padding:8px 10px;font-size:11px}.ms-offline-button svg{display:none}
++ #ms-stock-host .ms-direction-picker{padding:16px;border-radius:15px}
++ #ms-stock-host .ms-section-head{align-items:flex-start;gap:10px}
++ #ms-stock-host .ms-toolbar input:not([type=checkbox]){min-width:140px;flex:1}
++ #ms-stock-host .ms-research-table{min-width:1010px}
++ .ms-direction-browser>summary span{display:none}
++}
++</style>
+ </head>
+ <body>
+ <div class="ambient"></div>
+@@ -1049,8 +1107,7 @@
+ <!-- ══════ 个股 ══════ -->
+ <section class="pane" id="p-stocks">
+   <div class="hero" style="padding-bottom:26px">
+-    <h1 style="font-size:clamp(2rem,3.6vw,3rem)">全部样本</h1>
+-    <p id="stk-sub">—</p>
++    <div class="ms-stock-hero-row"><div><h1>个股强度榜</h1><p id="stk-sub">—</p></div><div id="stk-actions" class="ms-stock-actions"></div></div>
+   </div>
+   <div class="main" style="padding-top:0">
+     <details class="stocks-meta"><summary>数据时间与说明 ▾</summary>
+--- baseline/ui_client.js
++++ ui_client.js
+@@ -65,15 +65,15 @@
+   }
+   showStock=function(code,boardId){return open('stock',code,boardId);};
+   showBoardById=function(id){return open('board',id);};
+-  var exportButton=document.getElementById('btn-export');
+-  if(exportButton&&DATA.ui_lazy){
+-    var button=document.createElement('button');button.className='btn';button.textContent='完整离线看板';
++  var offlineHost=document.getElementById('stk-actions');
++  if(offlineHost&&DATA.ui_lazy){
++    var button=document.createElement('button');button.id='ui-offline-button';button.className='btn ms-offline-button';button.innerHTML='<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4" stroke-linecap="round" stroke-linejoin="round"/></svg><span>完整离线看板</span>';
+     button.title='保存同一版全部详情、图表和导出功能，双击即可离线查看';
+     button.onclick=function(){
+       if(!uiLocal()){toast('请先通过打开看板.bat启动本地服务');return;}
+       var a=document.createElement('a');a.href='/__ui/offline?version='+encodeURIComponent(DATA.ui_generation);
+       a.download='股票看板_完整离线_'+String(DATA.generated_at||'').slice(0,10)+'.html';a.click();
+-    };exportButton.parentNode.insertBefore(button,exportButton.nextSibling);
++    };offlineHost.appendChild(button);
+   }
+ }
+ function updateDashboardData(status){

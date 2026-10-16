@@ -1,0 +1,21 @@
+--- before/make_dashboard.py
++++ make_dashboard.py
+@@ -74,15 +74,18 @@
+     import scoring
+     import attack_model
+     import board_opportunity
++    import radar_opportunity
+     snap['runtime_contract'] = dict(code_close_refresh_version=scoring.CLOSE_REFRESH_VERSION,
+                                    code_fund_reference_version=price_only.VERSION,
+                                    code_attack_model_version=attack_model.LIVE_VERSION,
+                                    code_board_opportunity_version=board_opportunity.VERSION)
++    snap['runtime_contract']['code_radar_opportunity_version']=radar_opportunity.VERSION
+     attach_klines(snap)
+     import board_trend
+     if not snap.get('board_opportunity_model'):
+         board_trend.attach(snap, fetch=False)
+     tpl = TPL.read_text(encoding="utf-8")
++    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8'))
+     if PLACEHOLDER not in tpl:
+         print("[ERR] 模板缺少数据占位符")
+         return None

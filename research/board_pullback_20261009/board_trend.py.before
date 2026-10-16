@@ -1,0 +1,256 @@
+"""同花顺指数完成日线观察。新增板块筛选，不参与任何个股评分。"""
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
+import math
+import re
+import sqlite3
+import time
+
+import config
+import datafeed
+
+VERSION = "板块趋势观察1"
+WINDOW = 22  # 当前/前一天的 MA20 斜率以及20个含跳空TR。
+KEYS = ("date", "open", "close", "high", "low", "volume", "amount")
+
+
+def connect(path=None):
+    conn = sqlite3.connect(path or config.KLINE_DB, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS board_kline(
+        board TEXT,date TEXT,open REAL,close REAL,high REAL,low REAL,
+        volume REAL,amount REAL,PRIMARY KEY(board,date))""")
+    # 与原始日线分开记录逐根来源，旧无来源记录不进入判断。
+    conn.execute("""CREATE TABLE IF NOT EXISTS board_bar_source(
+        board TEXT,date TEXT,source TEXT,priority INTEGER,observed_at TEXT,
+        PRIMARY KEY(board,date))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS board_fetch_state(
+        board TEXT PRIMARY KEY,name TEXT,target TEXT,checked REAL,error TEXT)""")
+    conn.commit()
+    return conn
+
+
+def valid(bar):
+    try:
+        datetime.strptime(bar["date"], "%Y-%m-%d")
+        values = [float(bar[k]) for k in KEYS[1:]]
+        return (all(math.isfinite(v) for v in values)
+                and min(values[:4]) > 0 and min(values[4:]) >= 0
+                and bar["low"] <= min(bar["open"], bar["close"])
+                <= max(bar["open"], bar["close"]) <= bar["high"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def save(code, bars, source="last.js", path=None):
+    """按代码/日期增量合并；年度源优先，旧响应无法删除较新的日期。"""
+    priority = 1 if source == "last.js" else 2
+    now = datetime.now().isoformat(timespec="seconds")
+    today = now[:10]
+    closed = datetime.now().hour * 60 + datetime.now().minute >= 15 * 60 + 5
+    with connect(path) as conn:
+        for bar in bars:
+            if not valid(bar) or bar["date"] > today or (bar["date"] == today and not closed):
+                continue
+            previous = conn.execute("SELECT priority FROM board_bar_source WHERE board=? AND date=?",
+                                    (str(code), bar["date"])).fetchone()
+            if previous and previous[0] > priority:
+                continue
+            conn.execute("INSERT OR REPLACE INTO board_kline VALUES(?,?,?,?,?,?,?,?)",
+                         (str(code), *(bar[k] for k in KEYS)))
+            conn.execute("INSERT OR REPLACE INTO board_bar_source VALUES(?,?,?,?,?)",
+                         (str(code), bar["date"], source, priority, now))
+    conn.close()
+
+
+def load(code, path=None):
+    with connect(path) as conn:
+        rows = conn.execute("""SELECT b.date,b.open,b.close,b.high,b.low,b.volume,b.amount
+            FROM board_kline b JOIN board_bar_source s ON b.board=s.board AND b.date=s.date
+            WHERE b.board=? ORDER BY b.date""", (str(code),)).fetchall()
+    conn.close()
+    return [dict(zip(KEYS, row)) for row in rows]
+
+
+def calendar_from_db(asof, path=None, snapshot=None):
+    with sqlite3.connect(path or config.KLINE_DB, timeout=30) as conn:
+        counts = conn.execute("SELECT date,COUNT(*) FROM kline WHERE date<=? GROUP BY date ORDER BY date", (asof,)).fetchall()
+    conn.close()
+    threshold = max((n for _, n in counts), default=0) * .5
+    calendar = [d for d, n in counts if n >= threshold]
+    # quick收盘使用有效收市报价补出的完成K在内存中；模型已核验的信号日
+    # 可能尚未写入股票历史库。沿用模型日期，不凭自然日推算交易日。
+    rows = (snapshot or {}).get("stocks") or []
+    if rows and sum(s.get("signal_date") == asof for s in rows) >= len(rows)*.6:
+        calendar = sorted(set(calendar + [asof]))
+    return calendar
+
+
+def calculate(bars, calendar, asof):
+    calendar = sorted(set(d for d in calendar if d <= asof))
+    # 重复日期、非交易日、未完成当日均不允许污染窗口。
+    by_date = {b["date"]: b for b in bars if valid(b) and b["date"] in calendar}
+    wanted = calendar[-WINDOW:]
+    dates = sorted(by_date)
+    result = dict(version=VERSION, asof=dates[-1] if dates else None,
+                  expected_asof=asof, usable_bars=len(dates), ready=False,
+                  state="待核验", trend_online=None, initial_strength=None,
+                  weakening=None, pullback=None)
+    if not calendar or calendar[-1] != asof or len(wanted) < WINDOW:
+        result["reason"] = "共同交易日历不足22日或未对齐"
+        return result
+    missing = [d for d in wanted if d not in by_date]
+    if missing:
+        result.update(reason="最新完成日线缺失" if asof in missing else "历史窗口有缺口",
+                      missing_dates=missing)
+        return result
+    ks = [by_date[d] for d in wanted]
+    closes = [b["close"] for b in ks]
+    average = lambda length, offset=0: sum(closes[len(closes)-length-offset:len(closes)-offset]) / length
+    ma5, ma10, ma20 = [average(n) for n in (5, 10, 20)]
+    prev5, prev10, prev20 = [average(n, 1) for n in (5, 10, 20)]
+    online = ma5 > ma10 > ma20 and ma20 > prev20 and closes[-1] >= ma10
+    previous = prev5 > prev10 > prev20 and prev20 > average(20, 2) and closes[-2] >= prev10
+    atr = sum(max(ks[i]["high"]-ks[i]["low"], abs(ks[i]["high"]-ks[i-1]["close"]),
+                  abs(ks[i]["low"]-ks[i-1]["close"])) for i in range(2, 22)) / 20
+    touched = online and previous and ks[-1]["low"] <= ma10 <= ks[-1]["high"]
+    near = online and previous and atr > 0 and 0 <= (closes[-1]-ma10)/atr <= .4
+    initial = online and not previous
+    weakening = previous and not online
+    result.update(ready=True, reason=None, trend_online=online, previous_online=previous,
+                  initial_strength=initial, weakening=weakening, pullback=bool(touched or near),
+                  pullback_kind="触及MA10收回" if touched else "接近MA10" if near else None,
+                  state="初步转强" if initial else "回踩观察" if touched or near else
+                  "趋势在线" if online else "趋势走弱" if weakening else "趋势未在线",
+                  close=closes[-1], low=ks[-1]["low"], ma5=ma5, ma10=ma10, ma20=ma20,
+                  ma20_prev=prev20, atr20=atr,
+                  ma10_distance_atr=(closes[-1]-ma10)/atr if atr > 0 else None,
+                  ma10_distance_pct=(closes[-1]/ma10-1)*100,
+                  ret1=(closes[-1]/closes[-2]-1)*100,
+                  ret5=(closes[-1]/closes[-6]-1)*100,
+                  ret20=(closes[-1]/closes[-21]-1)*100)
+    return result
+
+
+def parse_year(code, year):
+    url = f"http://d.10jqka.com.cn/v6/line/bk_{code}/01/{year}.js"
+    raw = datafeed.http_get(url, headers={"Referer": "http://q.10jqka.com.cn/"},
+                            encoding="gbk", timeout=8, retry=0)
+    match = re.search(r"\((.*)\)\s*;?\s*$", raw.strip(), re.S)
+    obj = json.loads(match.group(1)) if match else {}
+    rows = []
+    for item in (obj.get("data") or "").split(";"):
+        p = item.split(",")
+        if len(p) < 7:
+            continue
+        try:
+            d = p[0]
+            d = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d
+            bar = dict(zip(KEYS, [d, float(p[1]), float(p[4]), float(p[2]), float(p[3]),
+                                 float(p[5] or 0), float(p[6] or 0)]))
+            if valid(bar) and d.startswith(str(year)):
+                rows.append(bar)
+        except ValueError:
+            continue
+    return obj.get("name"), rows
+
+
+def observe(code, name, calendar, asof, fetch=True, path=None):
+    bars = load(code, path)
+    result = calculate(bars, calendar, asof)
+    if result["ready"] or not fetch or result.get("reason") == "共同交易日历不足22日或未对齐":
+        return result
+    with connect(path) as conn:
+        last = conn.execute("SELECT name,target,checked,error FROM board_fetch_state WHERE board=?", (str(code),)).fetchone()
+    conn.close()
+    # 失败/缺口也记录，避免每轮重复补拉。下一次5分钟扫描可重试。
+    if last and last[0] == name and last[1] == asof and time.time()-last[2] < 300:
+        result["fetch_error"] = last[3]
+        return result
+    error = None
+    try:
+        if not bars:
+            returned, rows = datafeed.fetch_ths_board_kline(code)
+            if returned != name:
+                raise ValueError(f"指数名称未对齐：{returned!r} / {name!r}")
+            save(code, rows, path=path)
+        if not calculate(load(code, path), calendar, asof)["ready"]:
+            # 跨年窗口先补前一年，再补当年。年度接口无name时以已核验目录代码绑定。
+            years = sorted(set(d[:4] for d in calendar[-WINDOW:]))
+            for year in years:
+                returned, rows = parse_year(code, year)
+                if returned and returned != name:
+                    raise ValueError(f"年度指数名称未对齐：{returned!r} / {name!r}")
+                save(code, rows, source=year+".js", path=path)
+    except Exception as exc:
+        error = str(exc)
+    with connect(path) as conn:
+        conn.execute("INSERT OR REPLACE INTO board_fetch_state VALUES(?,?,?,?,?)",
+                     (str(code), name, asof, time.time(), error))
+    conn.close()
+    result = calculate(load(code, path), calendar, asof)
+    result["fetch_error"] = error
+    return result
+
+
+def identities():
+    """只使用同花顺目录的精确同名映射；行业不映射到上位行业。"""
+    result = {}
+    try:
+        for code, name in datafeed.scan_ths_boards().items():
+            if datafeed._theme_ok(name):
+                result["theme:"+name] = str(code)
+    except (OSError, ValueError, RuntimeError):
+        pass
+    try:
+        blob = json.loads(config.THS_INDUSTRY_CACHE.read_text(encoding="utf-8"))
+        for code, name in (blob.get("detail") or {}).items():
+            # thshy目录中的881xxx同时是本源行业指数代码。
+            if re.fullmatch(r"881\d{3}", str(code)):
+                result["industry:"+name] = str(code)
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def attach(snapshot, calendar=None, fetch=True, path=None):
+    asof = (snapshot.get("strength_model") or {}).get("asof")
+    if not asof:
+        return {}
+    if calendar is None:
+        saved = (snapshot.get("board_trend_model") or {}).get("calendar") or []
+        calendar = saved if saved and saved[-1] == asof else calendar_from_db(asof, path, snapshot)
+    mapping = identities()
+    boards = snapshot.get("board_catalog") or []
+    candidates = [b for b in boards if b["id"] in mapping]
+
+    def work(board):
+        code = mapping[board["id"]]
+        try:
+            state = observe(code, board["name"], calendar, asof, fetch=fetch, path=path)
+        except (sqlite3.Error, ValueError, OSError) as exc:
+            state = dict(ready=False, state="待核验", reason=str(exc), expected_asof=asof)
+        state.update(code=code, source="同花顺概念指数（含非主板成员）" if board["type"] == "theme"
+                     else "同花顺行业指数（与当前行业精确同名）")
+        board["index_trend"] = state
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(work, candidates))
+    for board in boards:
+        if board["id"] not in mapping:
+            board["index_trend"] = None
+        board["member_diffusion"] = bool(board.get("ranking_eligible") and
+                                         board.get("trend_state") == "持续扩散")
+    model = dict(version=VERSION, asof=asof, mapped=len(candidates),
+                 calendar=sorted(set(d for d in calendar if d <= asof))[-WINDOW:],
+                 ready=sum(bool((b.get("index_trend") or {}).get("ready")) for b in boards),
+                 member_only=len(boards)-len(candidates),
+                 pending=sum(not (b.get("index_trend") or {}).get("ready") for b in candidates),
+                 trend_online=sum(bool((b.get("index_trend") or {}).get("trend_online")) for b in boards),
+                 source="同花顺指数完成日线，本地按日期增量保存",
+                 criterion="MA5>MA10>MA20，MA20较前日上升，收盘≥MA10；前日同口径",
+                 atr_basis="20个含跳空TR的简单平均；22日连续共同交易日窗口",
+                 pullback_criterion="前日与当前趋势在线；当日触及MA10收回或收盘距MA10≤0.4ATR；仅观察",
+                 breadth_basis="当前有效主板成员的近3日趋势比例；非历史全市场成分回测")
+    snapshot["board_trend_model"] = model
+    return model

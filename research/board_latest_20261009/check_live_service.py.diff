@@ -1,0 +1,41 @@
+--- check_live_service.py.before
++++ check_live_service.py
+@@ -13,6 +13,8 @@
+ import session_context
+ import board_trend
+ import board_center
++import board_quote
++from datetime import datetime
+ 
+ 
+ def get(url):
+@@ -72,6 +74,29 @@
+             if idx['pullback_atr'] is not None:
+                 assert idx['pullback_atr'] > 0
+                 assert idx['episode_start'] <= idx['pullback_atr_asof'] < idx['pullback_start'] <= idx['asof']
++        current = b.get('index_current')
++        if idx:
++            assert current is not None, '板块缺少最新指数判断入口'
++        if current and current.get('ready') and current.get('mode') == 'current':
++            quote = b['index_quote']
++            captured = datetime.fromisoformat(served['board_trend_model']['captured_at'])
++            assert board_quote.freshness(quote, captured, served['board_trend_model']['phase']) is None
++            assert current['quote_at'] == quote['quote_at'] and current['code'] == idx['code'] == quote['code']
++            assert current['name'] == b['name'] == quote['name']
++            bars = [k for k in board_trend.load(idx['code']) if k['date'] < quote['date']]
++            assert abs(bars[-1]['close']-quote['previous_close']) <= .01
++            if current['confirmation'] != '收盘确认':
++                for period in (5,10,20):
++                    assert abs(current['ma'+str(period)]-(sum(k['close'] for k in bars[-period+1:])+quote['price'])/period) < 1e-7
++                assert current['advance_signal'] == (current['ma5'] > current['ma10']
++                    and current['ma5'] > current['ma5_prev'] and current['ma10'] > current['ma10_prev']
++                    and current['close'] >= current['ma5'] and current['close'] >= current['ma10'])
++                assert current['repair_confirmed'] is False
++            if current['strong_advance']:
++                assert current['priority_observation'] and not current['weak']
++        elif current and not current.get('ready'):
++            assert not current.get('priority_observation') and not current.get('strong_advance')
++    assert served['board_trend_model']['current_ready'] == sum(bool((b.get('index_current') or {}).get('ready')) for b in served['board_catalog'])
+     assert snapshot['board_trend_model']['version'] == served['board_trend_model']['version'] == board_trend.VERSION
+     assert status['snapshot_board_trend_version'] == board_trend.VERSION
+     assert all(set(row["stock_strength_parts"]) == set(stock_strength.WEIGHTS)

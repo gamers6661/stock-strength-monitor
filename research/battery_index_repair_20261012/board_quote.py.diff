@@ -1,0 +1,31 @@
+--- before/board_quote.py
++++ board_quote.py
+@@ -11,7 +11,7 @@
+ import datafeed
+ 
+ CACHE = config.CACHE_DIR / 'ths_index_quotes.json'
+-VERSION = '同花顺指数缓存重验证3'
++VERSION = '同花顺指数缓存重验证4'
+ TOTAL_BUDGET_SECONDS = 60
+ BATCH_BUDGET_SECONDS = 45
+ 
+@@ -173,7 +173,10 @@
+             errors[code] = error or (cache_error(q, datetime.now()) if q else None)
+             if q and not errors[code]:
+                 fetched[code] = q
+-            if not errors[code] and needs_supplement(fetched.get(code),cached.get(code)):
++            # 网络拒绝不扩请求；批量节点有内容但时间异常时，正常交易中允许预算内补核。
++            invalid_clock = bool(q and errors[code] and not error)
++            if (not error and (not errors[code] or invalid_clock)
++                    and needs_supplement(fetched.get(code),cached.get(code))):
+                 supplemental.append(code)
+     if supplemental:
+         # Rotate the starting point each normal 5-minute bucket to avoid starving the same tail.
+@@ -195,6 +198,7 @@
+     for code,q in collect(supplemental,supplement,deadline):
+         if q:
+             fetched[code]=q
++            errors[code]=None
+     result = {}
+     now=datetime.now()
+     session=datafeed.session_label(now)

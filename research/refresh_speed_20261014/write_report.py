@@ -1,0 +1,67 @@
+import json
+from pathlib import Path
+from urllib.request import urlopen
+p=Path(__file__).parent
+s=json.loads(urlopen('http://127.0.0.1:8848/__status',timeout=10).read())
+rows=json.loads((p/'live_measurements.json').read_text('utf8'))
+assert len(rows)>=2 and all(r['pid']==s['pid'] for r in rows)
+assert s['refresh_interval_seconds']==120 and s['refresh_overrun_retry_seconds']==15
+lines=[]
+for i,r in enumerate(rows,1):
+    v=r['performance']
+    lines.append(f"| {i} | {v['seconds']:.3f} | {v['scan_seconds']:.3f} | {v['publish_seconds']:.3f} | {v['latest_quote_at']} | {v['published_at']} | {v['latest_quote_age_seconds_at_publish']:.3f} |")
+http=json.loads((p/'http_acceptance.json').read_text('utf8'))
+age=http.get('valid_quote_age_seconds_at_publish',{})
+report='''# 刷新速度优化与实测（2026-10-14）
+
+## 问题与原因
+
+旧记录一轮 276.241 秒，扫描 186.791 秒、发布 89.450 秒。五分钟的采集节奏与四分多钟的处理延迟叠加，页面刚更新时行情就已过去几分钟，下一轮发布前可能接近十分钟旧；并非每时每刻恰好落后十分钟。
+
+定位到四项实际问题：
+
+1. 轻量页仍带约 108 MB 的逻辑数据，打包后约 46 MB。板块成员重复带个股强度依据，旧雷达投影重复出现；完整图表和内部参考输入也随列表一起发送。
+2. 每轮 SQLite 发布文件约 709 MB，完整 JSON、压缩副本、详情和导出字段重复写入。当前强度 CSV 只用 19 列，但仍准备大量旧版导出字段。
+3. 独立的官方指数取数排在个股计算之后，网络等待未重叠。缓存读取已返回隔离副本，外层又重复深拷贝。
+4. 旧调度遇到超时或手动刷新重叠，会跳过已经错过的触发点，可能额外等待一个完整周期，进一步拉长数据年龄。
+
+## 已实施
+
+- 列表保留显示、排序和筛选字段；板块完整成员依据、完整 K 线仍由同版本详情读取。删除旧雷达在轻量数据中的重复强度投影，保留完整详情与离线导出。
+- 详情按条压缩保存；完整数据只保留压缩副本，按需解压，不在每轮写第二份巨大的未压缩副本。当前 CSV 只准备它实际使用的字段；旧版本 239 列导出仍通过原分支。
+- 官方指数报价与个股计算并行；取数完成后仍使用原来的来源、日期、覆盖与新鲜度校验。没有用本地时间替换源时间。
+- 缓存命中只做一次必要的副本隔离。隔离行为有回归测试，不能让页面修改回写缓存。
+- 目标周期从 300 秒改为 120 秒。超时或遇到另一轮占用时，最多等待 15 秒再尝试；始终单轮执行，不补跑已经错过的历史触发点，不积压任务。
+- 发布版本绑定实际加载的发布代码指纹，防止改文件尚未重启时出现相同版本号却对应不同打包内容。
+- 状态记录同时给出扫描耗时、发布耗时、最新源报价及发布时的真实报价年龄。
+
+## 冻结数据验证
+
+同一输入下，最终页面包由 46,044,062 字节降到 10,719,029 字节，减少约 77%。初步单独发布对比中，数据库由 709,382,144 字节降至 156,061,696 字节，准备耗时 51.545 秒降至 33.217 秒；该组是中间版本，最终效果以下面的真实运行记录为准。
+
+全市场股票分数与排序、板块分数与成员、强度参数及实现哈希完全一致。页面模板、前端客户端和雷达渲染脚本字节一致，没有修改布局、样式或强度规则。完整数值依据、完整图表与 CSV 保留在同版本详情。
+
+## 最终版本真实刷新
+
+| 轮次 | 总耗时秒 | 扫描秒 | 发布秒 | 最新源报价 | 发布时刻 | 发布时源报价年龄秒 |
+|---|---:|---:|---:|---|---|---:|
+'''+ '\n'.join(lines)+f'''
+
+运行 PID：{s['pid']}。目标周期 120 秒，超时重试间隔 15 秒。目标周期不等于强制每 120 秒发布；总耗时超过周期时，完成后短暂停顿再刷新，不会重叠执行。
+
+实际 HTTP 页面验收的 {age.get('count')} 只有效报价，在该轮发布时的源报价年龄：中位数 {age.get('median')} 秒，95% 分位 {age.get('p95')} 秒，最大 {age.get('maximum')} 秒。上表“最新源报价年龄”是最新一只的年龄，不能代替全部股票的年龄。
+
+## 验收证据与边界
+
+- 全量 607 项测试通过，退出码 0。35 项缓存、调度及单实例相关测试通过。
+- `frozen_projection_check.json`：固定输入评分、成员和界面源文件不变。
+- `http_acceptance.json`：实际页面/summary/详情/CSV 同版本；完整板块图表保留。
+- `live_measurements.json`：上表实际运行记录；`live_measurements_before_copy_fix.json` 是中间版本，不能当最终结果。
+- `live_check.txt`：完整服务一致性检查。
+- `source_diff.txt`：实际代码差异。
+
+这仍是批量计算系统，不能声称逐秒实时，也不能把“120 秒目标周期”当成“数据始终只旧 120 秒”。源请求耗时、计算、发布与下次采集之间的等待都会影响页面数据年龄；本轮已记录真实年龄供复核。网络超时和首次历史参考重建仍可能延长单轮耗时。
+'''
+(p/'速度优化与验收说明.md').write_text(report,'utf8')
+(p/'status_final.json').write_text(json.dumps(s,ensure_ascii=False,indent=2),'utf8')
+print('report saved for pid',s['pid'])

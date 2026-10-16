@@ -1,0 +1,40 @@
+from pathlib import Path
+
+def cut(s,a,b,put=''):
+    start=s.index(a);end=s.index(b,start)
+    return s[:start]+put+s[end:]
+
+p=Path('dashboard_template.html');s=p.read_text(encoding='utf-8')
+s=cut(s,'    <div class="card" id="legacy-board-quadrant"','    <div class="card" id="legacy-board-table"')
+s=cut(s,'function uiFund(f){','function uiCardStart','function uiFund(f){return "";}\n')
+s=cut(s,"  st.push('<span class=\"t\">资金口径",'  var sh=DATA.data_sources||{};')
+s=s.replace("    +' · 腾讯行情 '+srcState(sh.tencent_quotes)\n    +' · 东财资金 '+srcState(sh.eastmoney_fundflow)\n    +' · 新浪当日资金 '+srcState(sh.sina_fundflow)+'</b></span>');", "    +' · 腾讯行情 '+srcState(sh.tencent_quotes)+'</b></span>');")
+s=s.replace('今天的资金<br>去了哪里','价格趋势与<br>强势板块')
+s=s.replace('回踩、资金和风险单列','回踩、量价结构和风险单列')
+s=s.replace("var FACTORS_AUX=[['fund','主力资金分位（仅辅助）']];",'var FACTORS_AUX=[];')
+s=s.replace("  'fundpos':function(s){return s.fund_positive_all===true;},\n",'')
+s=s.replace("fundpos:'资金三期均正',",'').replace("fundpos:'东财日级主力净额近3/5/10日均正；未知不算正',",'').replace("'资金三期均正':{states:['fundpos']},",'')
+s=s.replace("    if(f.fundMin>0||f.fundMax<100){\n      var fu=fa.fund;\n      if(fu==null||fu===''){return false;}\n      if(n(fu)<f.fundMin||n(fu)>f.fundMax)return false;\n    }\n",'')
+s='\n'.join(line for line in s.split('\n') if not any(k in line for k in ('if(f.fundMin>0||f.fundMax<100)c++','if(f.fundMin>0||f.fundMax<100)out.push',"['资金分区间',function()", "if(k==='fund'){f.fundMin")))
+s=cut(s,"  var todayFundLabel=", "    +'<div class=\"detail-insight-section\"><h4>个股归属</h4>'", 
+    "  h+='<details class=\"detail-fold detail-insight\"><summary><span class=\"detail-insight-icon data\">▤</span>'\n    +'<span class=\"detail-insight-head\"><b>归属与数据来源</b><small>同花顺行业、题材及核对依据</small></span></summary>'\n    +'<div class=\"detail-fold-body detail-insight-body\">'\n")
+s=s.replace('资金按成交单分类，不证明机构持仓；所有盘中数据均为暂态。','盘中价格与量价结构均为暂态，正式日线与报价时间分别保留。')
+s=cut(s,"    +'<p><b>当日资金净额</b>", "    +'<p><b>盘中趋势/风险</b>")
+s=cut(s,'function attackFundText(s){','function renderAttackMonitor','function attackFundText(s){return "";}\n')
+s=s.replace("+'<div class=\"ui-card-foot\">'+uiFund(s.live_attack_fund)+'<span>'", "+'<div class=\"ui-card-foot\"><span>'")
+s=s.replace("uiMetric('综合进攻'","uiMetric('进攻强度'")
+s=s.replace('已有价格与资金综合进攻分；判断截至','价格进攻分；判断截至').replace('已有价格进攻分，资金不改变价格档位。','5/10/20日实际推进与相对速度的价格进攻分。')
+s=s.replace('行业、题材、资金分开展示','行业与题材分开展示')
+s=s.replace('资金、题材数量和所属最强概念不计入','题材数量和所属最强概念不计入')
+s=s.replace('可按资金 / 涨幅 / 五日线再叠加排序','可按涨幅 / 强度 / 五日线再叠加排序')
+s=cut(s,"  var cov=B.filter(function(x){return (x.fund_src||'').indexOf('东财')===0;}).length;",'  var best=B[0]||{};')
+s=cut(s,"    {l:'资金真实覆盖'", "    {l:'最强板块'")
+s=s.replace("'资金口径覆盖 '+cov+'/'+B.length+' · 点击行", "'价格、联动与动能 · 点击行")
+s='\n'.join(line for line in s.split('\n') if not any(k in line for k in ("+thSort('boards','fund'", "+'<td>'+hm(b.fund)+'</td>'", "+'资金强度：<b>'+esc(b.fund_src")))
+s=s.replace("['相对强度',fmt(b.rs,1),''],['资金强度',b.fund==null?'—':fmt(b.fund,1),''],", "['相对强度',fmt(b.rs,1),''],")
+s=s.replace("<th>成交额</th><th>主力净额</th>","<th>成交额</th>")
+s=cut(s,"      +'<td class=\"'+(n(t.main_net_sum)>0", "  document.getElementById('tb-themes').innerHTML", "      +'</tr>';});\n")
+s=cut(s,'  /* 四象限（只取东财真实资金口径','/* ── 板块明细抽屉 ── */','}\n\n')
+# 已隐藏的历史题材区域不再渲染资金流列表，保留空元素兼容旧初始化代码。
+s=s.replace('<h3>题材资金流 <small>组内主力净额合计</small></h3>','<h3>题材成交活跃度 <small>组内成交额合计</small></h3>')
+p.write_text(s,encoding='utf-8')

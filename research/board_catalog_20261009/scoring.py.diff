@@ -1,0 +1,10 @@
+--- scoring.py.before
++++ scoring.py
+@@ -1238,6 +1238,7 @@
+     snap["stock_count"] = len(stocks)
+     snap["board_catalog"] = board_center.build(stocks, quotes, theme_map, boards, fund_map,
+                                                model["asof"])
++    snap['board_catalog_version'] = board_center.VERSION
+     for item in snap["board_catalog"]:
+         item["member_quote_at"] = snap["quote_capture_at"]
+         item["fund_observed_at"] = (fund_meta.get("fetched_at") or snap["generated_at"])

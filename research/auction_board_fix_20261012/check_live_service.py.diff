@@ -1,0 +1,17 @@
+--- check_live_service.py.before
++++ check_live_service.py
+@@ -63,6 +63,14 @@
+     assert status["code_board_trend_version"] == board_trend.VERSION
+     assert status['code_board_catalog_version'] == board_center.VERSION
+     assert status['snapshot_board_catalog_version'] == snapshot['board_catalog_version'] == served['board_catalog_version'] == board_center.VERSION
++    if served['session'] in ('集合竞价', '竞价结束'):
++        import copy
++        expected_auction = copy.deepcopy(served)
++        board_center.attach_auction(expected_auction)
++        for actual, expected in zip(served['board_catalog'], expected_auction['board_catalog']):
++            assert actual.get('member_auction') == expected['member_auction'], '板块竞价汇总与有效个股报价不一致'
++            assert actual.get('members') == expected.get('members'), '板块竞价明细与有效个股报价不一致'
++        assert 'function boardAuctionMetrics(b)' in html and '竞价涨幅排序' in html
+     assert status['member_refresh']['interval_days'] == snapshot['member_refresh']['interval_days'] == served['member_refresh']['interval_days'] == config.MEMBER_REFRESH_DAYS == 7
+     industry_names = {b['name'] for b in served['board_catalog'] if b['type'] == 'industry'}
+     theme_names = {b['name'] for b in served['board_catalog'] if b['type'] == 'theme'}

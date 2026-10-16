@@ -1,0 +1,67 @@
+# Local runtime, generated market data and service state
+cache/
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.tmp
+*.lock
+.venv/
+venv/
+node_modules/
+logs/
+/dashboard.html
+/snapshot_report.md
+/push_report*.md
+/_*
+/(\{text
+/x.includes*
+
+# Local agent/browser artifacts and recovery copies
+.workbuddy/
+.playwright-cli/
+.codex/
+backups/
+output/
+preview/
+probe/
+**/baseline/
+**/before/
+**/after/
+**/fixture/
+**/isolated_test_cache/
+**/previous/
+
+# Research source and written reports are retained; frozen inputs and captures
+# are local evidence archives, not application source or fresh market data.
+/research/**/*.json
+!/research/**/definition*.json
+!/research/**/parameters*.json
+/research/**/*.jsonl
+/research/**/*.csv
+/research/**/*.gz
+/research/**/*.zip
+/research/**/*.html
+/research/**/*.png
+/research/**/*.jpg
+/research/**/*.webp
+/research/**/*.yaml
+/research/**/*.yml
+/research/**/*.txt
+/research/repair_entry_20261016/
+/*.png
+
+# Credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
+.DS_Store
+Thumbs.db

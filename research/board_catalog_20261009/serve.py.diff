@@ -1,0 +1,34 @@
+--- serve.py.before
++++ serve.py
+@@ -39,6 +39,7 @@
+ import wyckoff_structure
+ import session_context
+ import board_trend
++import board_center
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -77,6 +78,7 @@
+ }
+ STATE = {"port": None, "pid": os.getpid(), "code_model_version": strength.VERSION,
+          "code_board_trend_version": board_trend.VERSION,
++         "code_board_catalog_version": board_center.VERSION,
+          "code_strength_version": stock_strength.VERSION,
+          "code_intraday_model_version": intraday.VERSION,
+          "code_attack_model_version": attack_model.LIVE_VERSION,
+@@ -118,6 +120,7 @@
+                 "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
+                 "snapshot_daily_asof": (snapshot.get("strength_model") or {}).get("asof"),
+                 "snapshot_board_trend_version": (snapshot.get("board_trend_model") or {}).get("version"),
++                "snapshot_board_catalog_version": snapshot.get('board_catalog_version'),
+                 "snapshot_board_index_ready": (snapshot.get("board_trend_model") or {}).get("ready"),
+                 "snapshot_consolidation_version": (snapshot.get('trend_consolidation') or {}).get('version'),
+                 "snapshot_consolidation_count": (snapshot.get('trend_consolidation') or {}).get('count'),
+@@ -378,6 +381,7 @@
+                 )
+                 matches = (snapshot.get("factor_model_version") == strength.VERSION
+                            and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
++                           and snapshot.get('board_catalog_version') == board_center.VERSION
+                            and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+                            and (snapshot.get('wyckoff_structure') or {}).get('version') == wyckoff_structure.VERSION
+                            and (snapshot.get('session_context') or {}).get('version') == session_context.VERSION

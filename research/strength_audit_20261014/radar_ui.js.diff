@@ -1,0 +1,54 @@
+--- before/radar_ui.js
++++ after/radar_ui.js
+@@ -27,6 +27,20 @@
+  if(field==='scope'){v.sort=value==='day_attack'?'day_attack':key==='stocks'?v.axis:value==='emotion'?'emotion':'trend';}
+  v.limit=100;msRender(key);
+ }
++// Keep the composing input alive through compositionend and its trailing input event.
++function msSearchStart(input){clearTimeout(input._msCommitTimer);input._msComposing=true;input._msEnding=false;}
++function msSearchInput(event,input,key,field){
++ MS_VIEW[key][field]=input.value;
++ if(event.isComposing||input._msComposing||input._msEnding)return;
++ msUpdate(key,field,input.value);
++}
++function msSearchEnd(input,key,field){
++ input._msComposing=false;input._msEnding=true;
++ clearTimeout(input._msCommitTimer);
++ input._msCommitTimer=setTimeout(function(){input._msEnding=false;msUpdate(key,field,input.value);},0);
++}
++document.addEventListener('compositionstart',function(event){var input=event.target;if(input.getAttribute&&input.getAttribute('data-ms-search-key'))msSearchStart(input);});
++document.addEventListener('compositionend',function(event){var input=event.target,key=input.getAttribute&&input.getAttribute('data-ms-search-key');if(key)msSearchEnd(input,key,input.getAttribute('data-ms-search-field'));});
+ function msStockAxis(axis){var v=MS_VIEW.stocks;v.axis=axis;if(v.scope==='trend'||v.scope==='emotion')v.scope=axis;v.sort=v.scope==='day_attack'?'day_attack':axis;v.limit=100;msRender('stocks');}
+ function msStockAll(checked){MS_VIEW.stocks.scope=checked?'all':MS_VIEW.stocks.axis;MS_VIEW.stocks.sort=MS_VIEW.stocks.axis;MS_VIEW.stocks.limit=100;msRender('stocks');}
+ function msToggleBoard(id){var b=boardById(id);if(!b)return;STATE.boardFilterId=null;var v=MS_VIEW.stocks,field=b.type==='industry'?'industryIds':'themeIds',idx=v[field].indexOf(id);if(idx<0)v[field].push(id);else v[field].splice(idx,1);v.openKinds[b.type]=true;v.limit=100;msRender('stocks');}
+@@ -39,10 +53,10 @@
+  if(key==='stocks')h+=msSelect('scope',[[v.axis,'当前榜强势'],['focus','任一强势'],['both','仅看双强'],['all','全部成员'],['day_attack','当日异动']],key,'筛选范围');
+ 
+  else h+=msSelect('scope',[['focus','全部强势'],['trend','趋势强'],['emotion','情绪强'],['all','全部板块']],key,'强势范围')+msSelect('sort',[['trend','趋势排序'],['emotion','情绪排序']],key,'强势排序');
+- h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" oninput="msUpdate(\''+key+'\',\'q\',this.value)"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
++ h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="'+key+'" data-ms-search-field="q" oninput="msSearchInput(event,this,\''+key+'\',\'q\')"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
+ }
+ function msDirectionPicker(){var v=MS_VIEW.stocks,selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
+- var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺确认成员 · 同类多选取并集，行业与题材取交集</p></div><button class="btn ms-clear-button" onclick="msClearDirections()">清除方向</button></div><div class="ms-direction-search-wrap"><span aria-hidden="true">⌕</span><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" oninput="MS_VIEW.stocks.boardQuery=this.value;msRender(\'stocks\')"></div>';
++ var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺确认成员 · 同类多选取并集，行业与题材取交集</p></div><button class="btn ms-clear-button" onclick="msClearDirections()">清除方向</button></div><div class="ms-direction-search-wrap"><span aria-hidden="true">⌕</span><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" data-ms-search-key="stocks" data-ms-search-field="boardQuery" oninput="msSearchInput(event,this,\'stocks\',\'boardQuery\')"></div>';
+  h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向 · 按当前筛选范围展示股票</span>')+'</div>';
+  h+='<details class="ms-direction-browser" '+(q||v.browseOpen?'open':'')+'><summary onclick="MS_VIEW.stocks.browseOpen=!this.parentNode.open">浏览行业 / 题材 <span>展开目录</span></summary><div class="ms-direction-browser-content">';
+  ['industry','theme'].forEach(function(kind){var rows=(DATA.board_catalog||[]).filter(function(b){return b.type===kind&&(!q||b.name.indexOf(q)>=0);}),rank=((msModel().boards||{}).sorts||{}).trend||[],order={};rank.forEach(function(id,i){order[id]=i;});rows.sort(function(a,b){return (order[a.id]==null?1e9:order[a.id])-(order[b.id]==null?1e9:order[b.id]);});
+@@ -70,12 +84,14 @@
+ }
+ function msStamp(){var m=msModel();return esc(m.mode||'')+' · 行情截至 '+esc(String((DATA.direction_changes||{}).source_at||m.at||'—').slice(0,19))+' · 沪深主板';}
+ function msDelta(value,digits){return value==null?'—':(value>0?'+':'')+fmt(value,digits);}
+-function msRender(key){var v=MS_VIEW[key],rows=msRows(key),html=key==='stocks'?msDirectionPicker():'';
++function msRender(key){
++ var host=document.getElementById(key==='industry'?'board-center':key==='theme'?'theme-center':'ms-stock-host'),focused=document.activeElement;
++ if(host&&focused&&host.contains(focused)&&(focused._msComposing||focused._msEnding))return;
++ var v=MS_VIEW[key],rows=msRows(key),html=key==='stocks'?msDirectionPicker():'';
+  html+=msTools(key);
+  var description=key==='stocks'?(v.scope==='day_attack'?'按当日进攻强度排序；当日异动不等于趋势强或情绪强。':v.axis==='trend'?'历史上涨力度与结构决定趋势排名；当天大涨不是入榜要求。':'当日进攻、区间保持与近期活跃决定情绪排名；不要求历史趋势强。'):'同花顺确认成员共振；官方指数在详情中单列。';
+  html+='<p class="ms-muted">'+description+' 当前 '+rows.length+' 项。</p>'+msTable(rows,key,v.limit);
+- var host=document.getElementById(key==='industry'?'board-center':key==='theme'?'theme-center':'ms-stock-host');
+- if(host){var focused=document.activeElement,label=focused&&focused.getAttribute('aria-label'),position=focused&&focused.selectionStart;host.innerHTML=html;if(label==='强势搜索'||label==='搜索板块题材'){var next=host.querySelector('[aria-label="'+label+'"]');next.focus();if(position!=null)next.setSelectionRange(position,position);}}
++ if(host){var label=focused&&focused.getAttribute('aria-label'),start=focused&&focused.selectionStart,end=focused&&focused.selectionEnd;host.innerHTML=html;if(label==='强势搜索'||label==='搜索板块题材'){var next=host.querySelector('[aria-label="'+label+'"]');if(next){next.focus({preventScroll:true});if(start!=null)next.setSelectionRange(start,end);}}}
+ }
+ function renderBoards(){document.getElementById('bd-metrics').innerHTML='<div class="card"><h3>行业强度</h3><p>'+msStamp()+'</p></div>';msRender('industry');}
+ function renderThemesPage(){msRender('theme');}

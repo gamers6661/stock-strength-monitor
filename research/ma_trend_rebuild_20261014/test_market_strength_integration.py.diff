@@ -1,0 +1,10 @@
+--- before/test_market_strength_integration.py
++++ after/test_market_strength_integration.py
+@@ -20,6 +20,7 @@
+     vm.createContext(ctx);vm.runInContext(FORMATS,ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);vm.runInContext(ACTION,ctx);console.log(JSON.stringify({els:els,ids:ctx.msRows('stocks').map(r=>r.code),drawer:ctx.drawer,pane:ctx.pane,view:ctx.MS_VIEW.stocks,exported:ctx.exported,formats:[ctx.fmt(null),ctx.pct(null),ctx.fmt(0),ctx.pct(0)]}));"""
+     # Rendering assertions use a minimal DOM; browser IME events are checked separately.
+     script=script.replace('activeElement:null,', 'activeElement:null,addEventListener(){},')
++    script=script.replace("vm.runInContext(ACTION,ctx)", "vm.runInContext(fs.readFileSync('ma_trend_ui.js','utf8'),ctx);vm.runInContext(ACTION,ctx)")
+     script=script.replace('INPUT',json.dumps(s,ensure_ascii=False)).replace('FORMATS',json.dumps(formats)).replace('ACTION',json.dumps(action))
+     r=subprocess.run(['node','--input-type=commonjs','-'],input=script,capture_output=True,text=True,encoding='utf8',check=True)
+     return json.loads(r.stdout)

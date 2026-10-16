@@ -1,0 +1,19 @@
+--- before/scoring.py
++++ scoring.py
+@@ -271,6 +271,7 @@
+     snap["generated_at"] = completed_at.strftime("%Y-%m-%d %H:%M:%S")
+     price_only.sanitize(snap)
+     snap["close_refresh_version"] = CLOSE_REFRESH_VERSION
++    radar.build_opportunities(snap,quotes,pool,{},formal,calendar,previous_snapshot,persist=True)
+     config.atomic_write_text(config.SNAPSHOT_JSON,
+                              json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     print(f"[RUN] 集合竞价有效报价 {len(observed)}/{len(codes)}；沿用完成日线与收盘名单")
+@@ -1358,6 +1359,8 @@
+                             daily_history_loader=lambda code: history_cache[code] if code in history_cache else df.load_kline(conn,'kline','code',code))
+     price_only.sanitize(snap)
+     session_context.attach(snap,quotes,formal,formal_calendar,contexts=price_contexts)
++    radar.build_opportunities(snap,quotes,opportunity_pool,price_contexts,formal,
++                             formal_calendar,previous_snapshot,persist=True)
+ 
+     timer.mark("盘中与结构", "观察留档与研究")
+     append_history(snap)

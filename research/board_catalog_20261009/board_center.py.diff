@@ -1,0 +1,61 @@
+--- board_center.py.before
++++ board_center.py
+@@ -5,6 +5,22 @@
+ 
+ import config
+ import stock_strength
++
++VERSION = '板块目录补全1'
++
++
++def _catalog():
++    """目录入口与个股的首个细分归属分开，零覆盖板块也保留查询入口。"""
++    import datafeed
++    out = {'industry': set(), 'theme': set()}
++    for kind, path in (('industry',config.THS_INDUSTRY_CACHE),('theme',config.THS_CONCEPT_CACHE)):
++        try:
++            blob = json.loads(path.read_text(encoding='utf-8'))
++            names = set((blob.get('detail') or {}).values())
++            out[kind] = {n for n in names if n and (kind == 'industry' or datafeed._theme_ok(n))}
++        except (OSError, ValueError):
++            pass
++    return out
+ 
+ 
+ def _cache(filename):
+@@ -51,12 +67,23 @@
+     industry_detail_map, industry_stat, industry_checked = _cache("ths_industry_members.json")
+     detail_themes = _reverse(theme_detail_map)
+     detail_industries = _reverse(industry_detail_map)
++    catalog = _catalog()
++    catalog_ids = set()
++    for kind, names in catalog.items():
++        detail = detail_themes if kind == 'theme' else detail_industries
++        for name in names:
++            board_id = kind+':'+name
++            catalog_ids.add(board_id)
++            # 只取该名称在同花顺详情中的真实成员，不把细分行业改名成上位行业。
++            official = detail.get(name,set()) & pool
++            pool_groups[board_id].update(official)
++            groups[board_id].update(official & set(valid))
+     index = {b["name"]: b for b in index_boards}
+     market_ret5 = _avg(stocks, "ret5") or 0
+     market_trend = mean(bool(s.get("trend_online")) for s in stocks) * 100 if stocks else 0
+     market_active = mean(bool(s.get("emotion_strong")) for s in stocks) * 100 if stocks else 0
+     out = []
+-    for board_id in sorted(set(pool_groups) | set(groups)):
++    for board_id in sorted(set(pool_groups) | set(groups) | catalog_ids):
+         kind, name = board_id.split(":", 1)
+         codes = sorted(groups.get(board_id, ()))
+         members = [valid[c] for c in codes]
+@@ -133,6 +160,10 @@
+                                          -r["change_pct"]))
+         index_ref = index.get(name) if kind == "theme" else None
+         out.append({"id": board_id, "type": kind, "name": name,
++                    "catalog_listed": board_id in catalog_ids,
++                    "membership_stale": name in failed,
++                    "coverage_state": ('成员待补齐' if not pool_codes else
++                                       '日线待补齐' if not members else '已覆盖'),
+                     "wide": kind == "theme" and len(members) > 60,
+                     "source_members": source_count, "source_basis": source_basis,
+                     "source_complete": detail_reliable,

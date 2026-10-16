@@ -1,0 +1,140 @@
+--- dashboard_template.html.before
++++ dashboard_template.html
+@@ -4302,17 +4302,39 @@
+   setTimeout(auditSticky,90);
+ }
+ /* 板块中心 V4：行业/题材与成员共用 board_catalog.id。 */
+-var BC_KIND='industry',BC_SORT='trend',BC_SEARCH='',BC_FILTER='watch';
++var BC_KIND='industry',BC_SORT=['集合竞价','竞价结束'].indexOf(sessionNow())>=0?'today':'trend',BC_SEARCH='',BC_FILTER='watch';
+ var BC_FILTERS=[['watch','重点观察'],['advance','强势推进'],['startup','沿5日线启动'],['pullback','回踩观察'],['support','20日支撑'],['weak','已转弱'],['diffusion','成员扩散'],['all','全部']];
+ function boardCatalog(){return DATA.board_catalog||[];}
+ function boardById(id){return boardCatalog().filter(function(b){return b.id===id;})[0];}
+ function boardDecision(b){return b.index_current||{ready:false,state:'指数待更新',reason:'尚未取得当日指数判断'};}
++function boardAuctionMode(){return ['集合竞价','竞价结束'].indexOf(sessionNow())>=0;}
++function boardAuction(b){
++  var q=b.member_auction,now=new Date(),phase=sessionNow();
++  var today=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
++  var bridge=phase==='早盘'&&['集合竞价','竞价结束'].indexOf(DATA.session)>=0;
++  if(!q&&boardAuctionMode())q={ready:false,date:today,valid_count:0,pool_count:n(b.pool_members),coverage_pct:0,
++    basis:'已覆盖主板成员竞价等权；不代表官方指数',reason:'竞价成员报价待更新'};
++  if(!q||q.date!==today||(!boardAuctionMode()&&!bridge))return null;
++  var at=parseDT(q.earliest_quote_at),age=at?(now-at)/1000:Infinity;
++  var current=q.ready&&at&&age>=-n((DATA.intraday_model||{}).max_quote_future_seconds,90)
++    &&(bridge||age<=n((DATA.intraday_model||{}).max_quote_age_seconds,600));
++  return Object.assign({},q,{ready:!!current,label:bridge?'主板成员竞价参考':'主板成员竞价等权',
++    reason:q.reason||(!current?'竞价报价过期，等待更新':null)});
++}
++function boardTodayValue(b){var a=boardAuction(b);return a?(a.ready?a.change_pct:null):boardAuctionMode()?null:b.member_today;}
++function boardAuctionNote(a){return a.basis+'；有效 '+a.valid_count+'/'+a.pool_count+'只，覆盖 '+fmt(a.coverage_pct,1)+'%；源报价 '+(a.earliest_quote_at||'无')+' 至 '+(a.quote_at||'无')+'。'+(a.reason||'');}
++function boardAuctionMetrics(b){
++  var a=boardAuction(b);if(!a)return '';
++  return uiMetric(a.label,a.ready?pct(a.change_pct,2):'—','',boardAuctionNote(a))
++    +uiMetric('竞价上涨占比',a.ready?fmt(a.up_pct,1):'—','%',boardAuctionNote(a))
++    +uiMetric('竞价覆盖',a.valid_count+'/'+a.pool_count,'只',boardAuctionNote(a));
++}
+ function boardTodayLabel(b){return b.member_quote_at&&String(b.member_quote_at).slice(0,10)===String(DATA.generated_at).slice(0,10)?'成员今日':'上轮等权';}
+ function boardMatches(b,key){
+   if(key==='all')return true;
+   if(!b.ranking_eligible)return false;
+   if(key==='diffusion')return !!b.member_diffusion;
+-  var t=boardDecision(b);
++  var t=boardAuctionMode()?b.index_trend||{}:boardDecision(b);
+   return !!t.ready&&!!t[{watch:'priority_observation',advance:'strong_advance',startup:'startup',pullback:'pullback',support:'support_observation',weak:'weak'}[key]];
+ }
+ function boardIndexNote(t){
+@@ -4361,7 +4383,7 @@
+   return h;
+ }
+ function boardCard(b){
+-  var t=boardDecision(b),valid=n(b.valid_members),ready=t.ready;
++  var t=boardDecision(b),valid=n(b.valid_members),ready=t.ready,a=boardAuction(b);
+   var metrics=b.index_trend?
+     uiMetric(t.mode==='current'?'指数当日':'指数5日',ready?pct(t.mode==='current'?t.change_pct:t.ret5,1):'—','','同花顺同名指数；源报价 '+(t.quote_at||t.asof||'未知')+'，含非主板成员。')
+     +uiMetric('距MA10',ready&&t.ma10_distance_atr!=null?sgn(t.ma10_distance_atr,2):'—','ATR','现价与滚动MA10距离 / 前一完成日ATR20；回踩缓冲另用固定基准。'):
+@@ -4371,10 +4393,10 @@
+     +'<div class="bc-card-head"><button type="button" class="bc-name" onclick="showBoardById(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>'
+     +'<span class="bc-kind">'+(b.type==='industry'?'行业':'题材')+'</span></div>'
+     +'<div class="ui-tags">'+boardTrendTags(b)+'</div>'
+-    +'<div class="ui-metrics">'+metrics
++    +'<div class="ui-metrics">'+boardAuctionMetrics(b)+metrics
+     +uiMetric('成员在线',fmt(b.trend_pct,0),'%',valid+'只有效主板成员中的趋势在线占比；日变化 '+sgn(b.trend_delta1_pp,1)+'个百分点。',b.trend_pct)+'</div>'
+     +'<div class="bc-card-foot"><span>'+valid+'只 · 覆盖 '+fmt(b.valid_coverage_pct,0)+'%</span>'
+-    +'<span title="'+esc(t.quote_at||t.reason||'')+'">'+(t.mode==='current'&&t.quote_at?'指数 '+esc(String(t.quote_at).slice(11,16)):boardTodayLabel(b)+' '+pct(b.member_today,1))+'</span></div></article>';
++    +'<span title="'+esc(a?boardAuctionNote(a):t.quote_at||t.reason||'')+'">'+(a?'竞价 '+esc(String(a.quote_at||'待更新').slice(11,16)||'待更新'):t.mode==='current'&&t.quote_at?'指数 '+esc(String(t.quote_at).slice(11,16)):boardTodayLabel(b)+' '+pct(b.member_today,1))+'</span></div></article>';
+ }
+ function setBoardFilter(key){BC_FILTER=key;renderBoards();renderThemesPage();}
+ function centerMarkup(kind,showTabs){
+@@ -4384,21 +4406,24 @@
+   boards.sort(function(a,b){
+     if(a.ranking_eligible!==b.ranking_eligible)return a.ranking_eligible?-1:1;
+     if(!a.ranking_eligible)return a.name.localeCompare(b.name);
+-    if(BC_SORT==='today')return n(b.member_today)-n(a.member_today)||n(b.emotion_pct)-n(a.emotion_pct);
++    if(BC_SORT==='today'){
++      var av=boardTodayValue(a),bv=boardTodayValue(b);
++      return (av==null)-(bv==null)||(av==null?0:bv-av)||a.name.localeCompare(b.name);
++    }
+     return n(a.trend_rank,1e9)-n(b.trend_rank,1e9)||a.name.localeCompare(b.name);
+   });
+   return '<div class="card bc-toolbar"><div class="row wrap" style="gap:8px;align-items:center">'
+     +(showTabs?'<button class="btn '+(kind==='industry'?'primary':'')+'" onclick="BC_KIND=\'industry\';renderBoards()">行业</button>'
+       +'<button class="btn '+(kind==='theme'?'primary':'')+'" onclick="BC_KIND=\'theme\';renderBoards()">题材</button>':'')
+     +'<button class="btn '+(BC_SORT==='trend'?'primary':'')+'" onclick="BC_SORT=\'trend\';renderBoards();renderThemesPage()">成员趋势排序</button>'
+-    +'<button class="btn '+(BC_SORT==='today'?'primary':'')+'" onclick="BC_SORT=\'today\';renderBoards();renderThemesPage()">今日热度</button>'
++    +'<button class="btn '+(BC_SORT==='today'?'primary':'')+'" onclick="BC_SORT=\'today\';renderBoards();renderThemesPage()">'+(boardAuctionMode()?'竞价涨幅排序':'今日热度')+'</button>'
+     +'<input id="bc-search-'+(showTabs?'boards':'themes')+'" aria-label="搜索板块" placeholder="搜索全部行业或题材" value="'+esc(BC_SEARCH)+'" '
+     +'oninput="updateBoardSearch(this,event)" class="bc-search"></div>'
+     +'<div class="bc-filters" role="group" aria-label="板块趋势筛选">'+BC_FILTERS.map(function(x){
+       return '<button type="button" data-board-filter="'+x[0]+'" aria-pressed="'+(BC_FILTER===x[0])+'" class="bc-filter '+(BC_FILTER===x[0]?'active':'')+'" onclick="setBoardFilter(\''+x[0]+'\')">'
+-        +x[1]+'<span>'+all.filter(function(b){return boardMatches(b,x[0]);}).length+'</span></button>';}).join('')+'</div>'
+-    +'<div class="bc-reference"><span>'+(BC_SEARCH?'全部目录查询':'最新指数结合历史趋势')+'</span>'
+-    +uiTag('筛选口径','','当前主标签及筛选使用当日有效指数报价，历史须最新22日连续对齐；至少6只有效主板成员。强势推进须MA5＞MA10、两线向上、现价站上两线。盘中不累计收盘确认日数；成员扩散单独保留日线标识。')
++        +(boardAuctionMode()&&x[0]!=='all'?'日线'+x[1]:x[1])+'<span>'+all.filter(function(b){return boardMatches(b,x[0]);}).length+'</span></button>';}).join('')+'</div>'
++    +'<div class="bc-reference"><span>'+(BC_SEARCH?'全部目录查询':boardAuctionMode()?'竞价涨幅观察 · 筛选沿用完成日线背景':'最新指数结合历史趋势')+'</span>'
++    +uiTag('筛选口径','',boardAuctionMode()?'竞价涨幅来自有效主板成员等权，至少6只并展示覆盖率；趋势筛选沿用最近完成日线，只作背景，不代表本次竞价转强。官方指数独立核验。':'当前主标签及筛选使用当日有效指数报价，历史须最新22日连续对齐；至少6只有效主板成员。强势推进须MA5＞MA10、两线向上、现价站上两线。盘中不累计收盘确认日数；成员扩散单独保留日线标识。')
+     +uiTag((DATA.member_refresh||{}).last_result==='failed'?'成员周更未完成':'成员每周更新',(DATA.member_refresh||{}).last_result==='failed'?'warn':'',
+       '成员名单每7天更新一次，避开交易窗口；下次检查 '+((DATA.member_refresh||{}).next_update_at||'待后台载入')+'。'
+       +((DATA.member_refresh||{}).error||'周内沿用缓存，行情和指数按原节奏刷新。'))
+@@ -4455,16 +4480,21 @@
+   renderBoards();renderThemesPage();
+ }
+ function boardMemberRows(b,codes){
+-  var by={};(b.members||[]).forEach(function(r){by[r.code]=r;});
++  var by={},auction=!!boardAuction(b);(b.members||[]).forEach(function(r){by[r.code]=r;});
+   if(!codes.length)return '<div class="empty" style="padding:10px 0">当前没有符合条件的成员</div>';
+   return '<div class="tw" style="border:0;background:transparent"><table><thead><tr><th class="l">个股</th>'
+-    +'<th>进攻强度</th><th>全体名次</th><th>板块名次</th><th>5日超额</th><th>20日超额</th><th>今日</th><th>当日情绪</th></tr></thead><tbody>'
+-    +codes.map(function(c){var r=by[c];if(!r)return '';return '<tr class="clickable" onclick="showStock(\''+jsq(c)+'\',\''+jsq(b.id)+'\')">'
++    +'<th>进攻强度</th><th>全体名次</th><th>板块名次</th><th>5日超额</th><th>20日超额</th><th>'+(auction?'竞价涨幅':'今日')+'</th><th>'+(auction?'上轮情绪':'当日情绪')+'</th></tr></thead><tbody>'
++    +codes.map(function(c){var r=by[c];if(!r)return '';var change=auction?r.auction_change_pct:r.change_pct;
++      var at=parseDT(r.auction_quote_at),a=boardAuction(b);
++      if(auction&&(!at||r.auction_quote_at<a.earliest_quote_at||
++          (new Date()-at)/1000 < -n((DATA.intraday_model||{}).max_quote_future_seconds,90)||
++          (boardAuctionMode()&&(new Date()-at)/1000>n((DATA.intraday_model||{}).max_quote_age_seconds,600))))change=null;
++      return '<tr class="clickable" onclick="showStock(\''+jsq(c)+'\',\''+jsq(b.id)+'\')">'
+       +'<td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+esc(c)+' · '+esc(r.role)+' · '+esc(r.strength_motion||'待观察')+'</span></td>'
+       +'<td>'+fmt(r.score,1)+'</td><td>'+n(r.global_rank)+'</td><td>'+n(r.rank)+'/'+n(b.valid_members)+'</td>'
+       +'<td class="'+cls(r.excess5)+'">'+(r.excess5==null?'—':sgn(r.excess5,1))+'</td>'
+       +'<td class="'+cls(r.excess20)+'">'+(r.excess20==null?'—':sgn(r.excess20,1))+'</td>'
+-      +'<td class="'+cls(r.change_pct)+'">'+pct(r.change_pct,1)+'</td>'
++      +'<td class="'+cls(change)+'" title="'+esc(auction?r.auction_quote_at||'竞价报价待更新':'')+'">'+(change==null?'—':pct(change,2))+'</td>'
+       +'<td>'+esc(r.emotion_heat||'数据不足')+'</td></tr>';}).join('')+'</tbody></table></div>';
+ }
+ function showBoardById(id){
+@@ -4478,14 +4508,14 @@
+     +uiMetric(idx.pullback_atr!=null?'回踩固定ATR':'ATR20',ready?fmt(idx.pullback_atr!=null?idx.pullback_atr:idx.atr20,2):'—','点',idx.pullback_atr!=null?'固定在 '+idx.pullback_atr_asof+'，不随本次回落放宽。':'20个含跳空真实波幅TR的简单平均。')+'</div>'
+     +(ready?'<div class="bc-line-values">'+(idx.mode==='current'?'最新指数 ':'收盘 ')+fmt(idx.close,2)+'<span>MA5 '+fmt(idx.ma5,2)+'</span><span>MA10 '+fmt(idx.ma10,2)+'</span><span>MA20 '+fmt(idx.ma20,2)+'</span></div>':'')+'</section>':
+       '<section class="card bc-detail"><h3>成员趋势观察</h3><div class="ui-tags">'+boardTrendTags(b)+'</div><p class="flat">未匹配同名指数，按主板成员观察。</p></section>')
+-    +'<section class="card ui-decision bc-detail"><h3>主板成员参与</h3><div class="ui-metrics">'
++    +'<section class="card ui-decision bc-detail"><h3>主板成员参与</h3><div class="ui-metrics">'+boardAuctionMetrics(b)
+     +uiMetric('成员在线',fmt(b.trend_pct,1),'%',n(b.valid_members)+'只有效成员中的趋势在线比例。',b.trend_pct)
+     +uiMetric('较前日',sgn(b.trend_delta1_pp,1),'点','当前有效成员的在线比例变化；成员范围按当前归属计算。')
+     +uiMetric('较全体主板',sgn(b.trend_vs_market_pp,1),'点','板块成员在线比例减全体有效主板在线比例。')
+     +uiMetric('有效成员',n(b.valid_members),'只','当前归集 '+n(b.pool_members)+'只，日线覆盖 '+fmt(b.valid_coverage_pct,1)+'%。')+'</div>'
+-    +'<div class="ui-tags">'+uiTag(boardTodayLabel(b)+' '+pct(b.member_today,1),'','已覆盖有效主板成员的等权涨跌幅；采集 '+(b.member_quote_at||'时间未知')+'。不参与指数日线筛选。')
++    +'<div class="ui-tags">'+(boardAuction(b)?uiTag(boardAuction(b).label,'',boardAuctionNote(boardAuction(b))):uiTag(boardTodayLabel(b)+' '+pct(b.member_today,1),'','已覆盖有效主板成员的等权涨跌幅；采集 '+(b.member_quote_at||'时间未知')+'。不参与指数日线筛选。')
+     +uiTag('涨停 '+n(b.limit_count)+'只','','已覆盖有效主板成员的当日涨停家数。')
+-    +uiTag('前三贡献 '+(b.positive_top3_share==null?'—':fmt(b.positive_top3_share,0)+'%'),'','上涨前三只的正收益之和 / 全部成员正收益之和；高比例可能由少数成员贡献。')+'</div></section>'
++    +uiTag('前三贡献 '+(b.positive_top3_share==null?'—':fmt(b.positive_top3_share,0)+'%'),'','上涨前三只的正收益之和 / 全部成员正收益之和；高比例可能由少数成员贡献。'))+'</div></section>'
+     +'<details class="detail-fold"><summary>数据与判断依据</summary><div class="detail-fold-body">'
+     +'<p>当前来源：'+esc(idx.source||'尚未取得有效的当日指数')+'；实际报价 '+esc(idx.quote_at||'—')+'。'+esc(idx.reason||'当前报价与前一完成日同源昨收一致。')+'</p>'
+     +'<p>完成日线背景：'+esc(daily.asof||'—')+' · '+esc(daily.state||'待核验')+'。历史状态只作背景，主标签及筛选跟随最新有效报价。'

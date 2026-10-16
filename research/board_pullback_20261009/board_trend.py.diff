@@ -1,0 +1,227 @@
+--- board_trend.py.before
++++ board_trend.py
+@@ -10,9 +10,149 @@
+ import config
+ import datafeed
+ 
+-VERSION = "板块趋势观察1"
++VERSION = "板块趋势观察2"
+ WINDOW = 22  # 当前/前一天的 MA20 斜率以及20个含跳空TR。
+ KEYS = ("date", "open", "close", "high", "low", "volume", "amount")
++RULES = dict(startup_days=3, shallow_atr=.3, deep_wick_atr=.5,
++             failure_atr=1., break_buffer_days=2, reclaim_days=2,
++             ma20_arm_days=2, startup_failure_atr=.5)
++
++
++def replay(bars, calendar):
++    """按完成交易日顺序重放；只读取当时及以前的K，缺口切断旧趋势。
++
++    MA10缓冲的ATR、首次失守日均属于该次回踩，单日收回不能重置。
++    MA20只有在本段观察连续两次站上后才成为最终退出线。
++    """
++    by_date = {b['date']: b for b in bars if valid(b)}
++    run, startup, episode, previous = [], [], None, None
++    weak_latched, last_exit, last_reason = False, None, None
++    history_start = None
++    out = None
++    for day_index, day in enumerate(calendar):
++        bar = by_date.get(day)
++        if bar is None:
++            run, startup, episode, previous = [], [], None, None
++            weak_latched, last_exit, last_reason = False, None, None
++            history_start = None
++            continue
++        run.append(bar)
++        if len(run) < 21:
++            continue
++        if history_start is None:
++            history_start = day
++        cs = [k['close'] for k in run[-21:]]
++        ma = {n: sum(cs[-n:])/n for n in (5, 10, 20)}
++        prev = {n: sum(cs[-n-1:-1])/n for n in (5, 10, 20)}
++        ks = run[-21:]
++        atr = sum(max(ks[j]['high']-ks[j]['low'], abs(ks[j]['high']-ks[j-1]['close']),
++                      abs(ks[j]['low']-ks[j-1]['close'])) for j in range(1, 21))/20
++        close, low = bar['close'], bar['low']
++        strong = close >= ma[5] and close >= ma[10] and ma[5] > ma[10] \
++            and ma[5] > prev[5] and ma[10] > prev[10]
++        qualifies5 = close >= ma[5] and ma[5] > prev[5]
++        startup = (startup + [(day, close)])[-RULES['startup_days']:] if qualifies5 else []
++        start_signal = len(startup) == RULES['startup_days'] and close > startup[0][1]
++        was_online = bool(previous and previous['trend_online'])
++        old_strong = bool(episode and episode['has_strong'])
++        repair_confirmed, exited = False, False
++        touch = old_strong and low <= ma[10] <= bar['high'] and close >= ma[10]
++        if episode is None and (strong or start_signal):
++            episode = dict(start=day, has_strong=strong, armed20=False, above20_run=0,
++                           below5_run=0, startup_atr=atr, pullback=None, downgraded=False)
++            weak_latched = False
++        if episode:
++            episode['above20_run'] = episode['above20_run']+1 if close >= ma[20] else 0
++            if episode['above20_run'] >= RULES['ma20_arm_days']:
++                episode['armed20'] = True
++            if episode['armed20'] and close < ma[20]:
++                last_reason, exited = '收盘跌破已建立的20日支撑', True
++            elif not episode['has_strong']:
++                episode['below5_run'] = episode['below5_run']+1 if close < ma[5] else 0
++                if (episode['below5_run'] >= 2 or
++                        close < ma[5]-RULES['startup_failure_atr']*episode['startup_atr']):
++                    last_reason, exited = '沿5日线启动条件失效', True
++            if not exited:
++                if strong:
++                    episode['has_strong'] = True
++                p = episode['pullback']
++                # 新入场当日不能称为既有趋势回踩；上日ATR必须可用。
++                trigger = old_strong and (touch or close < ma[5] or close < ma[10])
++                if p is None and trigger and previous and previous['atr20'] > 0:
++                    p = dict(start=day, atr=previous['atr20'], atr_asof=previous['asof'],
++                             first_break=None, first_break_index=None, reclaim_run=0)
++                    episode['pullback'] = p
++                if p:
++                    gap = (ma[10]-close)/p['atr']
++                    if close < ma[10]:
++                        p['reclaim_run'] = 0
++                        if p['first_break'] is None:
++                            p['first_break'], p['first_break_index'] = day, day_index
++                        elapsed = day_index-p['first_break_index']+1
++                        failed = gap > RULES['failure_atr'] or elapsed > RULES['break_buffer_days']
++                        if failed:
++                            last_reason = '10日支撑失效：'+('跌破超过1ATR' if gap > RULES['failure_atr'] else '第三个交易日仍未收复')
++                            if episode['armed20']:
++                                episode['downgraded'] = True
++                            else:
++                                exited = True
++                    else:
++                        p['reclaim_run'] += 1
++                        if strong or p['reclaim_run'] >= RULES['reclaim_days']:
++                            repair_confirmed = bool(p['first_break'] or episode['downgraded'])
++                            episode['pullback'] = None
++                            episode['downgraded'] = False
++                            # 当天触线仍展示位置标签，但已完成修复，不延续失守计时。
++            if exited:
++                last_exit, weak_latched = day, True
++                episode, startup = None, []
++        p = episode['pullback'] if episode else None
++        gap = (ma[10]-close)/p['atr'] if p else None
++        below_days = day_index-p['first_break_index']+1 if p and p['first_break_index'] is not None else 0
++        downgraded = bool(episode and episode['downgraded'])
++        strong_now = bool(episode and strong and not downgraded)
++        pullback = bool(episode and episode['has_strong'] and not downgraded and (p or touch or repair_confirmed))
++        kind = None
++        if episode and (p or touch):
++            wick_atr = p['atr'] if p else previous['atr20']
++            if close < ma[10]:
++                kind = '浅破待收复' if gap <= RULES['shallow_atr'] else '深回踩警戒'
++            elif p and p['first_break']:
++                kind = '回踩修复'
++            elif touch:
++                kind = '深探收回' if ma[10]-low > RULES['deep_wick_atr']*wick_atr else '触及MA10收回'
++            else:
++                kind = '趋势回踩'
++        if repair_confirmed:
++            kind = '修复已确认'
++        state = ('趋势转弱' if weak_latched and not episode else
++                 '20日支撑观察' if downgraded else
++                 '强势推进' if strong_now else
++                 kind if pullback else
++                 '启动观察' if episode and not episode['has_strong'] else
++                 '趋势保持' if episode else '暂未入选')
++        out = dict(asof=day, close=close, low=low, ma5=ma[5], ma10=ma[10], ma20=ma[20],
++                   ma5_prev=prev[5], ma10_prev=prev[10], ma20_prev=prev[20], atr20=atr,
++                   advance_signal=strong, strong_advance=strong_now,
++                   trend_online=bool(episode and episode['has_strong'] and not downgraded),
++                   previous_online=was_online, initial_strength=bool(episode and strong and not old_strong),
++                   startup=bool(episode and not episode['has_strong']), observing=bool(episode),
++                   priority_observation=bool(episode and not downgraded),
++                   support_observation=downgraded, weak=bool(weak_latched and not episode),
++                   weakening=bool(downgraded or weak_latched and not episode),
++                   pullback=pullback, pullback_kind=kind, repair_confirmed=repair_confirmed,
++                   state=state, episode_start=episode['start'] if episode else None,
++                   ma20_support_established=bool(episode and episode['armed20']),
++                   stage='20日支撑已建立' if episode and episode['armed20'] else '恢复阶段',
++                   pullback_start=p['start'] if p else None, pullback_atr=p['atr'] if p else None,
++                   pullback_atr_asof=p['atr_asof'] if p else None,
++                   first_ma10_break=p['first_break'] if p else None, ma10_break_days=below_days,
++                   buffer_days_left=max(0, RULES['break_buffer_days']-below_days) if p and below_days else None,
++                   reclaim_days=p['reclaim_run'] if p else 0, ma10_gap_fixed_atr=gap,
++                   exit_date=last_exit, risk_reason=last_reason if downgraded or weak_latched and not episode else None,
++                   replay_start=history_start)
++        previous = out
++    return out
+ 
+ 
+ def connect(path=None):
+@@ -104,26 +244,10 @@
+         result.update(reason="最新完成日线缺失" if asof in missing else "历史窗口有缺口",
+                       missing_dates=missing)
+         return result
+-    ks = [by_date[d] for d in wanted]
+-    closes = [b["close"] for b in ks]
+-    average = lambda length, offset=0: sum(closes[len(closes)-length-offset:len(closes)-offset]) / length
+-    ma5, ma10, ma20 = [average(n) for n in (5, 10, 20)]
+-    prev5, prev10, prev20 = [average(n, 1) for n in (5, 10, 20)]
+-    online = ma5 > ma10 > ma20 and ma20 > prev20 and closes[-1] >= ma10
+-    previous = prev5 > prev10 > prev20 and prev20 > average(20, 2) and closes[-2] >= prev10
+-    atr = sum(max(ks[i]["high"]-ks[i]["low"], abs(ks[i]["high"]-ks[i-1]["close"]),
+-                  abs(ks[i]["low"]-ks[i-1]["close"])) for i in range(2, 22)) / 20
+-    touched = online and previous and ks[-1]["low"] <= ma10 <= ks[-1]["high"]
+-    near = online and previous and atr > 0 and 0 <= (closes[-1]-ma10)/atr <= .4
+-    initial = online and not previous
+-    weakening = previous and not online
+-    result.update(ready=True, reason=None, trend_online=online, previous_online=previous,
+-                  initial_strength=initial, weakening=weakening, pullback=bool(touched or near),
+-                  pullback_kind="触及MA10收回" if touched else "接近MA10" if near else None,
+-                  state="初步转强" if initial else "回踩观察" if touched or near else
+-                  "趋势在线" if online else "趋势走弱" if weakening else "趋势未在线",
+-                  close=closes[-1], low=ks[-1]["low"], ma5=ma5, ma10=ma10, ma20=ma20,
+-                  ma20_prev=prev20, atr20=atr,
++    closes = [by_date[d]['close'] for d in wanted]
++    result.update(replay(list(by_date.values()), calendar))
++    atr, ma10 = result['atr20'], result['ma10']
++    result.update(ready=True, reason=None,
+                   ma10_distance_atr=(closes[-1]-ma10)/atr if atr > 0 else None,
+                   ma10_distance_pct=(closes[-1]/ma10-1)*100,
+                   ret1=(closes[-1]/closes[-2]-1)*100,
+@@ -219,7 +343,19 @@
+         return {}
+     if calendar is None:
+         saved = (snapshot.get("board_trend_model") or {}).get("calendar") or []
+-        calendar = saved if saved and saved[-1] == asof else calendar_from_db(asof, path, snapshot)
++        # 第一版仅存22日，不能重建更早的回踩起点；升级时重新取完整日历。
++        same_version = (snapshot.get('board_trend_model') or {}).get('version') == VERSION
++        calendar = saved if same_version and saved and saved[-1] == asof else calendar_from_db(asof, path, snapshot)
++    else:
++        # 盘中股票计算可能只传最近160根；历史库保留更早的真实交易日，
++        # 不能让每天滚动的窗口截断一段尚未结束的回踩起点。
++        try:
++            historical = calendar_from_db(asof, path, snapshot)
++        except sqlite3.OperationalError as exc:
++            if 'no such table: kline' not in str(exc):
++                raise
++            historical = []  # 独立测试库可只提供已核验的显式日历。
++        calendar = sorted(set(calendar) | set(historical))
+     mapping = identities()
+     boards = snapshot.get("board_catalog") or []
+     candidates = [b for b in boards if b["id"] in mapping]
+@@ -242,15 +378,17 @@
+         board["member_diffusion"] = bool(board.get("ranking_eligible") and
+                                          board.get("trend_state") == "持续扩散")
+     model = dict(version=VERSION, asof=asof, mapped=len(candidates),
+-                 calendar=sorted(set(d for d in calendar if d <= asof))[-WINDOW:],
++                 calendar=sorted(set(d for d in calendar if d <= asof)),
+                  ready=sum(bool((b.get("index_trend") or {}).get("ready")) for b in boards),
+                  member_only=len(boards)-len(candidates),
+                  pending=sum(not (b.get("index_trend") or {}).get("ready") for b in candidates),
+                  trend_online=sum(bool((b.get("index_trend") or {}).get("trend_online")) for b in boards),
+                  source="同花顺指数完成日线，本地按日期增量保存",
+-                 criterion="MA5>MA10>MA20，MA20较前日上升，收盘≥MA10；前日同口径",
+-                 atr_basis="20个含跳空TR的简单平均；22日连续共同交易日窗口",
+-                 pullback_criterion="前日与当前趋势在线；当日触及MA10收回或收盘距MA10≤0.4ATR；仅观察",
++                 criterion="强势推进：收盘≥MA5和MA10，MA5>MA10，MA5和MA10均较前日上升；启动观察：连续3日守MA5且MA5逐日上升、末日收盘高于首日",
++                 rules=dict(RULES),
++                 atr_basis="20个含跳空TR的简单平均；最新22日连续对齐，完整历史逐日重放",
++                 pullback_criterion="既有强势背景；回踩固定前日ATR，浅破≤0.3ATR缓冲2日，破位>1ATR或第三日仍失守则降级；连续2日守MA10或重新满足强势推进才确认修复",
++                 exit_criterion="本段观察连续2日站上MA20后才建立最终支撑，后续收盘跌破即退出；尚未建立MA20支撑时允许沿MA5启动",
+                  breadth_basis="当前有效主板成员的近3日趋势比例；非历史全市场成分回测")
+     snapshot["board_trend_model"] = model
+     return model

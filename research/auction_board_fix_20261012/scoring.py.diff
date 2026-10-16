@@ -1,0 +1,19 @@
+--- scoring.py.before
++++ scoring.py
+@@ -7,6 +7,7 @@
+   close : 正式收盘日线更新，正式日线就绪即发布榜单
+ """
+ import json
++import copy
+ import math
+ import re
+ import time
+@@ -222,6 +223,8 @@
+ 
+     snap["stocks"] = [auction_row(row) for row in previous_snapshot.get("stocks") or []]
+     snap["coverage_catalog"] = [auction_row(row) for row in previous_snapshot.get("coverage_catalog") or []]
++    snap['board_catalog'] = copy.deepcopy(previous_snapshot.get('board_catalog') or [])
++    board_center.attach_auction(snap)
+     intraday_model = dict(previous_snapshot.get("intraday_model") or {})
+     intraday_model.update(version=intraday.VERSION,
+                           rule_version=config.INTRADAY_RULE_VERSION,

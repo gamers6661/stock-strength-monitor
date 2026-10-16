@@ -1,0 +1,19 @@
+--- before/check_live_service.py
++++ check_live_service.py
+@@ -33,6 +33,7 @@
+     assert status.get('code_radar_opportunity_version')==radar_opportunity.VERSION
+     assert status.get('snapshot_radar_opportunity_version')==radar_opportunity.VERSION
+     assert status.get('code_radar_opportunity_hash')==status.get('snapshot_radar_opportunity_hash')==radar_opportunity.IMPLEMENTATION_HASH
++    assert status.get('code_radar_repair_version')==status.get('snapshot_radar_repair_version')==radar_opportunity.REPAIR_VERSION
+     radar_opportunity.validate(snapshot)
+     html = get(base + "/dashboard.html").decode("utf-8")
+     text_report = (config.ROOT / "snapshot_report.md").read_text(encoding="utf-8")
+@@ -83,6 +84,8 @@
+             assert response.headers.get('Content-Encoding') == 'gzip'
+             compressed = ui_payload.unpack(json.loads(gzip.decompress(response.read())))
+         assert compressed['board_opportunity_model'] == served['board_opportunity_model']
++        assert compressed['radar_opportunity'].get('last_close_review')==served['radar_opportunity'].get('last_close_review')
++        assert compressed['radar_opportunity']['presentation']==served['radar_opportunity']['presentation']
+         assert all(b['opportunity'] == next(x['opportunity'] for x in served['board_catalog'] if x['id']==b['id']) for b in compressed['board_catalog'])
+         example = served['board_catalog'][0]
+         response = json.loads(get(base+'/__ui/detail?'+urlencode({'version':served['ui_generation'],'kind':'board','id':example['id']})))

@@ -1,0 +1,17 @@
+--- before/radar.py
++++ radar.py
+@@ -1,6 +1,14 @@
+ """趋势候选关注层级；全体强度排名保持独立。"""
+ import config
+ import attack_model
++
++
++def build_opportunities(snap, quotes, pool, price_contexts, histories, calendar,
++                        previous=None, state=None, persist=False, now=None):
++    """全部主板合格样本可进入，日线分档保持原样。"""
++    import radar_opportunity
++    return radar_opportunity.build(snap,quotes,pool,price_contexts,histories,calendar,
++                                   previous,state,persist,now)
+ 
+ FACTOR_ORDER = config.STRATEGY['factors']['trend']
+ 

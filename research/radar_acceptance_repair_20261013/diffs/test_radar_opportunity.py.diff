@@ -1,0 +1,56 @@
+--- before/test_radar_opportunity.py
++++ test_radar_opportunity.py
+@@ -233,6 +233,53 @@
+         self.confirm();self.quotes[self.code].update(price=10.15,change_pct=1.5)
+         for i in range(4):self.assertTrue(self.run_round(300)['current'])
+ 
++    def test_yesterday_reset_timestamps_keep_confirmed_until_real_gap(self):
++        self.at=datetime(2026,10,12,14,17,15)
++        self.run_round(session='午盘');r=self.run_round(561)
++        old=copy.deepcopy(r['categories']['breakout']['event'])
++        self.assertTrue(r['current'])
++        self.assertTrue(self.run_round(411)['current'])
++        r=self.run_round(210);e=r['categories']['breakout']['event']
++        self.assertTrue(r['current']);self.assertEqual(e['event_id'],old['event_id'])
++        self.assertEqual(e['first_confirmed_at'],old['first_confirmed_at'])
++        self.assertEqual(e['continuity']['gap_seconds'],210)
++        self.assertIsNone(e['reset_reason'])
++        r=self.run_round(601);e=r['categories']['breakout']['event']
++        self.assertFalse(r['current']);self.assertEqual(e['sequence']['count'],1)
++        self.assertIn('间隔超限',e['reset_reason'])
++
++    def test_auction_stage_explains_disabled_market_not_bad_coverage(self):
++        self.at=datetime(2026,10,12,9,24);self.run_round(session='集合竞价')
++        m=self.snap['radar_opportunity']
++        self.assertEqual(m['presentation']['default_view'],'follow')
++        self.assertIn('尚未进入确认时段',m['presentation']['current_empty_message'])
++        self.assertFalse(m['market']['enabled']);self.assertIn('尚未启用',m['market']['reason'])
++        self.assertIsNone(m['market']['M0'])
++        self.assertIsNone(m['market']['coverage_pct'])
++        coverage=next(c for c in self.rows[0]['radar_opportunity']['admission_checks'] if c['key']=='主板报价覆盖%')
++        self.assertIsNone(coverage['actual']);self.assertIsNone(coverage['passed'])
++
++    def test_close_records_count_events_and_unique_stocks_and_survive_next_day(self):
++        self.rows[0]['trend_tier']='A';self.confirm()
++        self.calendar.append('2026-10-12')
++        for c in self.codes:self.history[c].append(dict(self.history[c][-1],date='2026-10-12',close=10.5 if c==self.code else 10.,high=11.))
++        self.snap['strength_model']['asof']='2026-10-12'
++        for row in self.rows:row['signal_date']='2026-10-12'
++        self.at=datetime(2026,10,12,15);self.run_round(session='已收盘')
++        m=self.snap['radar_opportunity'];review=copy.deepcopy(m['last_close_review'])
++        self.assertEqual(m['presentation']['default_view'],'close')
++        self.assertEqual(review['event_counts']['收盘确认'],2)
++        self.assertEqual(review['stock_counts']['收盘确认'],1)
++        self.assertEqual(review['stock_rows'][0]['labels'],['突破启动','持续进攻'])
++        self.at=datetime(2026,10,13,9,24);self.run_round(session='集合竞价')
++        self.assertEqual(self.snap['radar_opportunity']['last_close_review'],review)
++
++    def test_unknown_admission_records_explicit_pause_reason(self):
++        self.confirm();self.quotes[self.code].pop('open')
++        r=self.run_round(300);e=r['categories']['breakout']['event']
++        self.assertIn('数据或尺度待核验',e['reset_reason'])
++        self.assertEqual(e['sequence'],{})
++
+     def test_nontrading_day_is_not_an_extra_window_day(self):
+         for d in ['2026-10-12','2026-10-13']:
+             self.calendar.append(d)

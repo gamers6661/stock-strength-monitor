@@ -1,0 +1,107 @@
+--- dashboard_template.html.before
++++ dashboard_template.html
+@@ -4525,8 +4525,8 @@
+   setTimeout(auditSticky,90);
+ }
+ /* 板块中心 V4：行业/题材与成员共用 board_catalog.id。 */
+-var BC_KIND='industry',BC_SORT='trend',BC_SEARCH='',BC_FILTER='all';
+-var BC_FILTERS=[['all','全部'],['online','趋势在线'],['initial','初步转强'],['pullback','回踩观察'],['weakening','趋势走弱'],['diffusion','成员扩散']];
++var BC_KIND='industry',BC_SORT='trend',BC_SEARCH='',BC_FILTER='watch';
++var BC_FILTERS=[['watch','重点观察'],['advance','强势推进'],['startup','沿5日线启动'],['pullback','回踩观察'],['support','20日支撑'],['weak','已转弱'],['diffusion','成员扩散'],['all','全部']];
+ function boardCatalog(){return DATA.board_catalog||[];}
+ function boardById(id){return boardCatalog().filter(function(b){return b.id===id;})[0];}
+ function boardTodayLabel(b){return b.member_quote_at&&String(b.member_quote_at).slice(0,10)===String(DATA.generated_at).slice(0,10)?'成员今日':'上轮等权';}
+@@ -4535,16 +4535,38 @@
+   if(!b.ranking_eligible)return false;
+   if(key==='diffusion')return !!b.member_diffusion;
+   var t=b.index_trend||{};
+-  return !!t.ready&&!!t[{online:'trend_online',initial:'initial_strength',pullback:'pullback',weakening:'weakening'}[key]];
++  return !!t.ready&&!!t[{watch:'priority_observation',advance:'strong_advance',startup:'startup',pullback:'pullback',support:'support_observation',weak:'weak'}[key]];
++}
++function boardIndexNote(t){
++  var notes={
++    '强势推进':'收盘同时站上MA5、MA10；MA5＞MA10，且两条线均较前日上升。',
++    '启动观察':'连续3个完成交易日守住各自MA5，MA5逐日上升，末日收盘高于首日；允许尚未站上MA20。',
++    '趋势保持':'已形成强势背景；当前未触发退出，不因短暂均线走平直接判弱。',
++    '浅破待收复':'收盘跌破MA10不超过固定0.3ATR；首次失守起最多缓冲2个交易日。',
++    '深回踩警戒':'收盘跌破MA10超过固定0.3ATR，降低关注优先程度；超过1ATR或第三日仍失守则降级。',
++    '回踩修复':'收盘已收回MA10；连续2日守住，或重新满足强势推进，才结束本次回踩。',
++    '触及MA10收回':'既有强势板块日内触及MA10，收盘守住；位置观察，需继续跟踪。',
++    '深探收回':'日内下探MA10超过固定0.5ATR后收回；保留趋势并提示深探。',
++    '趋势回踩':'既有强势背景，当前回落到MA5下方或测试MA10；使用回踩开始前的ATR判断。',
++    '修复已确认':'连续2日守MA10或重新满足强势推进，结束旧回踩与失守计时。',
++    '20日支撑观察':'10日支撑已失效，移出重点观察；20日支撑仍有效，等待修复。',
++    '趋势转弱':t.risk_reason||'本段趋势已退出，后续需重新满足启动或强势推进条件。',
++    '暂未入选':'当前未满足启动条件，也没有正在延续的强势背景。'
++  };
++  return '完成日线 '+t.asof+'；'+(notes[t.state]||'按本段趋势连续跟踪。')
++    +(t.pullback_atr!=null?' 本次缓冲固定ATR '+fmt(t.pullback_atr,2)+'，基准 '+t.pullback_atr_asof+'。':'');
+ }
+ function boardTrendTags(b){
+   var t=b.index_trend,h='';
+   if(!t)h+=uiTag('成员趋势观察','','未找到与当前行业/题材精确同名的同花顺指数，只观察已覆盖的主板成员。');
+   else if(!t.ready)h+=uiTag('指数待核验','warn',(t.reason||'历史尚未对齐')+'；目标 '+(t.expected_asof||b.asof)+'；最新可用 '+(t.asof||'无')+'。不进入指数趋势筛选。');
+   else{
+-    h+=uiTag(t.state,t.weakening?'risk':t.trend_online?'good':'',
+-      '完成日线 '+t.asof+'；MA5 > MA10 > MA20，MA20较前日上升，收盘≥MA10，全部满足才为趋势在线。初步转强表示前一天未在线、当前在线；走弱表示相反。');
+-    if(t.pullback)h+=uiTag(t.pullback_kind,'blue','前日和当前趋势在线；当日触及MA10后收回，或收盘在MA10上方0.4ATR内。是回踩位置观察，尚未确认反弹。');
++    h+=uiTag(t.state,t.weak?'risk':t.support_observation||t.pullback_kind==='深回踩警戒'?'warn':t.strong_advance?'good':t.observing?'blue':'',boardIndexNote(t));
++    if(t.pullback_kind&&t.pullback_kind!==t.state)h+=uiTag(t.pullback_kind,t.pullback_kind==='深探收回'?'warn':'blue',boardIndexNote(Object.assign({},t,{state:t.pullback_kind})));
++    if(t.observing)h+=uiTag(t.ma20_support_established?'20日支撑有效':'恢复阶段','',
++      t.ma20_support_established?'本段已连续2日收盘站上MA20；后续收盘跌破即退出重点与支撑观察。':'本段尚未连续2日收盘站上MA20；MA20作为恢复背景，允许沿MA5启动。建立支撑后再启用跌破退出规则。');
++    if(t.first_ma10_break&&!t.support_observation)h+=uiTag(t.close>=t.ma10?'修复 '+t.reclaim_days+'/2日':'失守 '+t.ma10_break_days+'/2日','warn',
++      '首次失守 '+t.first_ma10_break+'；单日收回不重置首次失守日或固定ATR。连续2日守住或重新满足强势推进才确认修复。');
+   }
+   h+=uiTag('成员 · '+(b.trend_state||'待观察'),b.member_diffusion?'blue':'',
+     '当前有效主板成员的近3个完成日线：在线成员连续两次增加且在线比例高于全体主板，才标记持续扩散。不是历史全市场成分回测，也不证明带动关系。');
+@@ -4556,7 +4578,7 @@
+   var t=b.index_trend||{},valid=n(b.valid_members),ready=t.ready;
+   var metrics=b.index_trend?
+     uiMetric('指数5日',ready?pct(t.ret5,1):'—','','同花顺指数（含非主板成员）的完成日线收益。')
+-    +uiMetric('距MA10',ready&&t.ma10_distance_atr!=null?sgn(t.ma10_distance_atr,2):'—','ATR','(指数收盘−MA10) / ATR20；ATR为20个含跳空TR的简单平均。'):
++    +uiMetric('距MA10',ready&&t.ma10_distance_atr!=null?sgn(t.ma10_distance_atr,2):'—','ATR','(指数收盘−MA10) / 当前ATR20；回踩缓冲另用固定前日ATR，见状态标签。'):
+     uiMetric('成员5日',pct(b.member_ret5,1),'','有效主板成员的完成日线等权收益；未匹配同名指数，不能作为指数收益。')
+     +uiMetric('较前日',sgn(b.trend_delta1_pp,1),'点','当前有效成员的趋势在线比例较前一完成日的变化。');
+   return '<article class="bc-card" data-board-id="'+esc(b.id)+'">'
+@@ -4590,7 +4612,7 @@
+       return '<button type="button" data-board-filter="'+x[0]+'" aria-pressed="'+(BC_FILTER===x[0])+'" class="bc-filter '+(BC_FILTER===x[0]?'active':'')+'" onclick="setBoardFilter(\''+x[0]+'\')">'
+         +x[1]+'<span>'+all.filter(function(b){return boardMatches(b,x[0]);}).length+'</span></button>';}).join('')+'</div>'
+     +'<div class="bc-reference"><span>'+(showTabs?'指数与成员独立判断':'完成日线 '+esc((DATA.board_trend_model||DATA.strength_model||{}).asof||'—'))+'</span>'
+-    +uiTag('筛选口径','','指数筛选须22个连续交易日对齐且至少6只有效主板成员。成员扩散独立判断；今日行情和资金不提升指数日线资格。回踩仅观察位置，本轮不做威科夫整理突破确认。')
++    +uiTag('筛选口径','','指数须最新22个连续交易日对齐且至少6只有效主板成员，并按完整可用历史逐日跟踪。强势推进须MA5＞MA10；回踩保留强势背景。已转弱移出观察。成员扩散独立展示。')
+     +'<span>'+boards.length+' / '+all.length+' 个</span></div></div>'
+     +'<div class="bc-grid">'+(boards.length?boards.map(boardCard).join(''):'<div class="empty bc-empty">当前没有符合条件的板块，可切换筛选或清空搜索。</div>')+'</div>';
+ }
+@@ -4599,7 +4621,7 @@
+   var industry=all.filter(function(b){return b.type==='industry';});
+   var model=DATA.board_trend_model||{};
+   document.getElementById('bd-metrics').innerHTML=[['指数已对齐',model.ready==null?'—':model.ready+'/'+n(model.mapped),'同花顺精确同名指数'],
+-    ['指数趋势在线',all.filter(function(b){return boardMatches(b,'online');}).length,'至少6只有效主板成员'],
++    ['重点观察',all.filter(function(b){return boardMatches(b,'watch');}).length,'启动、推进及回踩中的板块'],
+     ['成员趋势观察',model.member_only==null?'—':model.member_only,'无对应同名指数'],
+     ['日线基准',esc((DATA.strength_model||{}).asof||'—'),'最新完成交易日']]
+     .map(function(x){return '<div class="metric"><div class="lbl">'+x[0]+'</div><div class="val">'+x[1]+'</div><div class="sub">'+x[2]+'</div></div>';}).join('');
+@@ -4631,8 +4653,8 @@
+     +'<div class="ui-tags">'+boardTrendTags(b)+'</div>'
+     +'<div class="ui-metrics">'+uiMetric('指数5日',ready?pct(idx.ret5,1):'—','','完成日线收益；指数包括非主板成员。')
+     +uiMetric('指数20日',ready?pct(idx.ret20,1):'—','','20个交易日的指数收盘收益。')
+-    +uiMetric('距MA10',ready&&idx.ma10_distance_atr!=null?sgn(idx.ma10_distance_atr,2):'—','ATR','(指数收盘−MA10) / ATR20。')
+-    +uiMetric('ATR20',ready?fmt(idx.atr20,2):'—','点','20个含跳空真实波幅TR的简单平均。')+'</div>'
++    +uiMetric('距MA10',ready&&idx.ma10_distance_atr!=null?sgn(idx.ma10_distance_atr,2):'—','ATR','(指数收盘−MA10) / 当前ATR20；回踩缓冲使用固定基准。')
++    +uiMetric(idx.pullback_atr!=null?'回踩固定ATR':'ATR20',ready?fmt(idx.pullback_atr!=null?idx.pullback_atr:idx.atr20,2):'—','点',idx.pullback_atr!=null?'固定在 '+idx.pullback_atr_asof+'，不随本次回落放宽。':'20个含跳空真实波幅TR的简单平均。')+'</div>'
+     +(ready?'<div class="bc-line-values">收盘 '+fmt(idx.close,2)+'<span>MA5 '+fmt(idx.ma5,2)+'</span><span>MA10 '+fmt(idx.ma10,2)+'</span><span>MA20 '+fmt(idx.ma20,2)+'</span></div>':'')+'</section>':
+       '<section class="card bc-detail"><h3>成员趋势观察</h3><div class="ui-tags">'+boardTrendTags(b)+'</div><p class="flat">未匹配同名指数，按主板成员观察。</p></section>')
+     +'<section class="card ui-decision bc-detail"><h3>主板成员参与</h3><div class="ui-metrics">'
+@@ -4647,7 +4669,11 @@
+     +'<details class="detail-fold"><summary>数据与判断依据</summary><div class="detail-fold-body">'
+     +'<p>指数来源：'+esc(idx.source||'未找到精确同名指数；只展示主板成员观察')+'。最新可用 '+esc(idx.asof||'—')+'，判断基准 '+esc(b.asof)+'。'
+     +(ready?'22个连续交易日已对齐。':esc(idx.reason||'无对应指数。'))+'</p>'
+-    +'<p>趋势在线：MA5&gt;MA10&gt;MA20，MA20较前日上升，收盘≥MA10；前日用同样条件。ATR20是20个含跳空TR的简单平均。回踩观察不等于反弹确认。</p>'
++    +'<p>强势推进：收盘≥MA5、MA10，MA5&gt;MA10，且两条线较前日上升。沿MA5启动：连续3日守MA5、MA5逐日上升，末日收盘高于首日。无需MA10&gt;MA20。</p>'
++    +'<p>回踩：固定回踩前一日ATR20；浅破≤0.3ATR缓冲2日，跌破&gt;1ATR或第三日仍失守则降级。连续2日守MA10或重新满足强势推进确认修复。MA20支撑在本段连续2日站上后建立，此后收盘跌破即退出。</p>'
++    +(ready?'<p>本段开始 '+esc(idx.episode_start||'暂无有效观察')+'；历史跟踪自 '+esc(idx.replay_start||'—')+'。'
++      +(idx.first_ma10_break?' 首次失守 '+esc(idx.first_ma10_break)+'，至今 '+n(idx.ma10_break_days)+'个交易日。':'')
++      +(idx.risk_reason?' '+esc(idx.risk_reason)+'。':'')+'</p>':'')
+     +'<p>成员来源：'+esc(b.source_basis)+'；'+esc(b.ranking_reason)+'。当前成员的近3日变化仅作扩散观察，不能代表历史全市场成员。'
+     +(b.membership_disagreements!=null?' F10/详情归属差异 '+n(b.membership_disagreements)+'只。':'')+'</p>'
+     +'<p>资金采集 '+esc(b.fund_observed_at||'未知')+'；来源 '+esc(DATA.fund_source||'未知')+'。'

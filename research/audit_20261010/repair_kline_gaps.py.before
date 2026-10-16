@@ -1,0 +1,40 @@
+"""Refetch missing completed daily bars from the quote source; never synthesize bars."""
+import json
+
+import config
+import datafeed as df
+import strength
+
+
+def run():
+    snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+    asof = snapshot["strength_model"]["asof"]
+    targets = [row["code"] for row in snapshot.get("coverage_catalog", [])
+               if row["reason"] in ("unaligned", "stale")]
+    conn = df.db()
+    wanted = strength.trading_calendar({
+        row["code"]: strength.completed(df.load_kline(conn, "kline", "code", row["code"]))
+        for row in snapshot["stocks"]})[-61:]
+    old_dates = {code: {bar["date"] for bar in df.load_kline(conn, "kline", "code", code)}
+                 for code in targets}
+    fetched, truncated = df.fetch_klines_bulk(targets, progress=True, days=180)
+    clean = {}
+    for code, bars in fetched.items():
+        valid = [bar for bar in bars if bar["date"] <= asof
+                 and all(isinstance(bar.get(key), (int, float)) and bar[key] > 0
+                         for key in ("open", "high", "low", "close", "volume"))]
+        if valid:
+            clean[code] = valid
+    restored = {code: sorted((set(wanted) - old_dates[code]) &
+                             {bar["date"] for bar in bars})
+                for code, bars in clean.items()}
+    inserted = df.save_klines(conn, "kline", "code", clean)
+    result = {"asof": asof, "targeted": len(targets), "fetched": len(clean),
+              "saved_rows": inserted, "restored_stocks": sum(bool(v) for v in restored.values()),
+              "restored_dates": sum(map(len, restored.values())), "truncated": truncated}
+    print(json.dumps(result, ensure_ascii=False))
+    return result
+
+
+if __name__ == "__main__":
+    run()

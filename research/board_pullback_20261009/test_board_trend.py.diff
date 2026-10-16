@@ -1,0 +1,183 @@
+--- test_board_trend.py.before
++++ test_board_trend.py
+@@ -63,14 +63,157 @@
+         self.assertTrue(r['weakening'])
+         self.assertFalse(r['trend_online'])
+ 
+-    def test_pullback_requires_existing_trend_and_actual_touch_or_near(self):
+-        self.bars[-1]['low'] = 123
++    def test_pullback_requires_existing_trend_and_actual_touch(self):
++        self.bars[-1]['low'] = 124
+         r = B.calculate(self.bars, self.days, self.days[-1])
+         self.assertTrue(r['pullback'])
+         self.assertEqual(r['pullback_kind'], '触及MA10收回')
+         bars, days = sample([100-i*.1 for i in range(29)]+[150])
+         bars[-1]['low'] = 95
+         self.assertFalse(B.calculate(bars, days, days[-1])['pullback'])
++
++    def test_ma5_must_exceed_ma10_even_when_both_rise_and_price_holds(self):
++        bars, days = sample([100]*21+[110]*5+[90]*4+[111])
++        r = B.calculate(bars, days, days[-1])
++        self.assertGreater(r['ma5'], r['ma5_prev'])
++        self.assertGreater(r['ma10'], r['ma10_prev'])
++        self.assertGreater(r['close'], r['ma10'])
++        self.assertLess(r['ma5'], r['ma10'])
++        self.assertFalse(r['advance_signal'])
++        self.assertFalse(r['strong_advance'])
++
++    def test_three_day_ma5_startup_is_allowed_below_ma20(self):
++        bars, days = sample([200]*20+[150]*5+[100]*5+[110,120,130])
++        self.assertFalse(B.calculate(bars[:-1], days[:-1], days[-2])['observing'])
++        r = B.calculate(bars, days, days[-1])
++        self.assertEqual(r['state'], '启动观察')
++        self.assertTrue(r['observing'])
++        self.assertLess(r['close'], r['ma20'])
++        self.assertFalse(r['ma20_support_established'])
++
++    def test_advance_does_not_require_ma10_above_ma20(self):
++        bars, days = sample([200]*20+[100]*8+[101,102,103])
++        r = B.calculate(bars, days, days[-1])
++        self.assertTrue(r['strong_advance'])
++        self.assertGreater(r['ma5'], r['ma10'])
++        self.assertLess(r['close'], r['ma20'])
++        self.assertFalse(r['ma20_support_established'])
++
++    def pullback_series(self, gaps, spike=None):
++        closes = [100+i*.5 for i in range(60)]
++        for gap in gaps:
++            # ATR初始2点；解出相对当日MA10的收盘缺口，不采用盘后均线倒算。
++            closes.append(sum(closes[-9:])/9-10/9*gap*2)
++        bars, days = sample(closes)
++        if spike is not None:
++            bars[60+spike]['high'] = 1000
++        return bars, days, B.calculate(bars, days, days[-1])
++
++    def test_shallow_break_preserves_trend_despite_ma5_falling(self):
++        _, _, r = self.pullback_series([.2])
++        self.assertLess(r['ma5'], r['ma5_prev'])
++        self.assertTrue(r['trend_online'])
++        self.assertFalse(r['strong_advance'])
++        self.assertEqual(r['state'], '浅破待收复')
++        self.assertEqual(r['ma10_break_days'], 1)
++        self.assertEqual(r['buffer_days_left'], 1)
++
++    def test_third_break_day_downgrades_to_ma20_support(self):
++        for gaps in ([.2], [.2,.2]):
++            self.assertTrue(self.pullback_series(gaps)[2]['priority_observation'])
++        _, _, r = self.pullback_series([.2,.2,.2])
++        self.assertEqual(r['state'], '20日支撑观察')
++        self.assertFalse(r['trend_online'])
++        self.assertTrue(r['support_observation'])
++        self.assertTrue(r['observing'])
++        self.assertFalse(r['priority_observation'])
++
++    def test_one_day_reclaim_cannot_reset_first_break_or_atr(self):
++        bars, days, r = self.pullback_series([.2,-.05,.2])
++        self.assertFalse(B.calculate(bars[:-1], days[:-1], days[-2])['strong_advance'])
++        self.assertEqual(r['first_ma10_break'], days[60])
++        self.assertEqual(r['ma10_break_days'], 3)
++        self.assertEqual(r['pullback_atr_asof'], days[59])
++        self.assertTrue(r['support_observation'])
++
++    def test_atr_is_frozen_before_pullback_not_inflated_by_spike(self):
++        _, days, r = self.pullback_series([.2,.4], spike=0)
++        self.assertGreater(r['atr20'], 40)
++        self.assertEqual(r['pullback_atr'], 2)
++        self.assertEqual(r['pullback_atr_asof'], days[59])
++        self.assertAlmostEqual(r['ma10_gap_fixed_atr'], .4)
++        self.assertEqual(r['state'], '深回踩警戒')
++
++    def test_large_ma10_break_downgrades_even_when_ma20_still_holds(self):
++        _, _, r = self.pullback_series([1.01])
++        self.assertGreaterEqual(r['close'], r['ma20'])
++        self.assertTrue(r['support_observation'])
++        self.assertFalse(r['priority_observation'])
++
++    def test_two_reclaims_confirm_repair_and_reset_buffer(self):
++        _, _, r = self.pullback_series([.2,-.05,-.05])
++        self.assertTrue(r['repair_confirmed'])
++        self.assertTrue(r['trend_online'])
++        self.assertIsNone(r['first_ma10_break'])
++        self.assertIsNone(r['pullback_atr'])
++
++    def test_deep_intraday_wick_reclaimed_is_not_automatic_exit(self):
++        self.bars[-1]['low'] = 110
++        r = B.calculate(self.bars, self.days, self.days[-1])
++        self.assertEqual(r['pullback_kind'], '深探收回')
++        self.assertTrue(r['observing'])
++        self.assertFalse(r['weak'])
++
++    def test_ma20_close_exit_has_priority_no_same_day_reentry(self):
++        self.bars[-1].update(open=110, close=110, high=150, low=109)
++        r = B.calculate(self.bars, self.days, self.days[-1])
++        self.assertEqual(r['state'], '趋势转弱')
++        self.assertFalse(r['observing'])
++        self.assertIsNone(r['episode_start'])
++        self.assertEqual(r['exit_date'], self.days[-1])
++        self.assertIn('20日', r['risk_reason'])
++
++    def test_recovery_without_ma20_support_exits_on_ma10_failure(self):
++        closes = [200]*20+[100]*8+[101,102,103]+[90]
++        bars, days = sample(closes)
++        r = B.calculate(bars, days, days[-1])
++        self.assertTrue(r['weak'])
++        self.assertFalse(r['observing'])
++        self.assertIn('10日', r['risk_reason'])
++
++    def test_ma20_arms_after_two_closes_and_overrules_fresh_advance_signal(self):
++        closes = [200]*20+[100]*8+[101,102,103]
++        for index, gap in enumerate((1,1,-1)):
++            # 解出当日收盘与MA20正/负1点的差值。
++            closes.append((sum(closes[-19:])+20*gap)/19)
++            bars, days = sample(closes)
++            r = B.calculate(bars, days, days[-1])
++            self.assertTrue(r['advance_signal'])
++            if index == 0:
++                self.assertFalse(r['ma20_support_established'])
++            elif index == 1:
++                self.assertTrue(r['ma20_support_established'])
++            else:
++                self.assertTrue(r['weak'])
++                self.assertFalse(r['strong_advance'])
++                self.assertFalse(r['observing'])
++
++    def test_startup_failure_before_strong_exits_after_two_closes_below_ma5(self):
++        bars, days = sample([200]*20+[150]*5+[100]*5+[110,120,130]+[115,112])
++        r = B.calculate(bars, days, days[-1])
++        self.assertTrue(r['weak'])
++        self.assertIn('5日', r['risk_reason'])
++
++    def test_replay_never_uses_future_bars_or_carries_across_old_gap(self):
++        bars, days, r = self.pullback_series([.2,-.05,.2])
++        prior = B.calculate(bars[:-1], days[:-1], days[-2])
++        self.assertEqual(prior, B.calculate(bars, days, days[-2]))
++        # 22日窗口以前的缺口不会让旧的20日支撑或趋势穿过缺口继承。
++        missing = bars[10]['date']
++        gap = B.calculate([b for b in bars if b['date'] != missing], days, days[-1])
++        self.assertTrue(gap['ready'])
++        self.assertGreater(gap['replay_start'], missing)
++        self.assertGreater(gap['episode_start'], missing)
+ 
+     def test_flat_zero_atr_has_no_distance_no_false_online(self):
+         for b in self.bars:
+@@ -133,6 +276,20 @@
+         self.assertIn(asof, B.calendar_from_db(asof, self.path, {'stocks':[{'signal_date':asof}]}))
+         self.assertNotIn(asof, B.calendar_from_db(asof, self.path, {'stocks':[{'signal_date':self.days[-2]}]}))
+ 
++    def test_rolling_caller_window_does_not_truncate_episode_history(self):
++        import sqlite3
++        B.save('885001', self.bars, '2025.js', self.path)
++        with sqlite3.connect(self.path) as conn:
++            conn.execute('CREATE TABLE kline(code TEXT,date TEXT)')
++            conn.executemany('INSERT INTO kline VALUES(?,?)', [('1',d) for d in self.days])
++        snap = dict(strength_model={'asof':self.days[-1]}, stocks=[],
++                    board_catalog=[{'id':'theme:测试','name':'测试','type':'theme','ranking_eligible':True}])
++        with patch.object(B,'identities',return_value={'theme:测试':'885001'}):
++            B.attach(snap, self.days[-22:], fetch=False, path=self.path)
++        self.assertEqual(snap['board_trend_model']['calendar'],self.days)
++        full = B.calculate(self.bars,self.days,self.days[-1])
++        self.assertEqual(snap['board_catalog'][0]['index_trend']['episode_start'],full['episode_start'])
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

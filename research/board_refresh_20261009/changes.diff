@@ -1,0 +1,113 @@
+--- board_quote before
++++ board_quote current
+@@ -4,11 +4,14 @@
+ import json
+ import math
+ import re
++import time
++import threading
+ 
+ import config
+ import datafeed
+ 
+ CACHE = config.CACHE_DIR / 'ths_index_quotes.json'
++VERSION = '同花顺指数缓存重验证1'
+ 
+ 
+ def parse(raw):
+@@ -48,6 +51,7 @@
+ 
+ def fetch(codes, cache_path=None):
+     """每20个指数合并为一请求，最多3路；失败缓存保持真实报价时间。"""
++    started = time.monotonic()
+     target = cache_path or CACHE
+     try:
+         cached = json.loads(target.read_text(encoding='utf-8')).get('quotes') or {}
+@@ -55,15 +59,67 @@
+         cached = {}
+     codes = sorted(set(str(c) for c in codes if re.fullmatch(r'\d{6}', str(c))))
+     batches = [codes[i:i+20] for i in range(0, len(codes), 20)]
++    refresh_bucket = int(time.time() // 300)
++    now = datetime.now()
++    session = datafeed.session_label(now)
++    supplement_lock = threading.Lock()
++    supplement_state = {'last': 0.0, 'requests': 0}
++    headers = {'Referer': 'http://q.10jqka.com.cn/',
++               'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
++
++    def needs_supplement(q, old):
++        if session in ('盘前', '非交易日', '集合竞价', '竞价结束'):
++            return False  # 分时指数未发布时不为缺少当日报价展开大量补核。
++        if not q or q.get('quote_at', '') < (old or {}).get('quote_at', ''):
++            return True
++        if freshness(q, now, session):
++            return True
++        # 批量响应虽未过期，也可能停留在上一轮；交易中延迟超过两分钟补核一次。
++        return (session in ('早盘', '午盘', '尾盘')
++                and (now-datetime.fromisoformat(q['quote_at'])).total_seconds() > 120)
++
++    def single_quote(code, scheme):
++        with supplement_lock:
++            delay = .35-(time.monotonic()-supplement_state['last'])
++            if delay > 0:
++                time.sleep(delay)
++            supplement_state['last'] = time.monotonic()
++            supplement_state['requests'] += 1
++        url = (scheme+'://d.10jqka.com.cn/v6/time/bk_'+code
++               +'/last.js?refresh='+str(refresh_bucket))
++        return parse(datafeed.http_get(url, headers=headers,
++                     encoding='gbk', timeout=6, retry=0)).get(code)
+ 
+     def work(batch):
+         try:
+-            url = 'http://d.10jqka.com.cn/v6/time/'+','.join('bk_'+c for c in batch)+'/last.js'
+-            raw = datafeed.http_get(url, headers={'Referer': 'http://q.10jqka.com.cn/'},
++            url = ('http://d.10jqka.com.cn/v6/time/'+','.join('bk_'+c for c in batch)
++                   +'/last.js?refresh='+str(refresh_bucket))
++            # 同一批次URL可能被缓存节点返回更早分时；按HTTP语义要求重验证，
++            # 并使用共享的5分钟缓存键，避免不遵循重验证头的中间缓存沿用旧响应。
++            # 仍按源时间判断新鲜度，不增加请求频率或把抓取时间当报价时间。
++            raw = datafeed.http_get(url, headers=headers,
+                                    encoding='gbk', timeout=8, retry=1)
+-            return batch, parse(raw), None
++            fresh = parse(raw)
+         except Exception as exc:
++            # 真实网络拒绝不再叠加单指数请求，保留缓存，避免失败时扩大请求量。
+             return batch, {}, str(exc)
++        if not fresh:
++            return batch, {}, '同花顺批量指数接口未返回有效数据'
++        for code in batch:
++            q = fresh.get(code)
++            if not needs_supplement(q, cached.get(code)):
++                continue
++            try:
++                single = single_quote(code, 'http')
++                if single and (not q or single['quote_at'] >= q['quote_at']):
++                    fresh[code] = q = single
++                if needs_supplement(q, cached.get(code)):
++                    verified = single_quote(code, 'https')
++                    if verified and (not q or verified['quote_at'] >= q['quote_at']):
++                        fresh[code] = verified
++            except Exception:
++                break  # 单指数接口失败时停止本批补核，下一正常周期再更新。
++        return batch, fresh, None
+ 
+     result = {}
+     with ThreadPoolExecutor(max_workers=3) as pool:
+@@ -77,8 +133,15 @@
+                 used = dict(cached.get(code) or {})
+                 if error or not q or q.get('quote_at', '') < (old or {}).get('quote_at', ''):
+                     used['fetch_error'] = error or '本轮未返回更新的有效指数报价'
++                elif freshness(used, now, session):
++                    used['fetch_error'] = freshness(used, now, session)
+                 result[code] = used
+-    config.atomic_write_text(target, json.dumps(dict(quotes=cached), ensure_ascii=False))
++    config.atomic_write_text(target, json.dumps(dict(quotes=cached, fetch_version=VERSION), ensure_ascii=False))
++    failures = sum(bool(q.get('fetch_error')) for q in result.values())
++    datafeed._source_mark('ths_index_quotes', 'partial' if failures else 'ok',
++                         elapsed=time.monotonic()-started,
++                         coverage=f'{len(codes)-failures}/{len(codes)}',
++                         detail=f'{VERSION}；批量{len(batches)}次；延迟补核{supplement_state["requests"]}次；本轮异常{failures}个')
+     return result
+ 
+ 

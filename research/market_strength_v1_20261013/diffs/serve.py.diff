@@ -1,0 +1,40 @@
+--- before/serve.py
++++ after/serve.py
+@@ -49,6 +49,7 @@
+ import weekly_members
+ import price_only
+ import ui_payload
++import market_strength
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -86,6 +87,8 @@
+     "snapshot_intraday_rule_version": None,
+ }
+ STATE = {"port": None, "pid": os.getpid(), "code_model_version": strength.VERSION,
++         "code_market_strength_version": market_strength.VERSION,
++         "code_market_strength_hash": market_strength.IMPLEMENTATION_HASH,
+          "code_board_trend_version": board_trend.VERSION,
+          "code_board_catalog_version": board_center.VERSION,
+          "code_board_opportunity_version": board_opportunity.VERSION,
+@@ -133,6 +136,8 @@
+         radar_opportunity.record_publication(snapshot,ui_payload.active_generation(),page.stat().st_mtime_ns)
+         try:
+             SNAPSHOT_META.update({
++                "snapshot_market_strength_version": (snapshot.get('market_strength') or {}).get('version'),
++                "snapshot_market_strength_hash": (snapshot.get('market_strength') or {}).get('implementation_hash'),
+                 "snapshot_generated_at": snapshot.get("generated_at"),
+                 "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
+                 "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
+@@ -460,9 +465,8 @@
+                            and snapshot.get("factor_model_version") == strength.VERSION
+                            and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
+                            and snapshot.get('board_catalog_version') == board_center.VERSION
+-                           and (snapshot.get('board_opportunity_model') or {}).get('version') == board_opportunity.VERSION
+-                           and (snapshot.get('radar_opportunity') or {}).get('version') == radar_opportunity.VERSION
+-                           and (snapshot.get('radar_opportunity') or {}).get('implementation_hash') == radar_opportunity.IMPLEMENTATION_HASH
++                           and (snapshot.get('market_strength') or {}).get('version') == market_strength.VERSION
++                           and (snapshot.get('market_strength') or {}).get('implementation_hash') == market_strength.IMPLEMENTATION_HASH
+                            and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+                            and (snapshot.get('wyckoff_structure') or {}).get('version') == wyckoff_structure.VERSION
+                            and (snapshot.get('session_context') or {}).get('version') == session_context.VERSION

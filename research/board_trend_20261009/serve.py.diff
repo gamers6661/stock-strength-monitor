@@ -1,0 +1,35 @@
+--- serve.py.before
++++ serve.py
+@@ -38,6 +38,7 @@
+ import trend_consolidation
+ import wyckoff_structure
+ import session_context
++import board_trend
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -75,6 +76,7 @@
+     "snapshot_intraday_rule_version": None,
+ }
+ STATE = {"port": None, "pid": os.getpid(), "code_model_version": strength.VERSION,
++         "code_board_trend_version": board_trend.VERSION,
+          "code_strength_version": stock_strength.VERSION,
+          "code_intraday_model_version": intraday.VERSION,
+          "code_attack_model_version": attack_model.LIVE_VERSION,
+@@ -115,6 +117,8 @@
+                 "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
+                 "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
+                 "snapshot_daily_asof": (snapshot.get("strength_model") or {}).get("asof"),
++                "snapshot_board_trend_version": (snapshot.get("board_trend_model") or {}).get("version"),
++                "snapshot_board_index_ready": (snapshot.get("board_trend_model") or {}).get("ready"),
+                 "snapshot_consolidation_version": (snapshot.get('trend_consolidation') or {}).get('version'),
+                 "snapshot_consolidation_count": (snapshot.get('trend_consolidation') or {}).get('count'),
+                 "snapshot_structure_version": (snapshot.get('wyckoff_structure') or {}).get('version'),
+@@ -373,6 +377,7 @@
+                         and close_confirmation.get("rule_version") == config.INTRADAY_RULE_VERSION)
+                 )
+                 matches = (snapshot.get("factor_model_version") == strength.VERSION
++                           and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
+                            and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+                            and (snapshot.get('wyckoff_structure') or {}).get('version') == wyckoff_structure.VERSION
+                            and (snapshot.get('session_context') or {}).get('version') == session_context.VERSION

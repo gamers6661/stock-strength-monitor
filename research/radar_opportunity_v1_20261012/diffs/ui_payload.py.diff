@@ -1,0 +1,58 @@
+--- before/ui_payload.py
++++ ui_payload.py
+@@ -99,9 +99,25 @@
+     result['board_catalog'] = [dict(b, members=[{'code': r['code'], 'change_pct': r.get('change_pct')}
+                                                  for r in b.get('members', [])])
+                                for b in full.get('board_catalog', [])]
++    if full.get('radar_opportunity'):
++        model=dict(full['radar_opportunity'])
++        model['by_code']={c:radar_brief(r) for c,r in model['by_code'].items()}
++        result['radar_opportunity']=model
++        for group in ('stocks','coverage_catalog'):
++            for r in result[group]:
++                if r['code'] in model['by_code']:r['radar_opportunity']=model['by_code'][r['code']]
+     result['ui_generation'] = token
+     result['ui_lazy'] = True
+     result.setdefault('runtime_contract', {})['code_ui_payload_version'] = VERSION
++    return result
++
++
++def radar_brief(row):
++    keys=('code','name','version','day','judged_at','source_at','R0','E0','M0','price','daily_tier','daily_asof',
++          'live_attack_score','risk','status','current','main_label','labels','trade_restriction','board_relation_status','display_label','opportunity_kinds','sort_rank')
++    result={k:row.get(k) for k in keys}
++    result['boards']=[{k:b.get(k) for k in ('name','type','selected','peers_qualified')} for b in row.get('boards',[])]
++    result['first_observed_at']=row.get('first_observed_at') or min((v['event']['first_observed_at'] for v in row.get('categories',{}).values() if v.get('event')),default=None)
+     return result
+ 
+ 
+@@ -168,8 +184,9 @@
+                     con.execute('INSERT INTO meta VALUES(?,?)', (key + '.gz', gzip.compress(value, compresslevel=1)))
+                 con.execute('INSERT INTO meta VALUES(?,?)', ('template', template.encode('utf-8')))
+                 con.execute('INSERT INTO meta VALUES(?,?)', ('csv_formatter', (config.ROOT / 'csv_export.js').read_bytes()))
+-                con.execute('INSERT INTO meta VALUES(?,?)', ('csv_meta', dumps({k: full.get(k) for k in
+-                            ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model')}).encode('utf-8')))
++                csv_meta={k:full.get(k) for k in ('quote_capture_at','generated_at','scan_completed_at','strength_model')}
++                csv_meta['ui_generation']=token
++                con.execute('INSERT INTO meta VALUES(?,?)', ('csv_meta', dumps(csv_meta).encode('utf-8')))
+                 html = template.replace('/*__DATA__*/null', config.script_json(packet)).encode('utf-8')
+                 con.execute('INSERT INTO meta VALUES(?,?)', ('page.gz', gzip.compress(html, compresslevel=1)))
+                 con.commit()
+@@ -223,7 +240,7 @@
+ 
+ 
+ def export_csv(token, codes, contexts):
+-    if not isinstance(codes, list) or not 0 < len(codes) <= 10000 or len(set(codes)) != len(codes):
++    if not isinstance(codes, list) or not 0 <= len(codes) <= 10000 or len(set(codes)) != len(codes):
+         raise ValueError('Invalid export selection')
+     if not isinstance(contexts, dict):
+         raise ValueError('Invalid display context')
+@@ -246,7 +263,7 @@
+         raise RuntimeError('Node.js is required for the shared CSV formatter')
+     # Formatting is shared with the existing offline page, retaining all 228 columns.
+     request = dumps({'rows': rows, 'data': {k: meta.get(k) for k in
+-                     ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model')},
++                     ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model','ui_generation')},
+                      'contexts': contexts, 'formatter': formatter[0].decode('utf-8')})
+     result = subprocess.run([node, str(config.ROOT / 'csv_runner.js')], input=request.encode('utf-8'),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,

@@ -1,0 +1,151 @@
+--- datafeed.py before
++++ datafeed.py current
+@@ -1980,6 +1980,40 @@
+     return blob
+ 
+ 
++def fetch_ths_index_members(index_code, expected_name):
++    """同花顺公开指数成员接口；名称与声明总数均对齐后才返回完整名单。"""
++    code = str(index_code)
++    if not re.fullmatch(r'\d{6}', code) or not expected_name:
++        raise ValueError('成员指数代码/名称无效')
++    limit, previous_total = 1000, None
++    for _ in range(2):
++        url = f'http://d.10jqka.com.cn/v2/blockrank/{code}/199112/d{limit}.js'
++        raw = http_get(url, headers={'Referer':'http://q.10jqka.com.cn/'},
++                       encoding='gbk', timeout=12, retry=1)
++        callback = re.search(r'^quotebridge_v2_blockrank_'+code+r'_199112_d'+str(limit)+r'\((.*)\)\s*;?\s*$', raw.strip(), re.S)
++        if not callback:
++            raise RuntimeError('成员接口回调与请求代码不一致')
++        obj = json.loads(callback.group(1))
++        block, items = obj.get('block') or {}, obj.get('items') or []
++        total = block.get('subcodeCount')
++        if block.get('name') != expected_name:
++            raise RuntimeError(f"成员指数名称未对齐：{block.get('name')!r} / {expected_name!r}")
++        if not isinstance(total,int) or isinstance(total,bool) or not 0 < total <= 10000:
++            raise RuntimeError('成员声明总数无效或超过读取范围')
++        if previous_total is not None and previous_total != total:
++            raise RuntimeError('两次成员请求总数变化，完整性需重核')
++        codes = [str(row.get('5') or '') for row in items]
++        if any(not re.fullmatch(r'\d{6}', c) for c in codes) or len(set(codes)) != len(codes):
++            raise RuntimeError('成员代码无效或重复，不能标记完整')
++        if len(codes) == total:
++            return sorted(codes)
++        if total > limit and len(codes) == limit:
++            previous_total, limit = total, total
++            continue
++        raise RuntimeError(f'成员名单未完整：实际{len(codes)} / 声明{total}')
++    raise RuntimeError('成员接口未返回声明的完整名单')
++
++
+ def fetch_ths_detail_members(detail_code, max_page=60, section="gn", allow_partial=False):
+     """从同花顺概念/行业详情页读取真实成分股代码。
+ 
+@@ -2189,14 +2223,18 @@
+     def ths_industry_work(item):
+         name, dc = item
+         try:
+-            result = fetch_ths_detail_members(dc, section="thshy", allow_partial=True)
+-            codes = result['codes']
+-            return name, codes, (RuntimeError(result['error'] or '同花顺行业详情页无成分股')
+-                                 if not result['complete'] or not codes else None)
++            try:
++                codes = fetch_ths_index_members(dc, name)
++                return name, codes, None
++            except Exception as index_error:
++                result = fetch_ths_detail_members(dc, section="thshy", allow_partial=True)
++                codes = result['codes']
++                return name, codes, (RuntimeError(str(index_error)+'；'+str(result['error'] or '详情成员为空'))
++                                     if not result['complete'] or not codes else None)
+         except Exception as e:
+             return name, [], e
+ 
+-    with ThreadPoolExecutor(max_workers=6) as ex:
++    with ThreadPoolExecutor(max_workers=3) as ex:
+         futs = [ex.submit(ths_industry_work, item) for item in direct_targets]
+         for f in as_completed(futs):
+             name, codes, err = f.result()
+@@ -2236,6 +2274,9 @@
+             "member_source": "ths-industry-detail-v1",
+             "catalog_fingerprint": catalog_fp,
+             "catalog_detail_count": len(catalog.get("detail") or {})}
++    stat['member_endpoint'] = '同花顺完整指数成员接口；失败时核对同花顺详情分页'
++    stat['complete_counts'] = {name:sum(name in names for names in out.values())
++                               for name in detail_by_name if name not in failed}
+     blob = {"map": out, "stat": stat}
+     config.atomic_write_text(p, json.dumps(blob, ensure_ascii=False))
+     _source_mark("ths_industry_members", "partial" if failed else "ok", elapsed=time.time() - t0,
+--- board_center.py before
++++ board_center.py current
+@@ -6,7 +6,7 @@
+ import config
+ import stock_strength
+ 
+-VERSION = '板块目录补全1'
++VERSION = '板块成员完整3'
+ 
+ 
+ def _catalog():
+@@ -76,8 +76,18 @@
+             catalog_ids.add(board_id)
+             # 只取该名称在同花顺详情中的真实成员，不把细分行业改名成上位行业。
+             official = detail.get(name,set()) & pool
+-            pool_groups[board_id].update(official)
+-            groups[board_id].update(official & set(valid))
++            verified_industry = (kind == 'industry'
++                                 and name not in (industry_stat.get('failed') or [])
++                                 and industry_stat.get('complete_counts', {}).get(name) == len(detail.get(name, set()))
++                                 and bool(detail.get(name)))
++            if verified_industry:
++                # 完整同源指数成分优先，旧F10中的移除成员不混入正式行业入口。
++                # 个股首个细分归属和未取得完整名单的旧归集均不改动。
++                pool_groups[board_id] = set(official)
++                groups[board_id] = official & set(valid)
++            else:
++                pool_groups[board_id].update(official)
++                groups[board_id].update(official & set(valid))
+     index = {b["name"]: b for b in index_boards}
+     market_ret5 = _avg(stocks, "ret5") or 0
+     market_trend = mean(bool(s.get("trend_online")) for s in stocks) * 100 if stocks else 0
+@@ -99,7 +109,7 @@
+                            and (disagreement is None or disagreement == 0))
+         # 详情成员数小于已确认的主板池成员，或与 F10 有差异时，不称其完整。
+         source_count = detail_count if detail_reliable else len(pool_codes)
+-        source_basis = (("同花顺概念详情成员缓存" if kind == "theme" else "同花顺行业详情成员缓存")
++        source_basis = (("同花顺概念详情成员缓存" if kind == "theme" else "同花顺行业完整成员接口缓存" if industry_stat.get('member_endpoint') else "同花顺行业详情成员缓存")
+                         if detail_reliable else
+                         "同花顺F10与概念详情合并归集（本系统主板池）" if kind == "theme"
+                         else "同花顺行业归集（本系统主板池）")
+--- dashboard_template.html before
++++ dashboard_template.html current
+@@ -4578,7 +4578,7 @@
+     '当前有效主板成员的近3个完成日线：在线成员连续两次增加且在线比例高于全体主板，才标记持续扩散。不是历史全市场成分回测，也不证明带动关系。');
+   if(!b.pool_members)h+=uiTag('成员待补齐','warn','同花顺目录中存在该板块，但当前尚未取得可用的主板成员；保留查询入口，不生成成员强势结论。');
+   else if(!b.valid_members)h+=uiTag('日线待补齐','warn','已归集成员，但本轮没有通过日线数据检查的有效样本；不进入正式筛选。');
+-  if(b.membership_stale)h+=uiTag('成员待更新','warn','该板块本次详情读取未完整成功，保留上次有来源的成员；不把部分分页标记为完整名单。');
++  if(b.membership_stale)h+=uiTag('成员缓存','','成员名单每7天在非交易时段更新一次。上次详情分页未完整成功，当前沿用有来源的归集名单，未标记为完整成分；报价及指数仍独立更新。');
+   if(!b.ranking_eligible)h+=uiTag('小样本','warn',b.ranking_reason||'有效成员不足6只，不参与正式筛选及排名。');
+   if(b.wide)h+=uiTag('宽题材','','成员超过60只，建议结合详情中的细分成员观察。');
+   return h;
+@@ -4622,6 +4622,9 @@
+         +x[1]+'<span>'+all.filter(function(b){return boardMatches(b,x[0]);}).length+'</span></button>';}).join('')+'</div>'
+     +'<div class="bc-reference"><span>'+(BC_SEARCH?'全部目录查询':'最新指数结合历史趋势')+'</span>'
+     +uiTag('筛选口径','','当前主标签及筛选使用当日有效指数报价，历史须最新22日连续对齐；至少6只有效主板成员。强势推进须MA5＞MA10、两线向上、现价站上两线。盘中不累计收盘确认日数；成员扩散单独保留日线标识。')
++    +uiTag((DATA.member_refresh||{}).last_result==='failed'?'成员周更未完成':'成员每周更新',(DATA.member_refresh||{}).last_result==='failed'?'warn':'',
++      '成员名单每7天更新一次，避开交易窗口；下次检查 '+((DATA.member_refresh||{}).next_update_at||'待后台载入')+'。'
++      +((DATA.member_refresh||{}).error||'周内沿用缓存，行情和指数按原节奏刷新。'))
+     +'<span>'+boards.length+' / '+all.length+' 个</span></div></div>'
+     +'<div class="bc-grid">'+(boards.length?boards.map(boardCard).join(''):'<div class="empty bc-empty">当前没有符合条件的板块，可切换筛选或清空搜索。</div>')+'</div>';
+ }
+@@ -4694,7 +4697,10 @@
+     +(daily.ready?'<p>完成日线本段开始 '+esc(daily.episode_start||'暂无有效观察')+'；历史跟踪自 '+esc(daily.replay_start||'—')+'。'
+       +(idx.first_ma10_break?' 首次失守 '+esc(idx.first_ma10_break)+'，至今 '+n(idx.ma10_break_days)+'个交易日。':'')
+       +(idx.risk_reason?' '+esc(idx.risk_reason)+'。':'')+'</p>':'')
+-    +'<p>成员来源：'+esc(b.source_basis)+'；'+esc(b.ranking_reason)+'。当前成员的近3日变化仅作扩散观察，不能代表历史全市场成员。'
++    +'<p>成员来源：'+esc(b.source_basis)+'。'
++    +(b.source_complete?'完整源成员 '+n(b.source_members)+'只；':'')
++    +'本系统主板样本 '+n(b.pool_members)+'只，日线有效 '+n(b.valid_members)+'只；成员核对 '+esc(typeof b.source_checked_at==='number'?new Date(b.source_checked_at*1000).toLocaleString('sv-SE',{timeZone:'Asia/Shanghai'}):(b.source_checked_at||'未知'))+'。'
++    +esc(b.ranking_reason)+'。当前成员的近3日变化仅作扩散观察，不能代表历史全市场成员。'
+     +(b.membership_disagreements!=null?' F10/详情归属差异 '+n(b.membership_disagreements)+'只。':'')+'</p>'
+     +'<p>资金采集 '+esc(b.fund_observed_at||'未知')+'；来源 '+esc(DATA.fund_source||'未知')+'。'
+     +(b.fund_today_covered?'已覆盖成员当日净额合计 '+sgn(b.fund_sum_today/1e8,2)+'亿元。':'')+'</p></div></details>';

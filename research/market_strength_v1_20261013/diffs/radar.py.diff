@@ -1,0 +1,15 @@
+--- before/radar.py
++++ after/radar.py
+@@ -6,9 +6,9 @@
+ def build_opportunities(snap, quotes, pool, price_contexts, histories, calendar,
+                         previous=None, state=None, persist=False, now=None):
+     """全部主板合格样本可进入，日线分档保持原样。"""
+-    import radar_opportunity
+-    return radar_opportunity.build(snap,quotes,pool,price_contexts,histories,calendar,
+-                                   previous,state,persist,now)
++    import market_strength
++    return market_strength.attach(snap,quotes,pool,histories,calendar,
++                                  contexts=price_contexts,now=now,previous=previous)
+ 
+ FACTOR_ORDER = config.STRATEGY['factors']['trend']
+ 

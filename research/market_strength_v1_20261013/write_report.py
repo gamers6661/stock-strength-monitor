@@ -1,0 +1,94 @@
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path.cwd()))
+import json,hashlib,csv,io,difflib
+import market_strength as M
+out=Path('research/market_strength_v1_20261013');base=out/'baseline'
+download=Path('.playwright-cli/当前强势-d393abdd26b36198ee3ce33e.csv');native=download.read_bytes();http=(out/'当前强势.csv').read_bytes();assert native==http
+(out/'浏览器实际导出.csv').write_bytes(native)
+for p in Path('output/playwright').glob('market-strength-*.png'):
+ if 'before-final' not in p.name:(out/p.name).write_bytes(p.read_bytes())
+v=json.loads((out/'live_verification.json').read_text(encoding='utf8'));after=json.loads((out/'post_publish_status.json').read_text(encoding='utf8'));before=json.loads((out/'pre_final_refresh_status.json').read_text(encoding='utf-8-sig'));initial=json.loads((base/'service_status.json').read_text(encoding='utf8'))
+assert after['data_version']!=before['data_version'] and after['ui_generation']!=before['ui_generation']
+assert after['refresh']['ok'] and not after['refresh']['running'] and after['phase']=='ready' and after['last_scan_ok']
+raw=json.loads((base/'frozen_complete_inputs.json').read_text(encoding='utf8'));comparison=json.loads((out/'comparison.json').read_text(encoding='utf8'));old_selected={c for c,r in comparison['stocks'].items() if r['old_current']};new_selected={c for c,r in comparison['stocks'].items() if r['new']['focus']}
+source_changes=[];(out/'diffs').mkdir(exist_ok=True)
+for p in Path('.').iterdir():
+ if p.is_file() and p.suffix in ('.py','.js','.html') and p.name!='dashboard.html':
+  old=base/p.name
+  if not old.exists() or old.read_bytes()!=p.read_bytes():
+   source_changes.append(dict(file=p.name,sha256=hashlib.sha256(p.read_bytes()).hexdigest()))
+   diff=''.join(difflib.unified_diff(old.read_text(encoding='utf-8-sig').splitlines(True) if old.exists() else [],p.read_text(encoding='utf-8-sig').splitlines(True),fromfile='before/'+p.name,tofile='after/'+p.name))
+   (out/'diffs'/(p.name+'.diff')).write_text(diff,encoding='utf8')
+(out/'changed_files.json').write_text(json.dumps(source_changes,ensure_ascii=False,indent=2),encoding='utf8')
+(out/'browser_csv_comparison.json').write_text(json.dumps(dict(rows=511,byte_equal=True,sha256=hashlib.sha256(native).hexdigest(),generation=v['ui_generation']),indent=2),encoding='utf8')
+text=f'''# 市场强度第一轮验收报告
+
+实施口径：负责人执行指令.md。版本固定 `{M.VERSION}`；65/80/45、各周期尺度、ATR结构档位、权重及6只/80%覆盖均按指令冻结，未按当天名单调参。全部参数见 config.py 的 MARKET_STRENGTH 和快照 market_strength.parameters。
+
+## 1. 实际完成结果
+
+- 个股：趋势强{v['counts']['trend']}、情绪强{v['counts']['emotion']}、两轴都强{v['counts']['both']}；去重当前强势{v['counts']['focus']}，完整范围3120只主板股票。
+- 板块：趋势强{v['board_counts']['trend']}、情绪强{v['board_counts']['emotion']}，去重{v['board_counts']['focus']}；实际页面行业13、题材3，共539个确认目录对象。
+- 个股两轴缺口：趋势{v['coverage']['trend_missing']}、情绪{v['coverage']['emotion_missing']}；有效分别{v['coverage']['trend_valid']}、{v['coverage']['emotion_valid']}。缺失保留null，不填0。
+- 当前强势阶段：启动215、推进194、回踩整理83、转弱16、阶段未知3。转弱仍可由情绪轴入选。上述为午休参考，使用实际源报价时间；不声称是午后连续竞价结果。
+- 实际抽查澳弘电子605058：T100.00/E99.77，主导20日、推进；中兴商业000715：T98.69/E100.00，主导5日、启动；情绪单轴抽查000668也通过同版详情比对。
+- 元件行业：T15.48/E85.87，阶段启动、情绪先行。成员广合科技001389独立为T1.37/E46.71，没有因板块情绪强而获得个股强度加分。
+
+## 2. 备份与冻结
+
+baseline/保存修改前源文件、配置、dashboard.html、cache/snapshot.json、相关JSON缓存；market.db和scan_features.db使用SQLite backup接口保存。manifest.json的147项原备份哈希已全部核验未变；原服务PID为{initial['pid']}，完整状态及UI版本见baseline/service_status.json。
+
+冻结判断时刻 `{raw['now']}`；报价、正式完成日线、交易日历、3120只配置股票池、539个板块的确认成员及原指数参照均冻结。首次快照整理缺少94条coverage行的volume_shou，随后从同一时刻、已有本地acquisitions采集记录补齐真实字段；全部已有原报价字段逐项相等，未重新联网取一套输入。保留首次冻结文件及manifest；补齐输入和采集原文另存frozen_complete_inputs.json、raw_acquisition_113111.json及freeze_completion_manifest.json，未覆盖首次备份。
+
+复算命令：`D:/python/python.exe -X utf8 research/market_strength_v1_20261013/replay_frozen.py`。固定原时刻，补齐后的完整冻结输入哈希为 `{comparison['input_hash']}`。报价、日线、股票池、日历、成员/指数各有独立哈希。复算前后输入文件、原成员代码顺序与原指数字段均未变。
+
+comparison.json逐股列出旧分、旧当前标记、新T/E、三个周期R/S/A/G/K/T、主导周期、阶段、原因、风险和数据缺口；板块保留各周期/轴有效数量、覆盖、截尾代码及结构/强股比例。旧current标记{len(old_selected)}只，新focus{len(new_selected)}只，新增{len(new_selected-old_selected)}、退出{len(old_selected-new_selected)}；这两个字段属于不同规则，不能当成收益提升证据。同份输入变化由新模型产生，未设最低入选名额。
+
+## 3. 实现与旧门槛撤除
+
+market_strength.py唯一计算两轴、独立周期、阶段、事件与名单；config.py集中固定参数；scoring.py在统一价格上下文形成后，以完整配置范围调用一次新模型并重建所有前台投影。原主板范围、同花顺分类/细分行业、成员图、数据源、5分钟采集周期、日历、价格口径核验保留。
+
+radar.py、radar_opportunity.build、board_opportunity.enrich的当前入口均改读统一模型；原V1采样实现标为私有_archived_v1入口，仅保留代码作为历史研究背景，不在生产主名单调用链中执行。scoring中移除了旧board_opportunity.enrich采样调用。新主名单不读取旧确认次数、跨度、生命周期、风险清零、完整多头、当天上涨或板块支持条件，也不写旧确认状态。
+
+board_catalog确认成员来自原board_center构建，最终成员及列表由新模型投影；情绪单轴、历史不足、重复题材关联均不截断。旧日线评分与MA专题留作历史兼容，但不控制主入口。
+
+页面总览、雷达、行业/题材、搜索和两类详情使用新T/E；主入口一张表，只有两轴，没有第三总分。综合/趋势/情绪排序顺序由后端完整ID列表提供；前端只做明确允许的范围、阶段、名称筛选及分页，不重新评分。撤掉旧流程视图和混有多头准入的策略说明条；风险始终展示，原旧risk_notes资格失败说明不作为新风险。
+
+ui_payload统一摘要、懒加载详情和CSV；成员摘要只复制规范评分字段，完整公式证据留在同版股票/板块详情，避免重复传输。修改文件和逐文件diff见changed_files.json、diffs/。
+
+## 4. 测试与异常处理
+
+- `D:/python/python.exe -X utf8 -m unittest -v test_market_strength test_market_strength_integration`：42项通过，model_tests.txt。
+- `D:/python/python.exe -X utf8 -m unittest discover -p "test_*.py"`：529项通过，regression_final.txt。
+- `D:/python/python.exe -X utf8 check_dashboard.py`：通过，dashboard_check.txt。
+- `D:/python/python.exe -X utf8 check_live_service.py`：通过，live_service_check.txt。
+- `D:/python/python.exe -X utf8 research/market_strength_v1_20261013/verify_http.py`：全部3120只摘要、539个板块摘要、股票/板块详情抽查和511行完整CSV同版核对通过，http_check.txt、live_verification.json。
+
+70.55和83.30不仅测试直接指定S/K的数值公式，还通过21只完整原始报价/日线、真实平均名次S95和真实ATR结构K0.85得到相同分数。其余覆盖慢涨高分位、全部结构受损、R0非正最多58、一字涨停/非涨停同高低价、真实半tick涨停、两轴缺失独立、单龙头截尾、6只/80%边界、逐周期独立、去重、首轮入选、下一轮退出、历史阶段优先级、竞价/午休/午后失效/盘后，以及正式当日不重复计入。
+
+旧测试对多次采样、确认跨度、事件窗口、风险取消等预期按新业务重写；原版本完整保留在baseline。价格口径、交易日窗口、缺失值、成员一致性、源时间、指数历史和服务版本等保护继续验证。初次回归的旧契约失败及UI接线错误已修正；一次重启扫描期间全量测试碰到全局写锁导致7项PipelineBusy，待扫描结束重跑完整529项后全部通过。最初组合重启命令被自动审批阻止，随后只核验并停止精确本项目PID，由原项目监督器重启；未终止其他项目。初次页面检查中的旧radar.trend Top N断言改为完整新名单一致性，未删除价格/成员/服务检查。
+
+## 5. 实际发布证据
+
+最终服务PID `{v['pid']}`，模型运行版本/快照版本均为 `{M.VERSION}`；进程导入时固定运行哈希、快照哈希及本地实现哈希一致：
+
+`{v['runtime_hash']}`
+
+实际POST /__refresh收到started/quick，最后ready、last_scan_ok=true、last_publish_ok=true、refresh.ok=true。一次再次请求遇到原有60秒cooldown，等冷却后正常启动，未修改采集/冷却周期。
+
+最终正常刷新前data_version `{before['data_version']}`，刷新后 `{v['data_version']}`；UI generation由 `{before['ui_generation']}` 更新到 `{v['ui_generation']}`。报价采集 `{v['quote_capture_at']}`、快照完成 `{after['snapshot_generated_at']}`、实际发布 `{v['published_at']}`。完整原/最终PID、版本、哈希和状态见pre_restart_status.json、pre_final_refresh_status.json、post_publish_status.json；刷新收据见refresh_receipt.json。
+
+实际重新加载HTTP dashboard后：雷达511只完整名单与后端ID顺序一致、一个主表；行业13＋题材3与后端完整板块名单一致；旧策略说明条computed display为none。实际点击股票、板块及成员详情，显示同版数值、来源时间和公式分项。浏览器真实点击CSV下载，511行文件与HTTP导出逐字节相同，且每行完整模型JSON与快照一致：SHA256 `{hashlib.sha256(native).hexdigest()}`。页面JS未发现运行错误；控制台有一次favicon.ico 404，未影响页面、详情或导出。
+
+## 6. 交付入口
+
+- [同份输入比较](comparison.json) · [原始采集记录](baseline/raw_acquisition_113111.json) · [哈希清单](baseline/manifest.json)
+- [完整浏览器实际导出CSV](浏览器实际导出.csv) · [HTTP同版核对](live_verification.json)
+- [实际雷达](market-strength-radar.png) · [行业](market-strength-industry.png) · [题材](market-strength-theme.png)
+- [股票详情](market-strength-stock-detail.png) · [板块详情](market-strength-board-detail.png) · [成员详情](market-strength-member-detail.png)
+
+当前实盘有启动及回踩阶段，已如实列出；分支边界仍以合成行情证明。上述验证证明本轮公式、数据与发布契约，不证明收益最优。交负责人验收，未放宽65分或改动固定参数。
+'''
+(out/'验收报告.md').write_text(text,encoding='utf8')
+print('Report saved; actual browser CSV byte-identical; publication updated; screenshots copied.')

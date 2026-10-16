@@ -1,0 +1,109 @@
+"""同花顺板块分时批量报价；保留源日期/分钟，不以采集时间替代报价时间。"""
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
+import math
+import re
+
+import config
+import datafeed
+
+CACHE = config.CACHE_DIR / 'ths_index_quotes.json'
+
+
+def parse(raw):
+    match = re.search(r'\((.*)\)\s*;?\s*$', raw.strip(), re.S)
+    obj = json.loads(match.group(1)) if match else {}
+    quotes = {}
+    for key, row in obj.items():
+        if not re.fullmatch(r'bk_\d{6}', key):
+            continue
+        try:
+            day = datetime.strptime(row['date'], '%Y%m%d').strftime('%Y-%m-%d')
+            points = []
+            for item in row.get('data', '').split(';'):
+                if not item:
+                    continue
+                p = item.split(',')
+                at = datetime.strptime(day+' '+p[0], '%Y-%m-%d %H%M')
+                price = float(p[1])
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError('分时价格异常')
+                if points and at <= points[-1][0]:
+                    raise ValueError('分时顺序异常')
+                points.append((at, price))
+            pre = float(row['pre'])
+            if not points or not math.isfinite(pre) or pre <= 0:
+                continue
+            quotes[key[3:]] = dict(code=key[3:], name=row['name'], date=day,
+                quote_at=points[-1][0].isoformat(sep=' ', timespec='seconds'),
+                price=points[-1][1], previous_close=pre,
+                sampled_low=min(p[1] for p in points), sampled_high=max(p[1] for p in points),
+                source='同花顺板块指数分时', price_basis='同花顺指数原值',
+                change_pct=(points[-1][1]/pre-1)*100)
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+    return quotes
+
+
+def fetch(codes, cache_path=None):
+    """每20个指数合并为一请求，最多3路；失败缓存保持真实报价时间。"""
+    target = cache_path or CACHE
+    try:
+        cached = json.loads(target.read_text(encoding='utf-8')).get('quotes') or {}
+    except (OSError, ValueError):
+        cached = {}
+    codes = sorted(set(str(c) for c in codes if re.fullmatch(r'\d{6}', str(c))))
+    batches = [codes[i:i+20] for i in range(0, len(codes), 20)]
+
+    def work(batch):
+        try:
+            url = 'http://d.10jqka.com.cn/v6/time/'+','.join('bk_'+c for c in batch)+'/last.js'
+            raw = datafeed.http_get(url, headers={'Referer': 'http://q.10jqka.com.cn/'},
+                                   encoding='gbk', timeout=8, retry=1)
+            return batch, parse(raw), None
+        except Exception as exc:
+            return batch, {}, str(exc)
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for batch, fresh, error in pool.map(work, batches):
+            for code in batch:
+                q = fresh.get(code)
+                old = cached.get(code)
+                # 旧响应和失败不倒退成功缓存，也不把旧数据的时间改成现在。
+                if q and (not old or q['quote_at'] >= old.get('quote_at', '')):
+                    cached[code] = q
+                used = dict(cached.get(code) or {})
+                if error or not q or q.get('quote_at', '') < (old or {}).get('quote_at', ''):
+                    used['fetch_error'] = error or '本轮未返回更新的有效指数报价'
+                result[code] = used
+    config.atomic_write_text(target, json.dumps(dict(quotes=cached), ensure_ascii=False))
+    return result
+
+
+def freshness(quote, now, session):
+    try:
+        at = datetime.fromisoformat(quote['quote_at'])
+    except (KeyError, TypeError, ValueError):
+        return '尚无当日指数报价'
+    if at.date() != now.date():
+        return '指数报价不是当日数据'
+    age = (now-at).total_seconds()
+    if age < -config.INTRADAY['max_quote_future_seconds']:
+        return '指数报价时间超前'
+    minute = at.hour*60+at.minute
+    if session in ('集合竞价', '竞价结束'):
+        if not 9*60+15 <= minute < 9*60+30:
+            return '尚无当日竞价指数报价'
+    elif not (9*60+30 <= minute <= 11*60+30 or 13*60 <= minute <= 15*60):
+        return '指数报价不在交易时段'
+    if session == '午间休市':
+        return None if minute == 11*60+30 else '尚无11:30上午收市指数报价'
+    if session == '已收盘':
+        return None if minute == 15*60 else '尚无15:00收盘指数报价'
+    if session in ('午盘', '尾盘') and minute < 13*60:
+        return '尚无下午指数报价'
+    if age > config.INTRADAY['max_quote_age_seconds']:
+        return '指数报价过期'
+    return None

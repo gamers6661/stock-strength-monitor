@@ -1,0 +1,855 @@
+--- before/config.py
++++ after/config.py
+@@ -13,19 +13,19 @@
+ 
+ ROOT = Path(__file__).resolve().parent
+ EMOTION_RELAY = {
+-    'version': 'mainboard-relay-2026-10-15.1',
+-    'history_days': 21, 'raw_history_days': 65, 'workers': 6,
++    'version': 'mainboard-relay-2026-10-15.2',
++    'history_days': 20, 'warmup_days': 10, 'raw_history_days': 65, 'workers': 6,
+     'request_seconds': 8, 'fetch_budget_seconds': 55,
+     'min_peer_count': 5, 'min_peer_coverage_pct': 80.,
+     'diffusion_up_pct': 60., 'diffusion_limit_peers': 2,
+-    'leader_min_height': 2, 'core_min_height': 3,
+-    'continuation_max_height': 2, 'continuation_height_gap': 2,
+-    'continuation_peer_limit_min': 2, 'continuation_limit_enrichment': 1.5,
+-    'prior_high_lookback_days': 5,
++    'leader_min_height': 2,
+     'feedback_min_sample': 5, 'repair_gain_pp': 3.,
+     'observation_interval_minutes': 30,
+     'promotion_strong_pct': 50., 'promotion_weak_pct': 25.,
+     'negative_feedback_pct': -3., 'large_loss_pct': -5.,
++    'cycle_core_min_height': 5, 'cycle_core_recent_days': 5,
++    'companion_start_gap': 2, 'companion_overlap_days': 2,
++    'relation_max_members': 300,
+ }
+ MA_TREND = {
+     'version': 'ma-trend-2026-10-15.4',
+--- before/emotion_relay.py
++++ after/emotion_relay.py
+@@ -4,9 +4,9 @@
+ from datetime import datetime,timedelta
+ from pathlib import Path
+ from statistics import median,mean
+-import config,intraday,market_strength as M,relay_data as D
++import config,intraday,market_strength as M,relay_data as D,relay_history as H,relay_regulation as R,relay_cycles as C
+ P=config.EMOTION_RELAY;VERSION=P['version']
+-IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(D.__file__).read_bytes()+json.dumps(P,sort_keys=True).encode()).hexdigest()
++IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(D.__file__).read_bytes()+Path(H.__file__).read_bytes()+Path(R.__file__).read_bytes()+Path(C.__file__).read_bytes()+json.dumps(P,sort_keys=True).encode()).hexdigest()
+ 
+ def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+ def pct(n,d):return round(100*n/d,2) if d else None
+@@ -36,11 +36,14 @@
+ def chain(code,days,calendar,bars,evidence):
+     native={b['date']:b for b in bars};height=0;exact=False;path=[]
+     for day in days:
+-        sealed,reason=sealed_day(code,day,calendar,native,evidence)
+-        if sealed is None:height=0;exact=False
++        halted=False
++        if 'reference' in evidence:sealed,reason,halted=H.classify(code,day,calendar,evidence)
++        else:sealed,reason=sealed_day(code,day,calendar,native,evidence)
++        if halted:pass
++        elif sealed is None:height=0;exact=False
+         elif sealed:height+=1
+         else:height=0;exact=True
+-        path.append(dict(date=day,sealed=sealed,height=height if sealed is not None else None,exact=exact,reason=reason))
++        path.append(dict(date=day,sealed=sealed,height=height if sealed is not None or halted else None,exact=exact,reason=reason,halted=halted))
+     return path
+ 
+ def effective_quote(snap,row,quotes):
+@@ -51,16 +54,18 @@
+             if intraday.parse_quote_timestamp(saved.get('quote_at') or saved.get('ts'))==intraday.parse_quote_timestamp(clock):return saved
+     return q
+ 
+-def current(code,row,q,path,now,session,center,old,regime_ready=True):
++def current(code,row,q,path,now,session,center,old,regime_ready=True,daily_proof=None):
+     prior=path[-1] if path else {};previous=path[-2] if len(path)>1 else {}
+-    formal=(row.get('market_strength') or {}).get('mode')=='正式收盘'
++    formal=bool(daily_proof) or (row.get('market_strength') or {}).get('mode')=='正式收盘'
+     valid,at,reason=M.quote_valid(q,now,session,center,formal)
++    if daily_proof:valid=True;reason=None
+     if session not in ('早盘','午盘','尾盘','午间休市','已收盘'):valid=False;reason='竞价/非交易时段不生成正常接力事件'
+     out=dict(version=VERSION,code=code,quote_at=str(at) if at else None,valid=valid,reason=reason,
+         mode='正式收盘' if formal else '午休参考' if session=='午间休市' else '盘中暂态',
+         valid_until=(str(at+timedelta(seconds=config.INTRADAY['max_quote_age_seconds'])) if at else None),
+         prior_date=prior.get('date'),prior_height=prior.get('height'),prior_exact=prior.get('exact',False),
+         prior_sealed=prior.get('sealed'),height=None,height_exact=False,sealed=None,touched=None,
++        prior_suspended=prior.get('halted',False),suspended_current=False,
+         roles=[],events=[],risks=[],eligible=False,history_reason=prior.get('reason'),
+         broken_yesterday=bool(prior.get('sealed') is False and previous.get('sealed') is True and (previous.get('height') or 0)>=2),
+         broken_from_height=previous.get('height') if prior.get('sealed') is False else None,
+@@ -68,6 +73,7 @@
+         turnover_pct=q.get('turnover_pct') if valid else None,amount_wan=q.get('amount_wan') if valid else None,
+         price=q.get('price') if valid else None,limit_price=None,relations=[],continuation=[],observations=[])
+     if not valid:return out
++    if daily_proof:out['completed_daily_proof']=daily_proof;out['events'].append('收盘日线已核验')
+     if session=='午间休市':out['valid_until']=now.date().isoformat()+' 13:00:00'
+     elif formal:out['valid_until']=now.date().isoformat()+' 23:59:59'
+     limit=q.get('limit_up');prev=q.get('last_close')
+@@ -79,7 +85,7 @@
+         or D.tick(q['high'])>D.tick(limit) or D.tick(limit)!=D.tick(D.limit_price(prev))):
+         out.update(valid=False,reason='当日主板涨停制度、原价涨停价或OHLC待核验');return out
+     out.update(limit_price=limit,sealed=D.tick(q['price'])==D.tick(limit),touched=D.tick(q['high'])>=D.tick(limit),feedback_pct=round(100*(q['price']/prev-1),2))
+-    if prior.get('sealed') is not None:
++    if prior.get('sealed') is not None or prior.get('halted'):
+         out['height']=(prior.get('height') or 0)+1 if out['sealed'] else prior.get('height')
+         out['height_exact']=prior.get('exact',False)
+     out['completed_height']=out['height'] if formal and out['sealed'] else 0 if formal else prior.get('height')
+@@ -117,7 +123,7 @@
+ 
+ def order_key(m):
+     roles=m['roles'];priority=0 if '空间高标' in roles else 1 if '题材领先候选' in roles else 2 if '连板晋级' in roles else 3 if m['continuation'] else 4 if '首板启动' in roles else 5 if m['prior_sealed'] else 6
+-    return (not m['valid'],not m['eligible'],priority,-(m['height'] or 0),not bool(m['sealed']),-(m['feedback_pct'] if number(m['feedback_pct']) else -999),-(m['amount_wan'] or 0),m['code'])
++    return (not (m['valid'] or m['suspended_current']),not m['eligible'],0 if '周期最高标' in roles else priority,-(m['height'] or 0),not bool(m['sealed']),-(m['feedback_pct'] if number(m['feedback_pct']) else -999),-(m['amount_wan'] or 0),m['code'])
+ 
+ def cohort(models,codes):
+     valid=[models[c] for c in codes if models[c]['valid']];sealed=sum(bool(m['sealed']) for m in valid)
+@@ -129,17 +135,31 @@
+ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=None,fetch=True,persist=True):
+     now=now or datetime.fromisoformat(snap['quote_capture_at']);day=now.date().isoformat();session=snap.get('session')
+     rows={r['code']:r for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
+-    dates=[d for d in calendar if d<day];days=dates[-P['history_days']:]
+-    evidence=evidence if evidence is not None else D.load(days,fetch=fetch and session not in ('盘前','集合竞价','非交易日'))
+-    paths={c:chain(c,days,dates,histories.get(c) or [],evidence) for c in rows}
++    dates=[d for d in calendar if d<day];days=dates[-P['history_days']:];replay_days=dates[-(P['history_days']+P['warmup_days']):]
+     effective={c:effective_quote(snap,r,quotes) for c,r in rows.items()}
++    verified=intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
++    if session=='已收盘' and verified and verified.date()==now.date() and verified<=datetime.now()+timedelta(seconds=config.INTRADAY['max_quote_future_seconds']):now=max(now,verified)
++    proofs={}
++    if session=='已收盘':
++        proofs={c:p for c in rows if (p:=H.close_proof(snap,effective[c],histories.get(c) or [],calendar,now,code=c))}
++    if evidence is None:
++        H.ingest_close(snap,effective,now,proofs)
++        evidence=H.load(rows,replay_days,dates,day,fetch=fetch and session not in ('盘前','集合竞价','非交易日'))
++    if 'reference' in evidence:H.index(evidence)
++    reg=evidence.get('regulation')
++    if reg is None:
++        selected=C.focus(evidence,rows) if 'reference' in evidence else []
++        completed_dates=dates+([day] if session=='已收盘' and (proofs or any((r.get('market_strength') or {}).get('mode')=='正式收盘' for r in rows.values())) else [])
++        reg=R.load(selected,completed_dates,now,fetch=fetch and bool(selected)) if selected else dict(notices=[],indices={},scope_codes=[],covered_codes=[])
++    evidence['verified_halts']=reg.get('suspension_intervals',evidence.get('verified_halts',[]))
++    paths={c:chain(c,replay_days,dates,histories.get(c) or [],evidence) for c in rows}
+     times=[intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'),now) for q in effective.values()]
+     times=sorted(t for t in times if t and t.date()==now.date() and abs((now-t).total_seconds())<=config.INTRADAY['max_quote_age_seconds'])
+     center=times[len(times)//2] if times else None
+     previous=previous or {};same=(previous.get('emotion_relay') or {}).get('implementation_hash')==IMPLEMENTATION_HASH
+     old={r['code']:r.get('emotion_relay') or {} for r in previous.get('stocks',[])+previous.get('coverage_catalog',[])} if same else {}
+     models={c:current(c,r,effective[c],paths[c],now,session,center,old.get(c),
+-        regime_ready=sum(b.get('date','')<day and number(b.get('volume')) and b['volume']>0 for b in histories.get(c) or [])>=5) for c,r in rows.items()}
++        regime_ready=sum(b.get('date','')<day and number(b.get('volume')) and b['volume']>0 for b in histories.get(c) or [])>=5,daily_proof=proofs.get(c)) for c,r in rows.items()}
+     verified=[m for m in models.values() if m['valid'] and m['height_exact'] and (m['height'] or 0)>=P['leader_min_height']]
+     maximum=max((m['height'] or 0 for m in verified),default=0)
+     for m in verified:
+@@ -164,23 +184,7 @@
+                 else:kind='题材分化观察'
+             peers['state']=kind;m['relations'].append(peers)
+             if board['type']=='theme' and m in leaders and m['height']==top and peers['reliable']:m['roles'].append('题材领先候选')
+-            if board['type']!='theme' or not m['sealed'] or not m['height_exact'] or not 1<=m['height']<=P['continuation_max_height'] or not peers['reliable']:continue
+-            peer_limit_pct=pct(peers['limit_count'],peers['valid']) or 0
+-            if (market_coverage<P['min_peer_coverage_pct'] or not market_limit_pct
+-                or peers['limit_count']<P['continuation_peer_limit_min']
+-                or peer_limit_pct<market_limit_pct*P['continuation_limit_enrichment']):continue
+-            prior=paths[m['code']]
+-            if any((p.get('height') or 0)>=P['core_min_height'] for p in prior[-P['prior_high_lookback_days']:]):continue
+-            for leader in leaders:
+-                if leader['code']==m['code'] or (leader['prior_height'] or 0)<P['core_min_height'] or leader['height']-m['height']<P['continuation_height_gap']:continue
+-                if not leader['prior_exact'] or not leader['sealed']:continue
+-                index=len(dates)-int(leader['prior_height']);start=dates[index] if index>=0 else None
+-                if not start or start>=day:continue
+-                m['continuation'].append(dict(board_id=board['id'],board=board['name'],leader=leader['code'],leader_name=rows[leader['code']].get('name'),
+-                    leader_height=leader['prior_height'],leader_chain_start=start,own_height=m['height'],event_date=day,
+-                    peer_limit_pct=peer_limit_pct,market_limit_pct=market_limit_pct,limit_enrichment=round(peer_limit_pct/market_limit_pct,3),
+-                    basis='同题材核心已有至少3个完成连板；当前仍在板；本股首/二板主动封板且至少低两个板位，近期非旧高标；同行在板密度至少为市场1.5倍'))
+-                m['roles'].append('同题材接续候选')
++    cycles=C.attach(rows,models,paths,boards,evidence,reg,dates,day)
+     for m in models.values():
+         rivals=[r['code'] for r in verified if r['code']!=m['code'] and r['prior_height']==m['prior_height'] and (m['prior_height'] or 0)>=2]
+         if m['valid'] and rivals:m['roles'].append('同身位竞争');m['rivals']=rivals
+@@ -199,7 +203,7 @@
+     rankings={}
+     for board in snap.get('board_catalog',[])+[dict(id='all',member_codes=list(rows))]:
+         codes=list(dict.fromkeys(board.get('member_codes') or []));base=(snap.get('stock_board_ranking') or {}).get('all') if board['id']=='all' else board.get('stock_ranking')
+-        base=base or {};emotion=sorted((c for c in codes if c in models and models[c]['valid'] and models[c]['eligible']),key=lambda c:order_key(models[c]));ranks={c:i+1 for i,c in enumerate(emotion)}
++        base=base or {};emotion=sorted((c for c in codes if c in models and (models[c]['valid'] or models[c]['suspended_current']) and models[c]['eligible']),key=lambda c:order_key(models[c]));ranks={c:i+1 for i,c in enumerate(emotion)}
+         ordered=emotion+[c for c in base.get('all',codes) if c not in ranks]
+         items={}
+         for c in codes:
+@@ -218,29 +222,38 @@
+     promotion=[dict(height=n,**cohort(models,[c for c in yesterday if models[c]['prior_exact'] and models[c]['prior_height']==n])) for n in sorted({models[c]['prior_height'] for c in yesterday if models[c]['prior_exact']})]
+     timeline=[]
+     for i,d in enumerate(days):
+-        known=[p[i] for p in paths.values() if p[i]['sealed'] is not None]
+-        timeline.append(dict(date=d,valid=len(known),expected=len(rows),limit_count=sum(p['sealed'] is True for p in known),highest=max((p['height'] for p in known if p['exact'] and p['sealed']),default=None)))
++        offset=len(replay_days)-len(days);known=[p[offset+i] for p in paths.values() if p[offset+i]['sealed'] is not None or p[offset+i]['halted']]
++        timeline.append(dict(date=d,valid=len(known),expected=len(rows),suspended=sum(p['halted'] for p in known),limit_count=sum(p['sealed'] is True for p in known),highest=max((p['height'] for p in known if p['exact'] and p['sealed']),default=None),
++            retained_highest=max((p['height'] or 0 for p in known if p['exact']),default=None),unknown=len(rows)-len(known)))
++    # Include today's completed result only after a verified formal close.
++    if formal:
++        completed=[m['history'][-1] for m in models.values() if m.get('history') and m['history'][-1]['date']==day and (m['history'][-1]['sealed'] is not None or m['history'][-1]['halted'])]
++        timeline=(timeline+[dict(date=day,valid=len(completed),expected=len(rows),suspended=sum(p['halted'] for p in completed),limit_count=sum(p['sealed'] is True for p in completed),
++            highest=max((p['height'] or 0 for p in completed if p['exact'] and p['sealed']),default=0),retained_highest=max(cycles['cycle_highest'],max((p['height'] or 0 for p in completed if p['exact']),default=0)),unknown=len(rows)-len(completed))])[-P['history_days']:]
+     ordered=sorted(models,key=lambda c:order_key(models[c]));lists={
+-        'all':[c for c in ordered if models[c]['valid'] and models[c]['eligible']],
+-        'leaders':[c for c in ordered if models[c]['valid'] and any(r in models[c]['roles'] for r in ('空间高标','题材领先候选','同身位竞争'))],
++        'all':[c for c in ordered if (models[c]['valid'] or models[c]['suspended_current']) and models[c]['eligible']],
++        'leaders':[c for c in ordered if (models[c]['valid'] or models[c]['suspended_current']) and any(r in models[c]['roles'] for r in ('周期核心观察','空间高标','题材领先候选','同身位竞争'))],
+         'continuation':[c for c in ordered if models[c]['valid'] and models[c]['continuation']],
++        'companions':[c for c in ordered if models[c]['valid'] and models[c].get('companions')],
++        'suspended':[c for c in ordered if models[c]['suspended_current']],
+         'broken':[c for c in ordered if models[c]['valid'] and models[c]['broken_yesterday']],
+         'sealed':[c for c in ordered if models[c]['valid'] and models[c]['sealed']],
+-        'pending':[c for c in ordered if not models[c]['valid'] or models[c]['prior_sealed'] is None]}
++        'pending':[c for c in ordered if not models[c]['suspended_current'] and (not models[c]['valid'] or models[c]['prior_sealed'] is None and not models[c]['prior_suspended'])]}
+     snap['emotion_relay']=dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,parameters=copy.deepcopy(P),at=str(now),
+         source_at=max((m['quote_at'] for m in models.values() if m['valid']),default=None),mode='正式收盘' if formal else '午休参考' if session=='午间休市' else '盘中暂态',
+         scope='沪深主板普通10%制度；非全市场；盘中在板不等于完成连板',
+-        history_from=days[0] if days else None,history_asof=days[-1] if days else None,history_days=len(days),
+-        coverage=dict(pool=len(rows),valid_quotes=sum(m['valid'] for m in models.values()),valid_history=sum(m['prior_sealed'] is not None for m in models.values()),
++        history_from=timeline[0]['date'] if timeline else None,history_asof=timeline[-1]['date'] if timeline else None,history_days=len(timeline),
++        prior_history_asof=days[-1] if days else None,
++        coverage=dict(pool=len(rows),valid_quotes=sum(m['valid'] for m in models.values()),valid_history=timeline[-1]['valid'] if formal else sum(m['prior_sealed'] is not None or m['prior_suspended'] for m in models.values()),
+             verified_pool_days=sum(p.get('date_verified') is True for p in evidence['pools'].values()),expected_pool_days=len(days)),
+-        state=state,highest_previous=max((m['prior_height'] or 0 for m in models.values() if m['prior_exact']),default=0),
++        state=state,highest_previous=max((m['prior_height'] or 0 for m in models.values() if m['prior_exact'] and m['prior_sealed']),default=0),
+         highest_completed=(max((m['completed_height'] or 0 for m in models.values() if m['valid'] and m['height_exact']),default=0)
+             if formal else max((m['prior_height'] or 0 for m in models.values() if m['prior_exact']),default=0)),
+         highest_live=max((m['height'] or 0 for m in verified if m['sealed']),default=0),
+         daily_ladder=dict(daily_ladder),live_ladder=dict(live_ladder),promotion=promotion,
+         promotion_height_pending=sum(not models[c]['prior_exact'] for c in yesterday),
+         yesterday_feedback=feedback,yesterday_chain_feedback=chain_feedback,broken_feedback=broken_feedback,
+-        lists=lists,boards=[board_stats(b,models) for b in boards],rankings=rankings,timeline=timeline,fetch=evidence.get('fetch') or {},
++        lists=lists,boards=[board_stats(b,models) for b in boards],rankings=rankings,timeline=timeline,cycles=cycles,fetch=evidence.get('fetch') or {},
+         limitations=['未提供连板成功概率','未使用首封秒数、开板次数或封单强度','题材同步不等于因果带动，不推断躲异动动机'])
+     if persist and any(m['valid'] for m in models.values()):save_observation(snap)
+     return snap['emotion_relay']
+@@ -256,17 +269,17 @@
+     with gzip.open(path,'at',encoding='utf-8') as f:f.write(json.dumps(record,ensure_ascii=False)+'\n')
+     D.write(path.with_suffix('.last.json'),dict(at=meta['source_at'],hash=IMPLEMENTATION_HASH))
+ 
+-def brief(m):return {k:v for k,v in m.items() if k not in ('observations',)}
++def brief(m):return {k:v for k,v in m.items() if k not in ('observations','history','node_history')}
+ def validate(snap):
+     meta=snap['emotion_relay'];assert meta['version']==VERSION and meta['implementation_hash']==IMPLEMENTATION_HASH
+     rows={r['code']:r['emotion_relay'] for r in snap['stocks']+snap.get('coverage_catalog',[])}
+     for key,ids in meta['lists'].items():
+         assert len(ids)==len(set(ids)) and set(ids)<=set(rows)
+-        if key!='pending':assert all(rows[c]['valid'] for c in ids)
++        if key!='pending':assert all(rows[c]['valid'] or rows[c]['suspended_current'] for c in ids)
+     for c,m in rows.items():
+         if m['sealed']:assert m['valid'] and m['price']==m['limit_price']
+         if '首板启动' in m['roles']:assert m['height_exact'] and m['height']==1
+-        if m['continuation']:assert m['sealed'] and m['height_exact'] and m['height']<=P['continuation_max_height']
++        if m['continuation']:assert m['valid'] and m['height_exact'] and all(n['first_board_date']==n['date'] for n in m['continuation'])
+     for rank in meta['rankings'].values():
+         assert len(rank['all'])==len(set(rank['all']))==rank['expected']
+         assert set(rank['all'])==set(rank['emotion'])==set(rank['trend'])
+--- before/relay_history.py
++++ after/relay_history.py
+@@ -0,0 +1,173 @@
++"""Complete daily relay evidence and dated suspensions, separate from MA bars."""
++import json,time,urllib.parse
++from concurrent.futures import ThreadPoolExecutor,as_completed,TimeoutError
++from datetime import datetime
++from decimal import Decimal
++import config,datafeed,intraday,market_strength as M,relay_data as D
++
++
++def fetch_reference(codes,begin,asof):
++    url='https://q.stock.sohu.com/hisHq?'+urllib.parse.urlencode(dict(code=','.join('cn_'+c for c in codes),start=begin.replace('-',''),end=asof.replace('-',''),stat=1,order='A',period='d'))
++    values=json.loads(datafeed.http_get(url,timeout=config.EMOTION_RELAY['request_seconds'],retry=0))
++    if not isinstance(values,list):raise ValueError('原价参考返回格式异常')
++    result={}
++    for value in values:
++        code=str(value.get('code','')).removeprefix('cn_')
++        if value.get('status')!=0 or code not in codes or code in result:raise ValueError('原价参考代码或状态异常')
++        bars=[]
++        for r in value.get('hq',[]):
++            bar=dict(date=r[0],open=float(r[1]),close=float(r[2]),reference_close=float(Decimal(r[2])-Decimal(r[3])),
++                change_pct=float(r[4].removesuffix('%')),low=float(r[5]),high=float(r[6]),volume=float(r[7])*100,
++                turnover_pct=float(r[9].removesuffix('%')) if r[9]!='-' else None)
++            if not intraday._valid_historical_price_bar(bar) or bar['reference_close']<=0:raise ValueError('原价参考OHLC或前收无效')
++            bars.append(bar)
++        if len({b['date'] for b in bars})!=len(bars):raise ValueError('原价参考日期重复')
++        result[code]=dict(code=code,bars=bars,source='sohu_hisHq_raw',coverage_through=asof,requested_from=begin)
++    return result
++
++
++def fetch_halts(day):
++    params=dict(reportName='RPT_CUSTOM_SUSPEND_DATA_INTERFACE',columns='ALL',pageSize=500,pageNumber=1,
++        sortColumns='SUSPEND_START_DATE',sortTypes=-1,source='WEB',client='WEB',filter='(MARKET="全部")(DATETIME=\''+day+'\')')
++    value=json.loads(datafeed.em_get('https://datacenter-web.eastmoney.com/api/data/v1/get?'+urllib.parse.urlencode(params),timeout=config.EMOTION_RELAY['request_seconds']))
++    result=value.get('result') or {};rows=result.get('data')
++    if not value.get('success') or not isinstance(rows,list) or len(rows)!=result.get('count'):raise ValueError('停牌表完整性待核验')
++    return dict(day=day,source='eastmoney_exchange_suspension_table',rows=rows,fetched_at=str(datetime.now()))
++
++
++def halt_on(evidence,code,day):
++    for r in evidence.get('verified_halts',[]):
++        if r['code']==code and r['start']<=day and (not r.get('resume') or day<r['resume']):
++            return dict(start=r['start'],end=r.get('resume'),reason=r['reason'],source=r['source'],verified_day=day,known_at=r.get('published_at'))
++    record=(evidence.get('halts') or {}).get(day) or {}
++    for r in record.get('rows',[]):
++        if r.get('SECURITY_CODE')!=code or r.get('SUSPEND_EXPIRE')!='连续停牌':continue
++        start=str(r.get('SUSPEND_START_TIME') or '');end=str(r.get('SUSPEND_END_TIME') or '')
++        if start and start<=day+' 09:30:00' and (not end or end>=day+' 15:00:00'):
++            return dict(start=start,end=end or None,reason=r.get('SUSPEND_REASON'),source=record['source'],verified_day=day)
++    return None
++
++
++def load(codes,days,calendar,today,fetch=True,verified_halts=None):
++    result=D.load(days,fetch=False);result.update(reference={},halts={},verified_halts=verified_halts or []);start=time.monotonic();errors=[]
++    asof=days[-1] if days else None
++    if not asof:return result
++    for c in codes:
++        r=D.read(D.root()/'raw'/(c+'.json'))
++        if r:result['raw'][c]=r
++        r=D.read(D.root()/'reference'/(c+'.json'))
++        if r:result['reference'][c]=r
++    for day in days+[today]:
++        r=D.read(D.root()/'halts'/(day+'.json'))
++        if not r and fetch:
++            try:r=fetch_halts(day);D.write(D.root()/'halts'/(day+'.json'),r)
++            except Exception as e:errors.append(dict(day=day,reason=str(e)))
++        if r:result['halts'][day]=r
++    # A normal refresh is warm. The one-time history backfill is resumable, with
++    # a time budget; missing data never turns into a false non-limit day.
++    need=[c for c in codes if not any(b.get('date')==asof for b in result['raw'].get(c,{}).get('bars',[])) and not halt_on(result,c,asof)
++        and not (isinstance(codes,dict) and (codes[c].get('trade_status')=='no_trade') and not any(b['date']>=days[0] for b in result['raw'].get(c,{}).get('bars',[])))]
++    if fetch and need:
++        executor=ThreadPoolExecutor(max_workers=config.EMOTION_RELAY['workers']);jobs={executor.submit(D.fetch_raw,c):c for c in need}
++        try:
++            for job in as_completed(jobs,timeout=config.EMOTION_RELAY['fetch_budget_seconds']):
++                c=jobs[job]
++                try:r=job.result();result['raw'][c]=r;D.write(D.root()/'raw'/(c+'.json'),r)
++                except Exception as e:errors.append(dict(code=c,reason=str(e)))
++        except TimeoutError:errors.append(dict(reason='原价历史补采预算到期'))
++        finally:
++            for job in jobs:
++                if not job.done():job.cancel()
++            executor.shutdown(wait=False,cancel_futures=True)
++    active=[c for c in codes if any(b['date']>=days[0] for b in result['raw'].get(c,{}).get('bars',[]))]
++    need=[c for c in active if (result['reference'].get(c) or {}).get('coverage_through','')<asof]
++    for i in range(0,len(need),40):
++        if not fetch or time.monotonic()-start>config.EMOTION_RELAY['fetch_budget_seconds']:break
++        try:
++            values=fetch_reference(need[i:i+40],calendar[max(0,len(calendar)-66)],asof)
++            for c,r in values.items():result['reference'][c]=r;D.write(D.root()/'reference'/(c+'.json'),r)
++        except Exception as e:
++            errors.append(dict(reason='原价参考补采暂停：'+str(e)));break
++        time.sleep(.8)
++    result['fetch'].update(history_errors=errors,full_history_seconds=round(time.monotonic()-start,3),raw_codes=len(result['raw']),reference_codes=len(result['reference']))
++    return result
++
++
++def classify(code,day,calendar,evidence):
++    raw=evidence.get('_raw_index',{}).get(code)
++    if raw is None:raw={b['date']:b for b in evidence.get('raw',{}).get(code,{}).get('bars',[])}
++    refs=evidence.get('_ref_index',{}).get(code)
++    if refs is None:refs={b['date']:b for b in evidence.get('reference',{}).get(code,{}).get('bars',[])}
++    bar=raw.get(day);ref=refs.get(day);halt=halt_on(evidence,code,day)
++    if halt:
++        if bar and bar.get('volume',0)>0:return None,'停牌表与实际成交日线冲突',False
++        return None,'全天停牌，已完成板位保留且不增长',True
++    if not bar or not ref:return None,'原价日线或每日涨跌额参考未覆盖',False
++    if not intraday._valid_historical_price_bar(bar) or not bar.get('volume',0)>0 or not ref.get('volume',0)>0:return None,'无可核验成交日线',False
++    if any(D.tick(bar[k])!=D.tick(ref[k]) for k in ('open','high','low','close')):return None,'两来源原价OHLC不一致',False
++    if sum(b['date']<day and b.get('volume',0)>0 for b in raw.values())<5:return None,'上市初期涨跌幅制度待核验',False
++    entry=((evidence.get('pools',{}).get(day) or {}).get('entries') or {}).get(code)
++    if entry and str(entry.get('name','')).upper().startswith(('ST','*ST','N','C')):return None,'历史特殊涨跌幅制度不混比',False
++    cap=D.limit_price(ref['reference_close'])
++    if D.tick(bar['high'])>D.tick(cap):return None,'历史最高价超出普通10%限制，制度待核验',False
++    sealed=D.tick(bar['close'])==D.tick(bar['high'])==D.tick(cap)
++    pool=evidence.get('pools',{}).get(day) or {}
++    if pool.get('date_verified') and bool(entry)!=sealed:return None,'历史涨停池与原价封板核算不一致',False
++    return sealed,None,False
++
++
++def index(evidence):
++    evidence['_raw_index']={c:{b['date']:b for b in r['bars']} for c,r in evidence.get('raw',{}).items()}
++    evidence['_ref_index']={c:{b['date']:b for b in r['bars']} for c,r in evidence.get('reference',{}).items()}
++
++
++def close_proof(snap,q,bars,calendar,now,code=None):
++    """Verify a post-close quote against an independently completed native bar.
++
++    The provider's actual timestamp is retained. A late timestamp alone never
++    establishes a closing price; all four prices and the native scale must match.
++    """
++    at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'))
++    verified=intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
++    if snap.get('session')!='已收盘' or not verified or verified.date()!=now.date() or verified.hour*60+verified.minute<905:return None
++    if not at or at.date()!=now.date() or at.hour<15 or (at-now).total_seconds()>config.INTRADAY['max_quote_future_seconds']:return None
++    if q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES or q.get('last_close_semantics')!='previous_trade_day_raw_close':return None
++    if not (M.positive(q.get('amount_wan')) or M.positive(q.get('volume_shou'))):return None
++    native=next((b for b in reversed(bars) if b['date']==now.date().isoformat()),None)
++    if not native or not intraday._valid_historical_price_bar(native):return None
++    if native.get('price_basis_source') not in intraday._QFQ_HISTORY_SOURCES|intraday._RAW_HISTORY_SOURCES:return None
++    context=intraday.align_price_basis(q,bars,calendar,observation_day=now.date().isoformat())
++    suspension_days=[]
++    if not context.get('valid') and code and '历史窗口缺口' in str(context.get('reason')):
++        import relay_regulation
++        reg=relay_regulation.load([code],calendar,now,fetch=False)
++        evidence=dict(verified_halts=reg['suspension_intervals']);native_dates={b['date'] for b in bars if b.get('volume',0)>0}
++        suspension_days=[d for d in calendar if d not in native_dates and halt_on(evidence,code,d)]
++        if suspension_days:context=intraday.align_price_basis(q,bars,[d for d in calendar if d not in suspension_days],observation_day=now.date().isoformat())
++    if not context.get('valid') or not context.get('scale_factor'):return None
++    factor=context['scale_factor'];converted={k:native[k]*factor for k in ('open','high','low','close')}
++    for key,qkey in (('open','open'),('high','high'),('low','low'),('close','price')):
++        if not isinstance(q.get(qkey),(int,float)) or D.tick(converted[key])!=D.tick(q[qkey]):return None
++    return dict(date=native['date'],verified_at=str(verified),quote_at=str(at),history_source=native['price_basis_source'],history_basis=native['price_basis'],scale_factor=factor,
++        prices={k:float(D.tick(v)) for k,v in converted.items()},verified_suspension_days=suspension_days,basis='已完成独立日线按经核验尺度转换，逐项匹配报价开高低收；保留实际收盘后源时刻')
++
++
++def ingest_close(snap,quotes,now,proofs=None):
++    if snap.get('session')!='已收盘':return
++    proofs=proofs or {}
++    for row in snap.get('stocks',[])+snap.get('coverage_catalog',[]):
++        if (row.get('market_strength') or {}).get('mode')!='正式收盘' and row['code'] not in proofs:continue
++        c=row['code'];q=quotes.get(c) or {}
++        if (not M.quote_valid(q,now,'已收盘',None,True)[0] and c not in proofs) or q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES or q.get('last_close_semantics')!='previous_trade_day_raw_close':continue
++        if not all(isinstance(q.get(k),(int,float)) and q[k]>0 for k in ('open','high','low','price','last_close')):continue
++        day=now.date().isoformat();bar=dict(date=day,open=q['open'],high=q['high'],low=q['low'],close=q['price'],volume=(q.get('volume_shou') or 0)*100,price_basis='raw',price_basis_source='verified_close_quote')
++        if c in proofs:bar.update(proofs[c]['prices'],completed_daily_proof=proofs[c])
++        if not intraday._valid_historical_price_bar(bar) or bar['volume']<=0:continue
++        for folder in ('raw','reference'):
++            path=D.root()/folder/(c+'.json');record=D.read(path) or dict(code=c,source='verified_close_quote',bars=[])
++            values={b['date']:b for b in record['bars']};incoming=dict(bar,reference_close=q['last_close'],turnover_pct=q.get('turnover_pct')) if folder=='reference' else bar
++            old=values.get(day) or {};keys=('open','high','low','close','volume')+(('reference_close','turnover_pct') if folder=='reference' else ())
++            if all(old.get(k)==incoming.get(k) for k in keys) and (c not in proofs or old.get('completed_daily_proof')):continue
++            values[day]=incoming
++            record.update(bars=[values[d] for d in sorted(values)][-config.EMOTION_RELAY['raw_history_days']:],coverage_through=day)
++            D.write(path,record)
+--- before/relay_regulation.py
++++ after/relay_regulation.py
+@@ -0,0 +1,164 @@
++"""Dated issuer disclosures and rolling deviation references, not regulator verdicts."""
++import hashlib,json,re,time,urllib.parse,unicodedata
++from datetime import datetime
++import config,datafeed,intraday,relay_data as D
++
++RULE_SOURCES=[
++ 'https://www.sse.com.cn/lawandrules/sselawsrules2025/trade/universal/c/c_20260424_10816492.shtml',
++ 'https://docs.static.szse.cn/www/lawrules/rule/trade/W020260424690713155663.pdf']
++DATE=r'(\d{4})年(\d{1,2})月(\d{1,2})日'
++
++
++def available_day(published,calendar,today):
++    at=intraday.parse_quote_timestamp(published)
++    if not at:return None
++    dates=sorted(set(calendar+[today]));day=at.date().isoformat()
++    if day in dates and at.hour*3600+at.minute*60+at.second<15*3600:return day
++    return next((d for d in dates if d>day),None)
++
++
++def metadata(codes,begin,end):
++    records=[];page=1;total=None
++    while total is None or len(records)<total:
++        params=dict(sr=-1,page_size=100,page_index=page,ann_type='A',client_source='web',stock_list=','.join(codes),begin_time=begin,end_time=end)
++        value=json.loads(datafeed.em_get('https://np-anotice-stock.eastmoney.com/api/security/ann?'+urllib.parse.urlencode(params),timeout=config.EMOTION_RELAY['request_seconds']))
++        body=value.get('data') or {};items=body.get('list');count=body.get('total_hits')
++        if not isinstance(items,list) or not isinstance(count,int) or body.get('page_index') not in (page,str(page)):raise ValueError('公告分页与完整性待核验')
++        if total is None:total=count
++        if count!=total or not items and len(records)<total:raise ValueError('公告分页采集期间集合变化')
++        records.extend(items);page+=1
++    if len(records)!=total or len({r['art_code'] for r in records})!=len(records):raise ValueError('公告数量或唯一性异常')
++    return records
++
++
++def content(item):
++    art=item['art_code'];path=D.root()/'notices'/'content'/(art+'.json');saved=D.read(path)
++    if saved:return saved
++    url='https://np-cnotice-stock.eastmoney.com/api/content/ann?'+urllib.parse.urlencode(dict(art_code=art,client_source='web',page_index=1))
++    body=(json.loads(datafeed.em_get(url,timeout=config.EMOTION_RELAY['request_seconds'])).get('data') or {})
++    if body.get('art_code')!=art or not body.get('notice_content'):raise ValueError('公告正文或身份待核验')
++    saved=dict(art_code=art,text=body['notice_content'],pdf_url=body.get('attach_url'),title=body.get('notice_title'))
++    D.write(path,saved);return saved
++
++
++def intervals(notices):
++    events={}
++    for n in notices:
++        text=re.sub(r'\s+','',n.get('text') or '').replace('（','(').replace('）',')')
++        if not text:continue
++        for kind,expression in (
++            ('start',r'(?:自|于)'+DATE+r'(?:\([^)]*\))?(?:上午)?(?:开市起|起|开市)(?:继续)?停牌'),
++            ('resume',r'(?:自|于)'+DATE+r'(?:\([^)]*\))?(?:上午)?(?:开市起|起|开市)(?:恢复交易|复牌)')):
++            for match in re.finditer(expression,text):
++                day='%04d-%02d-%02d'%tuple(map(int,match.groups()))
++                for c in n['codes']:events.setdefault(c,[]).append(dict(kind=kind,day=day,title=n['title'],source=n.get('pdf_url') or n['url'],published_at=n['published_at']))
++    result=[]
++    for c,items in events.items():
++        items.sort(key=lambda x:(x['day'],x['kind']=='resume',x['published_at']));opening=None
++        for event in items:
++            if event['kind']=='start':
++                if opening is None:opening=event
++            elif opening is not None and event['day']>opening['day']:
++                result.append(dict(code=c,start=opening['day'],resume=event['day'],source=opening['source'],resume_source=event['source'],reason=opening['title'],published_at=opening['published_at']));opening=None
++        if opening:result.append(dict(code=c,start=opening['day'],resume=None,source=opening['source'],reason=opening['title'],published_at=opening['published_at']))
++    return result
++
++
++def fetch_index(symbol,asof,previous=None):
++    # zs_ distinguishes an index from the cn_000002 stock. No stock-code fallback.
++    code='zs_'+symbol[2:];url='https://q.stock.sohu.com/hisHq?'+urllib.parse.urlencode(dict(code=code,start='20260101',end=datetime.now().strftime('%Y%m%d'),stat=1,order='A',period='d'))
++    values=json.loads(datafeed.http_get(url,timeout=config.EMOTION_RELAY['request_seconds'],retry=0))
++    if not isinstance(values,list) or len(values)!=1 or values[0].get('code')!=code or values[0].get('status')!=0:raise ValueError('分类指数身份待核验')
++    bars=[dict(date=r[0],open=float(r[1]),close=float(r[2]),low=float(r[5]),high=float(r[6])) for r in values[0].get('hq',[]) if r[0]<=asof]
++    bars=sorted(bars,key=lambda b:b['date'])[-config.EMOTION_RELAY['raw_history_days']:]
++    if not bars or any(not intraday._valid_historical_price_bar(b) for b in bars):raise ValueError('分类指数日线无效')
++    result=dict(symbol=symbol,source='sohu_index_hisHq',bars=bars,completed_through=bars[-1]['date'],fetched_at=str(datetime.now()))
++    if bars[-1]['date']!=asof:
++        now=datetime.now()
++        if asof!=now.date().isoformat() or now.hour*60+now.minute<905 or not previous or bars[-1]['date']!=previous:raise ValueError('分类指数完成日线尚未覆盖目标交易日')
++        text=datafeed.http_get('https://qt.gtimg.cn/q='+symbol,encoding='gbk',timeout=config.EMOTION_RELAY['request_seconds'],retry=0)
++        match=re.search(r'v_'+symbol+r'="([^\"]+)"',text)
++        parts=match.group(1).split('~') if match else []
++        if len(parts)<35:raise ValueError('分类指数收盘报价格式待核验')
++        name=unicodedata.normalize('NFKC',parts[1]);allowed=('A股指数','上证A股','上证A股指数') if symbol=='sh000002' else ('深证A指','深证A股指数')
++        at=intraday.parse_quote_timestamp(parts[30]);bar=dict(date=asof,open=float(parts[5]),close=float(parts[3]),high=float(parts[33]),low=float(parts[34]))
++        if parts[2]!=symbol[2:] or name not in allowed or not at or at.date()!=now.date() or at.hour<15 or (at-now).total_seconds()>config.INTRADAY['max_quote_future_seconds']:raise ValueError('分类指数身份、日期或源时刻不符')
++        if D.tick(float(parts[4]))!=D.tick(bars[-1]['close']) or not intraday._valid_historical_price_bar(bar):raise ValueError('分类指数前收衔接或收盘OHLC不符')
++        bar.update(source='tencent_verified_index_close',quote_at=str(at),previous_date=previous,previous_close=float(parts[4]));result['bars'].append(bar)
++        result.update(source='sohu_history+tencent_verified_index_close',completed_through=asof,closing_quote_at=str(at),closing_name=name)
++    return result
++
++
++def load(codes,calendar,now,fetch=True,budget_seconds=None):
++    today=now.date().isoformat();begin=calendar[max(0,len(calendar)-45)];codes=sorted(set(codes));records={};errors=[];started=time.monotonic();need=[];covered=[]
++    for c in codes:
++        path=D.root()/'notices'/'stocks'/(c+'_'+today+'.json');saved=D.read(path)
++        try:at=datetime.fromisoformat((saved or {}).get('fetched_at',''))
++        except ValueError:at=None
++        usable=saved and saved.get('begin','9999')<=begin
++        if usable:
++            covered.append(c)
++            for r in saved['items']:records[r['art_code']]=r
++        if not usable or not at or (now-at).total_seconds()>1800:need.append(c)
++    # Backfills finish missing codes before renewing already covered codes.
++    need.sort(key=lambda c:c in covered)
++    budget=config.EMOTION_RELAY['fetch_budget_seconds'] if budget_seconds is None else budget_seconds
++    for i in range(0,len(need),20):
++        if not fetch or time.monotonic()-started>=budget:break
++        chunk=need[i:i+20]
++        try:
++            items=metadata(chunk,begin,today)
++            for c in chunk:
++                selected=[r for r in items if any(v.get('stock_code')==c for v in r.get('codes',[]))]
++                D.write(D.root()/'notices'/'stocks'/(c+'_'+today+'.json'),dict(items=selected,begin=begin,fetched_at=str(now)))
++                if c not in covered:covered.append(c)
++            for r in items:records[r['art_code']]=r
++        except Exception as e:errors.append(str(e))
++    notices=[]
++    for item in records.values():
++        title=item.get('title') or '';published=str(item.get('display_time') or '')[:19];at=intraday.parse_quote_timestamp(published)
++        if not at or at>now or not any(k in title for k in ('异常波动','停牌','复牌','股票交易风险')):continue
++        related=[c['stock_code'] for c in item.get('codes',[]) if c.get('stock_code') in codes]
++        if not related:continue
++        n=dict(id=item['art_code'],title=title,codes=related,published_at=published,notice_date=str(item.get('notice_date',''))[:10],available_day=available_day(published,calendar,today),
++            kind='serious' if '严重异常波动' in title else 'abnormal' if '异常波动' in title else 'suspension' if '停牌' in title else 'resume' if '复牌' in title else 'risk',
++            url='https://data.eastmoney.com/notices/detail/'+related[0]+'/'+item['art_code']+'.html')
++        if any(k in title for k in ('停牌','复牌')):
++            try:
++                saved=D.read(D.root()/'notices'/'content'/(item['art_code']+'.json'))
++                if not saved and fetch and time.monotonic()-started<budget:saved=content(item)
++                if saved:n.update(text=saved['text'],pdf_url=saved.get('pdf_url'))
++            except Exception as e:errors.append(str(e))
++        notices.append(n)
++    indices={}
++    for symbol in ('sh000002','sz399107'):
++        path=D.root()/'benchmarks'/(symbol+'.json');record=D.read(path)
++        if record:record=dict(record,bars=[b for b in record.get('bars',[]) if b['date']<=record.get('completed_through',today if now.hour>=15 else calendar[-1]) and b['date']<=calendar[-1]])
++        if fetch and (not record or not any(b['date']==calendar[-1] for b in record.get('bars',[])) or calendar[-1]==today and record.get('completed_through','')<today):
++            try:record=fetch_index(symbol,calendar[-1],calendar[-2] if len(calendar)>1 else None);D.write(path,record)
++            except Exception as e:errors.append(str(e))
++        if record:indices[symbol]=record
++    return dict(notices=notices,suspension_intervals=intervals(notices),indices=indices,scope_codes=codes,covered_codes=covered,errors=errors,asof=str(now),rule_sources=RULE_SOURCES)
++
++
++def deviation(code,days,evidence,indices):
++    symbol='sh000002' if code.startswith('6') else 'sz399107';index={b['date']:b for b in indices.get(symbol,{}).get('bars',[])}
++    raw=evidence.get('_raw_index',{}).get(code,{ });refs=evidence.get('_ref_index',{}).get(code,{ });windows=[]
++    for count,threshold in ((3,20),(10,100),(30,200)):
++        selected=days[-count:];before=days[-count-1] if len(days)>count else None;factor=1.;reason=None
++        if len(selected)<count or not before or before not in index or selected[-1] not in index:reason='分类指数或交易日窗口未覆盖'
++        if not reason:
++            for day in selected:
++                if H_halted(evidence,code,day):continue
++                bar=raw.get(day);ref=refs.get(day)
++                if not bar or not ref or any(D.tick(bar[k])!=D.tick(ref[k]) for k in ('open','high','low','close')):reason='原价与每日涨跌额未完成交叉核验';break
++                if sum(b['date']<day and b.get('volume',0)>0 for b in raw.values())<5:reason='窗口含上市初期，普通制度不适用';break
++                factor*=ref['close']/ref['reference_close']
++        value=None if reason else round((factor-index[selected[-1]]['close']/index[before]['close'])*100,2)
++        windows.append(dict(days=count,asof=selected[-1] if selected else None,deviation_pp=value,threshold_pp=threshold,remaining_pp=None if value is None else round(threshold-value,2),reason=reason))
++    return dict(benchmark=symbol,windows=windows,basis='按市场交易日计算股票滚动区间涨幅减分类指数区间涨幅，停牌日股票收益不增长；尚未核验交易所公告/复牌重置，不作为正式异动认定或次数计数')
++
++
++def H_halted(evidence,code,day):
++    import relay_history
++    return relay_history.halt_on(evidence,code,day)
+--- before/relay_cycles.py
++++ after/relay_cycles.py
+@@ -0,0 +1,152 @@
++"""Replay dated cycle anchors and event-day first-board cohorts without hindsight."""
++from collections import defaultdict
++import config,relay_history as H,relay_regulation as R
++
++
++def runs(path):
++    result=[];active=None
++    for p in path:
++        if p.get('sealed') and p.get('exact'):
++            if active is None:
++                active=dict(start=p['date'],last=p['date'],height=p['height'],days=[])
++            active.update(last=p['date'],height=p['height']);active['days'].append(p['date'])
++        elif p.get('halted'):
++            continue
++        elif active:
++            active['end']=p['date'];result.append(active);active=None
++    if active:result.append(dict(active,end=None))
++    return result
++
++
++def focus(evidence,codes):
++    """Disclosure scope: verified multi-board stocks plus missing actual sessions."""
++    selected=set()
++    for c in codes:
++        raw=evidence.get('_raw_index',{}).get(c,{})
++        n=0
++        for d,b in sorted(raw.items()):
++            ref=evidence.get('_ref_index',{}).get(c,{}).get(d)
++            n=n+1 if ref and H.D.tick(b['close'])==H.D.tick(b['high'])==H.D.tick(H.D.limit_price(ref['reference_close'])) else 0
++            if n>=2:selected.add(c)
++    for record in evidence.get('halts',{}).values():
++        selected.update(r['SECURITY_CODE'] for r in record.get('rows',[]) if r.get('SECURITY_CODE') in codes)
++    return sorted(selected)
++
++
++def attach(rows,models,paths,boards,evidence,reg,dates,day):
++    P=config.EMOTION_RELAY;all_dates=dates+[day];position={d:i for i,d in enumerate(all_dates)}
++    formal=any(m['valid'] and m['mode']=='正式收盘' for m in models.values())
++    if formal:
++        completed={}
++        for c,path in paths.items():
++            m=models[c];extra=[]
++            if m['valid'] and m['mode']=='正式收盘':
++                extra=[dict(date=day,sealed=m['sealed'],height=m['height'] if m['sealed'] else 0,exact=m['height_exact'],halted=False,reason=None)]
++            elif H.halt_on(evidence,c,day) and path:
++                extra=[dict(path[-1],date=day,sealed=None,halted=True,reason='全天停牌，已完成板位保留且不增长')]
++            completed[c]=path+extra
++        paths=completed
++    lookup={c:{p['date']:p for p in path} for c,path in paths.items()};waves={c:runs(p) for c,p in paths.items()}
++    for c,m in models.items():
++        if m['valid']:
++            lookup[c][day]=dict(date=day,sealed=m['sealed'],height=m['height'] if m['sealed'] else 0,exact=m['height_exact'],halted=False,pending=m['mode']!='正式收盘')
++    recent=(all_dates if formal else dates)[-P['cycle_core_recent_days']:]
++    themes=[b for b in boards if b['type']=='theme' and len(b.get('member_codes',[]))<=P['relation_max_members']]
++    membership=defaultdict(list)
++    for b in themes:
++        for c in set(b.get('member_codes',[])):membership[c].append(b)
++    def shared(a,b):
++        return [dict(id=t['id'],name=t['name']) for t in membership[a] if b in t.get('member_codes',[])]
++    def top_before(c,d):
++        ix=position.get(d,0)-1
++        if ix<0:return False,None
++        prev=all_dates[ix];p=lookup[c].get(prev,{})
++        h=p.get('height') or 0
++        maximum=max((v.get(prev,{}).get('height') or 0 for v in lookup.values() if v.get(prev,{}).get('exact') and (v.get(prev,{}).get('sealed') or v.get(prev,{}).get('halted'))),default=0)
++        return bool(p.get('exact') and h>=P['cycle_core_min_height'] and h==maximum),h
++    cores=[]
++    for c,w in waves.items():
++        eligible=[r for r in w if r['height']>=P['cycle_core_min_height'] and r['last'] in recent]
++        if not eligible:continue
++        wave=eligible[-1];m=models[c]
++        halt=H.halt_on(evidence,c,day)
++        if halt and m['valid']:
++            m['risks'].append('停牌记录与有效成交报价冲突');halt=None
++        # A dated full-day suspension is distinct from a stale traded quote.
++        if halt:
++            m.update(suspended_current=True,suspension=halt,eligible=True,feedback_pct=None,sealed=None,height=wave['height'],height_exact=True)
++            m['roles'].append('停牌核心观察');m['reason']='全天停牌，保留已完成高度；不计入在板与晋级分母'
++            m['last_trade_date']=wave['last'];m['price']=(evidence.get('_raw_index',{}).get(c,{}).get(wave['last']) or {}).get('close')
++        m['cycle']=dict(wave,code=c,name=rows[c].get('name'),suspended=bool(halt))
++        m['roles'].append('周期核心观察');cores.append(m['cycle'])
++    maximum=max((r['height'] for r in cores),default=0)
++    for r in cores:
++        if r['height']==maximum:models[r['code']]['roles'].append('周期最高标')
++    # Published disclosures and actual board breaks are separate event types.
++    nodes=[];seen=set()
++    for n in sorted(reg.get('notices',[]),key=lambda n:n['published_at']):
++        if n['kind']!='serious' or not n.get('available_day'):continue
++        d=n['available_day']
++        for c in n['codes']:
++            if c not in lookup:continue
++            ok,height=top_before(c,d)
++            wave=next((w for w in waves[c] if w['start']<=d and (not w['end'] or d<=w['end'])),None)
++            key=(c,'regulation',(wave or {}).get('start'))
++            if not ok or not wave or key in seen:continue
++            seen.add(key);nodes.append(dict(id=n['id'],kind='regulation',label='监管接续候选',date=d,leader=c,leader_name=rows[c].get('name'),leader_height=height,known_at=n['published_at'],source=n['url'],leader_chain_start=wave['start']))
++    for c,path in paths.items():
++        for i,p in enumerate(path):
++            if i==0:continue
++            prior=path[i-1];kind=None
++            if p.get('sealed') is False and prior.get('sealed') is True:kind='break'
++            if p.get('halted') and not prior.get('halted'):kind='suspension'
++            if not kind:continue
++            ok,height=top_before(c,p['date'])
++            if not ok:continue
++            halt=H.halt_on(evidence,c,p['date']) if kind=='suspension' else None
++            if kind=='suspension' and not (halt or {}).get('known_at'):continue
++            node_day=max(p['date'],R.available_day(halt['known_at'],dates,day) or day) if halt else p['date']
++            wave=next((w for w in waves[c] if w['start']<=p['date'] and (not w['end'] or p['date']<=w['end'])),{})
++            nodes.append(dict(id=c+'_'+p['date']+'_'+kind,kind=kind,label='断板补涨候选' if kind=='break' else '停牌接续候选',date=node_day,leader=c,leader_name=rows[c].get('name'),leader_height=height,known_at=(halt or {}).get('known_at') or p['date']+' 15:00:00',source=(halt or {}).get('source'),leader_chain_start=wave.get('start')))
++    # A first board must occur ON the node's usable trading day. Following a
++    # cohort into its third/fourth board never changes its original anchor.
++    for node in nodes:
++        node['members']=[]
++        for c,m in models.items():
++            p=lookup[c].get(node['date'],{})
++            if c==node['leader'] or not p.get('exact') or not p.get('sealed') or p.get('height')!=1:continue
++            links=shared(node['leader'],c)
++            if not links:continue
++            cohort=dict(node,boards=links,board=links[0]['name'],board_id=links[0]['id'],first_board_date=node['date'],own_height=m.get('height'),
++                active=bool(m['valid'] and m.get('height_exact') and m.get('prior_sealed') and m.get('sealed')),
++                basis='节点当日首板且共享确认题材；持续跟踪该批次，催化与因果尚待核验')
++            cohort.pop('members',None);m.setdefault('node_history',[]).append(cohort);node['members'].append(c)
++            # Show current continuing waves, never revive a broken old cohort.
++            tail=[v for v in paths[c] if v['date']>=node['date']]
++            intact=all(v.get('sealed') or v.get('halted') for v in tail)
++            if intact and m['valid'] and m['height_exact'] and (m['sealed'] or m['prior_sealed'] and m['mode']!='正式收盘'):
++                cohort['active']=bool(m['sealed']);m['continuation'].append(cohort);m['roles'].append(node['label']);m['eligible']=True
++    for core in cores:
++        c=core['code'];core_days=set(core['days'])
++        for child,rs in waves.items():
++            if child==c:continue
++            links=shared(c,child)
++            if not links:continue
++            for wave in rs:
++                gap=position.get(wave['start'],-999)-position.get(core['start'],999)
++                overlap=sorted(core_days&set(wave['days']))
++                if wave['height']>=P['cycle_core_min_height'] and wave['end'] and wave['end']<core['start'] and 0<position.get(core['start'],0)-position.get(wave['last'],-999)<=P['warmup_days']:
++                    models[child].setdefault('previous_cores',[]).append(dict(leader=c,leader_name=core['name'],start=wave['start'],last=wave['last'],end=wave['end'],height=wave['height'],boards=links))
++                    models[child]['roles'].append('同题材前轮高标')
++                if abs(gap)>P['companion_start_gap'] or len(overlap)<P['companion_overlap_days']:continue
++                m=models[child];relation=dict(leader=c,leader_name=core['name'],start=wave['start'],core_start=core['start'],start_gap=gap,overlap_days=overlap,boards=links,basis='启动相距不超过2个交易日，至少2个完成日同步封板；仅为伴生关系观察')
++                m.setdefault('companions',[]).append(relation);m['roles'].append('伴生关系观察')
++                if m['valid']:m['eligible']=True
++    for c,m in models.items():
++        m['history']=[dict(p,close=m.get('price') if p['date']==day and m['valid'] else (evidence.get('_raw_index',{}).get(c,{}).get(p['date']) or {}).get('close')) for p in paths[c][-P['history_days']:]]
++        notices=[n for n in reg.get('notices',[]) if c in n['codes']]
++        m['regulation']=dict(notices=[{k:v for k,v in n.items() if k!='text'} for n in notices],covered=c in reg.get('covered_codes',[]))
++        if notices and any(n['kind']=='serious' for n in notices):m['risks'].append('已披露严重异动')
++        if m['eligible'] or c in reg.get('scope_codes',[]):m['regulation']['reference']=R.deviation(c,all_dates if formal else dates,evidence,reg.get('indices',{}))
++    return dict(cycle_highest=maximum,cores=sorted(cores,key=lambda r:(-r['height'],r['code'])),nodes=nodes,
++        disclosure_coverage=dict(expected=len(reg.get('scope_codes',[])),covered=len(reg.get('covered_codes',[])),errors=reg.get('errors',[])),rule_sources=reg.get('rule_sources',R.RULE_SOURCES))
+--- before/emotion_ui.js
++++ after/emotion_ui.js
+@@ -5,13 +5,23 @@
+  '空间高标':'已核验主板样本中，完成连板或当前在板晋级高度居前的候选。完成高度与盘中待收盘高度分别标明；不等于已经确认唯一市场龙头。',
+  '题材领先候选':'同花顺确认题材中，已核验连板高度居前且同行覆盖达标的候选；题材领先是可观测相对地位。',
+  '同身位竞争':'昨日具有相同完成连板身位的候选相互比较；盘中谁在板、谁未封分别展示，不提前宣布竞争结果。',
+- '同题材接续候选':'同题材已有至少3个完成连板的核心，核心当前仍在板；本股主动封首/二板、低至少两个板位，近期不是旧高标。只是接续观察，不表示必然补涨或连板。',
++ '断板补涨候选':'已建立至少5板且当时为最高标的核心，实际断板当日的同题材首板批次；跟踪后续强度，不提前确认补涨龙。',
++ '监管接续候选':'最高标首次严重异动公告公开后的首个可交易日，本股同日首板且共享确认题材；保留原批次后续晋级，不等同断板。',
++ '停牌接续候选':'最高标停牌核查可知节点当日的同题材首板批次；停牌不视为断板。',
++ '周期最高标':'近5个交易日仍有封板的至少5板周期核心中，已完成高度最高；已核验停牌保留高度但不增长。',
++ '周期核心观察':'最近5个交易日仍有封板记录，且本轮至少完成5板的周期锚点；与当日在交易高标分开。',
++ '停牌核心观察':'有日期有效的全天停牌公告证据，保留停牌前真实成交日与已完成高度，不计入当日在板或晋级分母。',
++ '伴生关系观察':'共享确认题材，首次连板启动与核心相距不超过2个交易日，至少2个完成日同步封板；仅为关系观察，不自动代表当前仍强。',
++ '停牌记录与有效成交报价冲突':'停牌区间与当日已核验真实成交报价冲突，暂停停牌身份，保留冲突核验提示。',
++ '同题材前轮高标':'与当前周期核心共享确认题材，较早一轮已完成至少5板且已经断板；不归为同轮伴生或自动视为当前龙头。',
++ '已披露严重异动':'焦点股票近期公开公告已披露严重异常波动；逐条列出时间和链接，不等于当前必然停牌。',
+  '断板反馈':'前一完成日结束了至少2板的已核验连板链，观察最新行情的正负反馈。',
+  '首板启动':'完成历史确认前一日未封板，当前价格在真实涨停价；盘中仍需等收盘确认。',
+  '连板晋级':'前一完成日已封板，当前价格仍在真实涨停价；盘中晋级是暂态，正式收盘才确认。',
+  '接力观察':'有当前在板、昨日封板或近期断板反馈事件；按高度、角色、在板和反馈排序，不使用普通活跃分替代龙头地位。',
+  '暂无接力事件':'当前没有进入主板接力事件名单，股票仍保留在完整成员排名中。',
+  '当前在板·待收盘':'最新有效价格等于按最小价位核验的涨停价。不是已完成连板。',
++ '收盘日线已核验':'实际报价时间在收盘后；只有经核验价格尺度的独立完成日线与报价开高低收逐项一致，才作为正式收盘依据，保留真实源时间。',
+  '收盘封板':'正式完成日确认并取得有效收盘报价，收盘价等于核验涨停价。',
+  '触板未封':'最新有效日内最高价触及涨停价，但现价未封住。不推断开板次数。',
+  '高标分歧观察':'昨日已有至少2个完成连板，最新行情未封板，观察分歧反馈。',
+@@ -28,29 +38,36 @@
+  '在板·连板链待补齐':'当前涨停价已核验，但前序完成日链尚未全部确认，不能擅自标首板或指定连板高度。'
+ });
+ function erModel(){return DATA.emotion_relay||null;}
+-function erLive(){return (DATA.stocks||[]).concat(DATA.coverage_catalog||[]).some(function(r){return erFresh(r.emotion_relay);});}
+-function erFresh(m){if(!m||!m.valid)return false;return mtSnapshotFresh({mode:m.mode==='盘中暂态'?'连续竞价':m.mode,valid_until:m.valid_until});}
++function erLive(){return (DATA.stocks||[]).concat(DATA.coverage_catalog||[]).some(function(r){return r.emotion_relay&&r.emotion_relay.valid&&!r.emotion_relay.suspended_current&&erFresh(r.emotion_relay);});}
++function erFresh(m){if(!m)return false;if(m.suspended_current)return (erModel().at||'').slice(0,10)===new Date(Date.now()+8*3600000).toISOString().slice(0,10);if(!m.valid)return false;return mtSnapshotFresh({mode:m.mode==='盘中暂态'?'连续竞价':m.mode,valid_until:m.valid_until});}
+ function erRows(){var meta=erModel(),v=MS_VIEW.emotion,by={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){by[r.code]=r;});return ((meta.lists||{})[v.scope]||[]).map(function(c){return by[c];}).filter(function(r){return r&&msMatchDirections(r,'emotion')&&(!v.q||String(r.code+' '+r.name).indexOf(v.q)>=0)&&(v.scope==='pending'||erFresh(r.emotion_relay));});}
+-function erHeight(m){if(m.height==null)return '板位待核验';var h=(m.height_exact?'':'至少')+m.height+'板';return m.sealed?h+(m.mode==='正式收盘'?' · 收盘确认':' · 在板待收盘'):(m.prior_height||0)+'板 · 昨日完成';}
++function erHeight(m){if(m.suspended_current)return m.height+'板 · 停牌保留';if(m.height==null)return '板位待核验';var h=(m.height_exact?'':'至少')+m.height+'板';return m.sealed?h+(m.mode==='正式收盘'?' · 收盘确认':' · 在板待收盘'):(m.prior_height||0)+'板 · 前日完成';}
+ function erRankCell(row,item,ranking){var m=row.emotion_relay;if(!m)return '<span class="ms-muted">接力数据待核验</span>';return '<b class="er-position">'+esc(!erFresh(m)?'报价待更新':item.emotion_rank==null?'暂无接力事件':erHeight(m))+'</b><span class="cd">'+(item.emotion_rank==null?'完整成员保留':'接力观察第 '+item.emotion_rank+' / '+ranking.emotion_valid)+'</span>';}
+ function erTags(m){return (m.roles||[]).concat(m.events||[],m.risks||[]).map(function(t){return msTag(t,'源行情 '+(m.quote_at||'待更新'),(m.risks||[]).indexOf(t)>=0?'risk':'er-tag');}).join('');}
+-function erTable(rows){return '<div class="tw"><table class="market-strength-table er-table"><thead><tr><th class="l">个股 / 确认方向</th><th>身位 / 当前状态</th><th class="l">地位与事件</th><th class="l">同题材反馈</th><th>今日涨幅 / 换手</th><th>源行情</th></tr></thead><tbody>'+rows.map(function(r){var m=r.emotion_relay||{},rel=(m.relations||[]).slice(0,2),connections=m.continuation||[];return '<tr data-relay-code="'+esc(r.code)+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+r.code+'</span>'+msAffiliation(r,'emotion')+'</td><td><b class="er-position">'+esc(erHeight(m))+'</b><span class="cd">前一完成日 '+esc(m.prior_date||'—')+' · '+(m.prior_height==null?'链待补齐':m.prior_height+'板')+'</span></td><td class="l"><div class="ms-tag-list">'+erTags(m)+'</div>'+(m.reason?'<span class="cd">'+esc(m.reason)+'</span>':'')+(connections.length?'<span class="cd er-connection">接续参照 '+connections.slice(0,2).map(function(c){return esc(c.leader_name)+' · '+c.leader_height+'板 · '+esc(c.board);}).join('；')+'</span>':'')+'</td><td class="l">'+rel.map(function(b){return '<b>'+esc(b.name)+'</b> '+msTag(b.state,'排除本股后有效同行 '+b.valid+'/'+b.expected+'；同行在板 '+b.limit_count+'只；上涨占比 '+fmt(b.up_pct,1)+'%')+'<span class="cd">同行在板 '+b.limit_count+' · 上涨 '+fmt(b.up_pct,1)+'% · 覆盖 '+fmt(b.coverage_pct,1)+'%</span>';}).join('')+'</td><td>'+pctHtml(m.feedback_pct,2)+'<span class="cd">换手 '+fmt(m.turnover_pct,2)+'%</span></td><td><span class="cd">'+esc(m.quote_at||'待更新')+'</span>'+esc(m.mode||'')+'</td></tr>';}).join('')+'</tbody></table></div>';}
++function erTable(rows){return '<div class="tw"><table class="market-strength-table er-table"><thead><tr><th class="l">个股 / 确认方向</th><th>身位 / 当前状态</th><th class="l">地位与事件</th><th class="l">关系依据</th><th>今日涨幅 / 换手</th><th>实际源时间</th></tr></thead><tbody>'+rows.map(function(r){var m=r.emotion_relay||{},links=(m.continuation||[]).map(function(n){return '<p class="er-connection">'+esc(n.label)+' · '+esc(n.leader_name)+'<span class="cd">节点 / 本股首板 '+esc(n.first_board_date)+' · '+esc(n.board)+'</span></p>';}).join('')+(m.companions||[]).map(function(n){return '<p class="er-connection">伴生参照 '+esc(n.leader_name)+'<span class="cd">本股启动 '+esc(n.start)+' · 同步封板 '+n.overlap_days.length+'日</span></p>';}).join('');return '<tr data-relay-code="'+esc(r.code)+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+r.code+'</span>'+msAffiliation(r,'emotion')+'</td><td><b class="er-position">'+esc(erHeight(m))+'</b><span class="cd">'+(m.suspended_current?'最后成交 '+esc(m.last_trade_date)+' · '+fmt(m.price,2)+'元':'前一完成日 '+esc(m.prior_date||'—')+' · '+(m.prior_height==null?'待核验':m.prior_height+'板'))+'</span></td><td class="l"><div class="ms-tag-list">'+erTags(m)+'</div>'+(m.reason?'<span class="cd">'+esc(m.reason)+'</span>':'')+'</td><td class="l">'+(links||(m.relations||[]).slice(0,2).map(function(b){return '<p>'+esc(b.name)+' '+msTag(b.state,'排除本股有效同行 '+b.valid+'/'+b.expected+'；在板 '+b.limit_count+'只')+'<span class="cd">在板 '+b.limit_count+' · 覆盖 '+fmt(b.coverage_pct,1)+'%</span></p>';}).join(''))+'</td><td>'+(m.suspended_current?'<span class="ms-muted">全天停牌</span>':pctHtml(m.feedback_pct,2)+'<span class="cd">换手 '+fmt(m.turnover_pct,2)+'%</span>')+'</td><td><span class="cd">'+esc(m.suspended_current?m.last_trade_date+'（最后成交）':m.quote_at||'待更新')+'</span>'+esc(m.suspended_current?'停牌公告已核验':m.mode||'')+'</td></tr>';}).join('')+'</tbody></table></div>';}
+ function erMetric(title,value,sub){return '<article class="er-metric"><span>'+title+'</span><b>'+value+'</b><small>'+sub+'</small></article>';}
+ function erLadder(values){return Object.keys(values||{}).sort(function(a,b){return Number(b)-Number(a);}).map(function(h){return '<div class="er-ladder-row"><b>'+h+'板</b><span class="er-ladder-track"><i style="width:'+Math.min(100,values[h]*7)+'%"></i></span><span>'+values[h]+'只</span></div>';}).join('')||'<p class="ms-muted">暂无已核验梯队</p>';}
+-function renderEmotion(){var host=document.getElementById('emotion-host'),meta=erModel();if(!host)return;if(!meta){host.innerHTML='<section class="card"><p>正在等待主板接力模型的新一轮数据。</p></section>';return;}var focus=document.activeElement;if(focus&&host.contains(focus)&&(focus._msComposing||focus._msEnding))return;var v=MS_VIEW.emotion,rows=erRows(),fb=meta.yesterday_feedback||{},bf=meta.broken_feedback||{},c=meta.coverage||{},cf=meta.yesterday_chain_feedback||{},formal=meta.mode==='正式收盘',live=erLive();document.getElementById('emotion-sub').textContent=meta.scope+' · '+meta.mode+' · 行情截至 '+(meta.source_at||'待更新');
+- var h='<div class="er-context"><div><span class="er-eyebrow">接力环境</span><h2>'+esc(meta.state)+'</h2><p>以高度、晋级和负反馈观察接力；指数涨跌不能单独决定接力情绪。</p></div><button class="btn" onclick="goPane(\'boards\')">查看板块／题材</button></div><div class="er-metrics">'+erMetric('前一完成日最高连板',meta.highest_previous+'板','历史截至 '+esc(meta.history_asof||'—'))+erMetric(formal?'当日收盘最高':live?'当前在板最高':'上次在板最高（待更新）',meta.highest_live+'板',formal?'正式收盘确认':'盘中晋级，待收盘')+erMetric('昨日封板股晋级',fmt(fb.promotion_pct,1)+'%',fb.sealed+' / '+fb.valid+'个有效样本，原队列 '+fb.expected)+erMetric('昨日封板股反馈',pctHtml(fb.median_return_pct,2),'有效覆盖 '+fmt(fb.coverage_pct,1)+'%')+'</div>';
+- h+='<div class="er-dual"><section class="card"><div class="er-section-heading"><h3>前一完成日连板梯队</h3><span>'+esc(meta.history_asof||'—')+'</span></div>'+erLadder(meta.daily_ladder)+'</section><section class="card"><div class="er-section-heading"><h3>'+(formal?'收盘梯队':'当前在板梯队')+'</h3><span>'+esc(meta.mode)+'</span></div>'+erLadder(meta.live_ladder)+'</section></div>';
+- h+='<section class="card"><div class="er-section-heading"><h3>分板位晋级与断板反馈</h3><span>分母与缺口分别显示'+(meta.promotion_height_pending?' · '+meta.promotion_height_pending+'只板位待核验':'')+'</span></div><div class="er-promotion">'+(meta.promotion||[]).map(function(p){return '<div><b>'+p.height+'→'+(p.height+1)+'板</b><strong>'+fmt(p.promotion_pct,1)+'%</strong><small>'+p.sealed+'/'+p.valid+'有效 · 应跟踪 '+p.expected+' · 反馈中位 '+pctHtml(p.median_return_pct,2)+'</small></div>';}).join('')+'</div><p class="ms-muted">昨日连板股（≥2板） '+cf.expected+'只，当前有效 '+cf.valid+'只 · 晋级 '+fmt(cf.promotion_pct,1)+'% · 反馈中位 '+pctHtml(cf.median_return_pct,2)+'。</p><p class="ms-muted">昨日断板队列 '+bf.expected+'只，当前有效 '+bf.valid+'只 · 今日反馈中位 '+pctHtml(bf.median_return_pct,2)+' · 明显负反馈 '+bf.large_loss_count+'只。</p></section>';
+- h+='<section class="card er-candidates"><div class="er-section-heading"><h3>龙头与接续观察</h3><span>候选与证据，不提供连板成功概率</span></div>'+msDirectionPicker('emotion')+'<div class="ms-toolbar">'+msSelect('scope',[['all','全部接力事件'],['leaders','高标 / 同身位竞争'],['continuation','同题材接续候选'],['sealed','当前在板'],['broken','断板反馈'],['pending','必要数据待核验']],'emotion','接力观察范围')+'<input aria-label="情绪股票搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="emotion" data-ms-search-field="q" oninput="msSearchInput(event,this,\'emotion\',\'q\')"><button class="btn" onclick="erCSV()">导出当前接力观察</button></div><p class="ms-muted">当前 '+rows.length+'只。排序依据：角色、高度、在板、反馈和成交额；趋势资格独立判断。</p>'+erTable(rows.slice(0,v.limit))+(rows.length>v.limit?'<button class="btn" onclick="MS_VIEW.emotion.limit+=100;renderEmotion()">加载更多</button>':'')+'</section>';
+- h+='<details class="card er-data"><summary>数据覆盖与判断边界</summary><p>沪深主板池 '+c.pool+'只 · 有效报价 '+c.valid_quotes+' · 完成日可核验 '+c.valid_history+'。</p><p>历史计划覆盖 '+meta.history_days+'个交易日，涨停池逐股原价交叉核验 '+c.verified_pool_days+'/'+c.expected_pool_days+'日；较早缺口会中断可确认连板链，不填成未涨停。</p><p>起止 '+esc(meta.history_from)+' 至 '+esc(meta.history_asof)+'。历史涨停由当日股票名称、原价收盘/最高价和按分取整涨停价核验；未知制度与除权参考价不足时暂停。</p><p>'+meta.limitations.map(esc).join('；')+'。</p><p>规则 '+esc(meta.version)+' · UI '+esc(DATA.ui_generation||'')+'</p></details>';
++function renderEmotion(){var host=document.getElementById('emotion-host'),meta=erModel();if(!host)return;if(!meta){host.innerHTML='<section class="card">正在等待接力数据。</section>';return;}var focus=document.activeElement;if(focus&&host.contains(focus)&&(focus._msComposing||focus._msEnding))return;var v=MS_VIEW.emotion,rows=erRows(),fb=meta.yesterday_feedback||{},c=meta.coverage||{},cy=meta.cycles||{},dc=cy.disclosure_coverage||{},formal=meta.mode==='正式收盘',live=erLive();document.getElementById('emotion-sub').textContent=meta.scope+' · '+meta.mode+' · 行情截至 '+(meta.source_at||'待更新');
++ var h='<div class="er-context"><div><span class="er-eyebrow">周期 · 高度 · 接续</span><h2>'+esc(meta.state)+'</h2><p>周期核心保留停牌前高度，当前在板和节点首板批次分别观察。</p></div><button class="btn" onclick="goPane(\'boards\')">板块／题材</button></div><div class="er-metrics">'+erMetric('近期周期最高标',(cy.cycle_highest||0)+'板','完成高度 · 含已核验停牌核心')+erMetric(formal?'当日收盘最高':live?'当前在板最高':'上次在板最高（待更新）',meta.highest_live+'板',formal?'正式收盘确认':'盘中晋级，待收盘')+erMetric('前一完成日在交易高标',meta.highest_previous+'板','不含当日停牌；实际截至 '+esc(meta.prior_history_asof||meta.history_asof))+erMetric('昨日封板股晋级',fmt(fb.promotion_pct,1)+'%',fb.sealed+'/'+fb.valid+'有效 · 队列 '+fb.expected)+'</div>';
++ h+='<section class="card er-cycle"><div class="er-section-heading"><h3>近期周期核心</h3><span>已完成至少5板 · 最近5个交易日仍有封板记录</span></div><div class="er-core-grid">'+(cy.cores||[]).map(function(x){return '<button class="er-core" onclick="showStock(\''+jsq(x.code)+'\')"><span>'+esc(x.name)+' <small>'+x.code+'</small></span><b>'+x.height+'板'+(x.suspended?' · 停牌保留':'')+'</b><small>本轮 '+esc(x.start)+' — '+esc(x.last)+'<br>最后封板后'+(x.end?'于 '+esc(x.end)+' 断板':'尚未确认断板')+'</small></button>';}).join('')+'</div><p class="ms-muted">停牌不按断板处理、不增加板数，也不计入当日在板和晋级分母。以上为近期周期定位，不宣称唯一市场龙头。</p></section>';
++ h+='<div class="er-dual"><section class="card"><div class="er-section-heading"><h3>前一完成日封板梯队</h3><span>'+esc(meta.prior_history_asof||meta.history_asof)+'</span></div>'+erLadder(meta.daily_ladder)+'</section><section class="card"><div class="er-section-heading"><h3>'+(formal?'收盘梯队':'当前在板梯队')+'</h3><span>'+esc(meta.mode)+'</span></div>'+erLadder(meta.live_ladder)+'</section></div>';
++ h+='<section class="card"><div class="er-section-heading"><h3>分板位晋级与负反馈</h3><span>有效分母与缺口分别显示</span></div><div class="er-promotion">'+(meta.promotion||[]).map(function(p){return '<div><b>'+p.height+'→'+(p.height+1)+'板</b><strong>'+fmt(p.promotion_pct,1)+'%</strong><small>'+p.sealed+'/'+p.valid+'有效 · 应跟踪 '+p.expected+' · 中位 '+pctHtml(p.median_return_pct,2)+'</small></div>';}).join('')+'</div><p class="ms-muted">昨日断板队列 '+meta.broken_feedback.expected+'只 · 今日有效 '+meta.broken_feedback.valid+'只 · 中位反馈 '+pctHtml(meta.broken_feedback.median_return_pct,2)+' · 明显负反馈 '+meta.broken_feedback.large_loss_count+'只。</p></section>';
++ h+='<section class="card er-candidates"><div class="er-section-heading"><h3>龙头与接续观察</h3><span>节点、首板日期和后续强度一起看</span></div>'+msDirectionPicker('emotion')+'<div class="ms-toolbar">'+msSelect('scope',[['all','全部接力事件'],['leaders','高标 / 同身位'],['continuation','节点接续候选'],['companions','伴生关系观察'],['suspended','停牌核心'],['sealed','当前在板'],['broken','断板反馈'],['pending','数据待核验']],'emotion','接力观察范围')+'<input aria-label="情绪股票搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="emotion" data-ms-search-field="q" oninput="msSearchInput(event,this,\'emotion\',\'q\')"><button class="btn" onclick="erCSV()">导出当前观察</button></div><p class="ms-muted">当前 '+rows.length+'只。断板补涨取最高标断板当日首板；监管与停牌各建节点，共享确认题材后跟踪原批次，谁最终走强由后续决定。催化与因果单独待核验。</p>'+erTable(rows.slice(0,v.limit))+(rows.length>v.limit?'<button class="btn" onclick="MS_VIEW.emotion.limit+=100;renderEmotion()">加载更多</button>':'')+'</section>';
++ h+='<details class="card er-data"><summary>最近'+meta.history_days+'个交易日完整复核</summary><p>'+esc(meta.history_from)+' — '+esc(meta.history_asof)+' · <button class="btn" onclick="erTimelineCSV()">导出逐日概况</button></p><div class="tw"><table class="market-strength-table"><thead><tr><th>交易日</th><th>已核验 / 应覆盖</th><th>收盘封板</th><th>交易高标</th><th>含停牌保留高度</th><th>全天停牌</th><th>待核验</th></tr></thead><tbody>'+(meta.timeline||[]).map(function(t){return '<tr><td>'+t.date+'</td><td>'+t.valid+'/'+t.expected+'</td><td>'+t.limit_count+'</td><td>'+(t.highest||0)+'板</td><td>'+(t.retained_highest||0)+'板</td><td>'+t.suspended+'</td><td>'+t.unknown+'</td></tr>';}).join('')+'</tbody></table></div><p>普通10%制度主板池 '+c.pool+'只 · 有效报价 '+c.valid_quotes+' · 最近完成日可核验 '+c.valid_history+'。原价OHLC、每日涨跌额反推的参考前收交叉核验；有公告证据的全天停牌保留链，未知不填成未涨停。</p><p>公告焦点股票覆盖 '+dc.covered+'/'+dc.expected+'；非全市场公告扫描。指数偏离仅展示未处理公告重置的滚动参考，正式异动以公司与交易所披露为准，不推断自动停牌或躲异动动机。</p><p>'+meta.limitations.map(esc).join('；')+'。</p><p>规则 '+esc(meta.version)+' · UI '+esc(DATA.ui_generation||'')+'</p></details>';
+  erPut(host,h,focus,['情绪股票搜索','搜索板块题材']);}
++function erTimelineCSV(){var fields=['date','valid','expected','limit_count','highest','retained_highest','suspended','unknown'],headers=['交易日','已核验','应覆盖','收盘封板','交易高标','含停牌保留高度','全天停牌','待核验','UI版本'];downloadMSCSV('\ufeff'+headers.join(',')+'\n'+(erModel().timeline||[]).map(function(t){return fields.map(function(k){return t[k];}).concat(DATA.ui_generation).join(',');}).join('\n'),'情绪20日概况_'+DATA.ui_generation+'.csv');}
+ function erPut(host,html,focus,labels){var label=focus&&focus.getAttribute('aria-label'),start=focus&&focus.selectionStart,end=focus&&focus.selectionEnd;msHideTooltip();host.innerHTML=html;if(labels.indexOf(label)>=0){var next=host.querySelector('[aria-label="'+label+'"]');if(next){next.focus({preventScroll:true});if(start!=null)next.setSelectionRange(start,end);}}}
+ function erCSV(){return msExportRows(erRows(),'emotion','主板龙头接力_'+DATA.ui_generation+'.csv');}
+ function erBoardRows(){var v=MS_VIEW.directions,meta=erModel(),lookup={};((meta||{}).boards||[]).forEach(function(b){lookup[b.id]=b;});return msBoardCatalog().filter(function(b){return (v.kind==='all'||v.kind===b.type)&&(!v.q||b.name.indexOf(v.q)>=0);}).sort(function(a,b){if(v.sort==='relay')return ((lookup[b.id]||{}).limit_count||0)-((lookup[a.id]||{}).limit_count||0)||a.name.localeCompare(b.name,'zh');return ((b.market_strength||{}).trend_score||-1)-((a.market_strength||{}).trend_score||-1)||a.name.localeCompare(b.name,'zh');});}
+ function erRenderBoards(){var host=document.getElementById('board-center'),v=MS_VIEW.directions;if(!host)return;var focus=document.activeElement;if(focus&&host.contains(focus)&&(focus._msComposing||focus._msEnding))return;var metric=document.getElementById('bd-metrics');if(metric)metric.innerHTML='';var title=document.querySelector('#p-boards h1');if(title)title.textContent='板块／题材';var rows=erBoardRows(),by={};((erModel()||{}).boards||[]).forEach(function(b){by[b.id]=b;});var h='<div class="ms-toolbar">'+msSelect('kind',[['all','全部方向'],['industry','行业板块'],['theme','题材概念']],'directions','方向类型')+msSelect('sort',[['trend','成员趋势参考'],['relay','当前在板数量']],'directions','方向排序')+'<input aria-label="板块题材搜索" placeholder="搜索行业或题材" value="'+esc(v.q)+'" data-ms-search-key="directions" data-ms-search-field="q" oninput="msSearchInput(event,this,\'directions\',\'q\')"><button class="btn" onclick="erBoardCSV()">导出当前方向</button></div><p class="ms-muted">同花顺确认主板成员 · 当前 '+rows.length+'个方向 · 源行情 '+esc((erModel()||{}).source_at||'待更新')+(erLive()?'':' · 以下为上次行情参考')+'。行业与题材可重合，分类名称和完整成员入口保留。</p><div class="tw"><table class="market-strength-table er-board-table"><thead><tr><th class="l">方向 / 类型</th><th>确认主板成员</th><th>成员趋势参考</th><th>在板 / 梯队</th><th>成员反馈</th><th>有效覆盖</th><th></th></tr></thead><tbody>'+rows.slice(0,v.limit).map(function(b){var e=by[b.id]||{};return '<tr data-direction-id="'+esc(b.id)+'"><td class="l"><button class="ms-name-link" onclick="showBoardById(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button><span class="cd">'+(b.type==='industry'?'行业板块':'题材概念')+'</span></td><td>'+(b.member_codes||[]).length+'</td><td>'+msBadge(b.market_strength||{},'trend')+'</td><td><b>'+(e.limit_count==null?'—':e.limit_count)+'只在板</b><span class="cd">'+Object.keys(e.ladder||{}).sort().map(function(n){return n+'板 '+e.ladder[n]+'只';}).join(' / ')+'</span></td><td>'+pctHtml(e.median_return_pct,2)+'<span class="cd">上涨占比 '+fmt(e.up_pct,1)+'%</span></td><td>'+fmt(e.coverage_pct,1)+'%<span class="cd">'+(e.valid||0)+'/'+(e.expected||0)+'</span></td><td><button class="btn" onclick="pickBoardMembers(\''+jsq(b.id)+'\')">完整成员排名</button></td></tr>';}).join('')+'</tbody></table></div>'+(rows.length>v.limit?'<button class="btn" onclick="MS_VIEW.directions.limit+=100;erRenderBoards()">加载更多（完整 '+rows.length+'项）</button>':'');erPut(host,h,focus,['板块题材搜索']);}
+ function erBoardCSV(){var rows=erBoardRows(),version=DATA.ui_generation;return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:version,kind:'board',ids:rows.map(function(b){return b.id;})})}).then(function(r){if(!r.ok)throw Error('方向导出失败 '+r.status);return r.text();}).then(function(text){downloadMSCSV(text,'板块题材_'+version+'.csv');});}
+-function erStockDetail(m){if(!m)return '';return '<details class="card er-stock-detail"><summary>主板龙头接力依据 · '+esc(erHeight(m))+'</summary><p>'+esc(m.mode)+' · 源行情 '+esc(m.quote_at||'待核验')+'</p><div class="ms-tag-list">'+erTags(m)+'</div><p>前一完成日 '+esc(m.prior_date||'—')+'：'+(m.prior_height==null?'历史链待补齐':m.prior_height+'板')+'；当前 '+esc(erHeight(m))+'。</p><p>真实涨停价 '+fmt(m.limit_price,2)+' · 最新价格 '+fmt(m.price,2)+' · 反馈 '+pctHtml(m.feedback_pct,2)+'</p>'+(m.continuation||[]).map(function(c){return '<p>'+esc(c.board)+' · 核心 '+esc(c.leader_name)+'，已有'+c.leader_height+'个完成连板，链起于 '+esc(c.leader_chain_start)+'；'+esc(c.basis)+'</p>';}).join('')+'<p class="ms-muted">'+esc(m.reason||m.history_reason||'当前必要证据已核验')+'</p><pre style="white-space:pre-wrap;max-height:320px;overflow:auto">'+esc(JSON.stringify(m,null,2))+'</pre></details>';}
+-function erOverview(){var m=erModel(),f=m.yesterday_feedback;return '<section class="card ms-overview-section er-overview"><div class="er-section-heading"><h3>主板龙头接力</h3><button class="btn" onclick="goPane(\'emotion\')">进入情绪页 →</button></div><div class="er-metrics">'+erMetric('接力环境',esc((erLive()?'':'待更新 · 上次')+m.state),'源行情 '+esc(m.source_at||'待更新'))+erMetric('前一完成日 / 当前在板',m.highest_previous+' / '+m.highest_live+'板','两种口径独立展示')+erMetric('昨日封板股晋级',fmt(f.promotion_pct,1)+'%',f.sealed+'/'+f.valid+'个有效样本')+'</div></section>';}
++function erStockDetail(m){if(!m)return '';var reg=m.regulation||{},ref=reg.reference||{};return '<details class="card er-stock-detail"><summary>主板龙头接力依据 · '+esc(erHeight(m))+'</summary><p>'+esc(m.suspended_current?'最后成交 '+m.last_trade_date:m.mode+' · '+m.quote_at)+'</p><div class="ms-tag-list">'+erTags(m)+'</div>'+(m.continuation||[]).map(function(n){return '<p><b>'+esc(n.label)+'</b> · '+esc(n.leader_name)+'，节点 '+esc(n.date)+'，本股同日首板。公开时间 '+esc(n.known_at)+'；共享题材 '+n.boards.map(function(b){return esc(b.name);}).join('、')+'。'+esc(n.basis)+'</p>';}).join('')+(m.companions||[]).map(function(n){return '<p>伴生参照 '+esc(n.leader_name)+'：核心启动 '+esc(n.core_start)+'，本股 '+esc(n.start)+'；同步封板 '+n.overlap_days.map(esc).join('、')+'。'+esc(n.basis)+'</p>';}).join('')+(m.previous_cores||[]).map(function(n){return '<p>同题材前轮高标：'+n.height+'板，'+esc(n.start)+' — '+esc(n.last)+'，于 '+esc(n.end)+' 断板。与当前 '+esc(n.leader_name)+' 周期分别记录。</p>';}).join('')+'<h4>异动与停复牌披露</h4><p class="ms-muted">'+(reg.covered?'已扫描焦点股票的近期公告。':'近期公告尚未覆盖，不能据此判断无监管风险。')+'</p>'+(reg.notices||[]).map(function(n){return '<p><a href="'+esc(n.pdf_url||n.url)+'" target="_blank" rel="noopener noreferrer">'+esc(n.title)+'</a><span class="cd">实际公开 '+esc(n.published_at)+' · 首个可交易日 '+esc(n.available_day||'待核验')+'</span></p>';}).join('')+'<h4>分类指数偏离滚动参考</h4><p class="ms-muted">'+esc(ref.basis||'必要窗口待核验')+'。'+esc(ref.benchmark||'')+'；阈值差不是可继续上涨的额度。</p>'+(ref.windows||[]).map(function(w){return '<p>'+w.days+'交易日 · 截至 '+esc(w.asof)+' · '+(w.deviation_pp==null?esc(w.reason):'偏离 '+w.deviation_pp+'个百分点 / 上涨阈值 '+w.threshold_pp+'个百分点')+'</p>';}).join('')+'<h4>最近20个完成交易日</h4><div class="tw"><table class="market-strength-table"><thead><tr><th>日期</th><th>原价收盘</th><th>封板 / 停牌</th><th>完成高度</th><th>核验</th></tr></thead><tbody>'+(m.history||[]).map(function(p){return '<tr><td>'+p.date+'</td><td>'+fmt(p.close,2)+'</td><td>'+(p.halted?'全天停牌':p.sealed===true?'收盘封板':p.sealed===false?'未封板':'待核验')+'</td><td>'+(p.height==null?'—':p.height)+'板</td><td>'+esc(p.reason|| (p.exact?'链完整':'链起点待核验'))+'</td></tr>';}).join('')+'</tbody></table></div><details><summary>完整计算依据</summary><pre style="white-space:pre-wrap;max-height:320px;overflow:auto">'+esc(JSON.stringify(m,null,2))+'</pre></details></details>';}
++function erOverview(){var m=erModel(),f=m.yesterday_feedback;return '<section class="card ms-overview-section er-overview"><div class="er-section-heading"><h3>主板龙头接力</h3><button class="btn" onclick="goPane(\'emotion\')">进入情绪页 →</button></div><div class="er-metrics">'+erMetric('接力环境',esc((erLive()?'':'待更新 · 上次')+m.state),'源行情 '+esc(m.source_at||'待更新'))+erMetric('周期核心 / 当前在板',(m.cycles||{}).cycle_highest+' / '+m.highest_live+'板','两种口径独立展示')+erMetric('昨日封板股晋级',fmt(f.promotion_pct,1)+'%',f.sealed+'/'+f.valid+'个有效样本')+'</div></section>';}
++var ER_SOURCE_FRESH=typeof renderFresh==='function'?renderFresh:null;
++if(ER_SOURCE_FRESH){
++ renderFresh=function(){var result=ER_SOURCE_FRESH(),m=erModel();if(STATE.pane==='emotion'&&m&&m.mode==='正式收盘'&&erLive()){document.getElementById('fresh-txt').textContent='情绪 · 正式收盘已核验 · 实际源时间 '+m.source_at+(location.protocol==='file:'?' · 静态快照':'');var dot=document.getElementById('fresh-dot');dot.style.background='#8e8e93';dot.style.boxShadow='none';}return result;};
++ var ER_SOURCE_PANE=goPane;goPane=function(p){var result=ER_SOURCE_PANE(p);renderFresh();return result;};
++}
+ var ER_OLD_RENDER=msRender;msRender=function(key){if(key==='emotion')return renderEmotion();if(key==='directions')return erRenderBoards();return ER_OLD_RENDER(key);};
+ renderBoards=erRenderBoards;renderThemesPage=erRenderBoards;
+ var ER_OLD_STOCK=showStock;showStock=function(code,boardId){var result=ER_OLD_STOCK(code,boardId),row=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).find(function(r){return r.code===code;}),host=document.getElementById('dr-b');if(row&&host&&row.emotion_relay)host.insertAdjacentHTML('beforeend',erStockDetail(row.emotion_relay));return result;};
+--- before/csv_export.js
++++ after/csv_export.js
+@@ -1,9 +1,9 @@
+ function buildStockCSV(res,DATA,contexts){
+   contexts=contexts||{};
+   if(contexts.view==='emotion'&&DATA.emotion_relay){
+-    var head=['代码','名称','已完成日截至','昨日完成板位','昨日板位完整','当前板位','当前板位完整','模式','当前在板','接力角色','事件','风险','今日涨幅%','真实涨停价','换手%','源行情','有效截至','接续参照','同题材关系','规则版本','实现哈希','UI版本','完整接力依据'];
++    var head=['代码','名称','已完成日截至','昨日完成板位','昨日板位完整','当前板位','当前板位完整','模式','当前在板','接力角色','事件','风险','今日涨幅%','真实涨停价','换手%','源行情','有效截至','接续参照','同题材关系','周期核心','全天停牌','最后成交日','伴生关系','异动披露与参考','规则版本','实现哈希','UI版本','完整接力依据'];
+     var quote=function(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';};
+-    return '\ufeff'+head.join(',')+'\n'+res.map(function(r){var m=r.emotion_relay||{};return [r.code,r.name,m.prior_date,m.prior_height,m.prior_exact,m.height,m.height_exact,m.mode,m.sealed,(m.roles||[]).join(' / '),(m.events||[]).join(' / '),(m.risks||[]).join(' / '),m.feedback_pct,m.limit_price,m.turnover_pct,m.quote_at,m.valid_until,JSON.stringify(m.continuation||[]),JSON.stringify(m.relations||[]),DATA.emotion_relay.version,DATA.emotion_relay.implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');}).join('\n');
++    return '\ufeff'+head.join(',')+'\n'+res.map(function(r){var m=r.emotion_relay||{};return [r.code,r.name,m.prior_date,m.prior_height,m.prior_exact,m.height,m.height_exact,m.mode,m.sealed,(m.roles||[]).join(' / '),(m.events||[]).join(' / '),(m.risks||[]).join(' / '),m.feedback_pct,m.limit_price,m.turnover_pct,m.quote_at,m.valid_until,JSON.stringify(m.continuation||[]),JSON.stringify(m.relations||[]),JSON.stringify(m.cycle||{}),m.suspended_current,m.last_trade_date,JSON.stringify(m.companions||[]),JSON.stringify(m.regulation||{}),DATA.emotion_relay.version,DATA.emotion_relay.implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');}).join('\n');
+   }
+   function candidate(m){return m.recovery_current&&m.recovery_candidate&&m.recovery_candidate.active?m.recovery_candidate:{};}
+   if(contexts.view==='ranking' && DATA.stock_board_ranking){
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -975,6 +975,7 @@
+ .ma-stage-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:14px 0}.ma-stage-section{margin:18px 0;padding:20px}.ma-state{display:inline-block;padding:5px 10px;border-radius:8px;font-size:12px}.ma-active{background:#eaf1ff;color:#31689c}.ma-inactive{background:#f6efe9;color:#9c6545}.ma-trend-table{min-width:950px}.ma-trend-table td{vertical-align:top}.ma-trend-detail pre{font-size:11px;max-height:480px;overflow:auto}.ma-trend-detail .ms-mini-metrics{margin:12px 0}@media(max-width:800px){.ma-stage-grid{grid-template-columns:1fr}.ma-stage-section{padding:12px}.ma-trend-table{min-width:920px}}
+ .ms-label-tooltip{position:fixed;z-index:10000;max-width:360px;padding:10px 13px;background:#17243b;color:#fff;border-radius:9px;font-size:12px;line-height:1.65;box-shadow:0 5px 22px #0003;pointer-events:none;white-space:normal}.ms-label-tooltip[hidden]{display:none}[data-tip]{cursor:help}[data-tip]:focus-visible{outline:2px solid #4686cf;outline-offset:2px}#p-radar .hero{padding-bottom:20px}.ma-trend-table td{white-space:normal}.ms-rank-table .ms-tag-list{max-width:280px}
+ .er-table .cd,.er-board-table .cd{display:block;line-height:1.65;margin-top:5px}.er-table td:nth-child(2){min-width:155px}.er-table .ms-tag-list{display:flex;flex-wrap:wrap;gap:5px}.er-table td:last-child{min-width:130px;line-height:1.7}
++.er-core-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.er-core{display:flex;flex-direction:column;gap:12px;text-align:left;padding:20px;border:1px solid #e8dfd2;border-radius:14px;background:linear-gradient(130deg,#fcfaf5,#fff);color:#4d443b;cursor:pointer}.er-core b{font-size:24px;letter-spacing:-.035em}.er-core small{font-size:11px;font-weight:400;color:#8a8580;line-height:1.8}.er-stock-detail h4{font-size:13px;margin-top:24px}.er-stock-detail a{color:#886f52;text-decoration:underline;text-underline-offset:3px}.er-data .tw{margin:18px 0}.er-connection{margin:0 0 10px}.er-tag{border-radius:7px!important;letter-spacing:.01em}
+ </style>
+ </head>
+ <body>
+--- before/stock_rank_ui.js
++++ after/stock_rank_ui.js
+@@ -65,7 +65,7 @@
+ function msRankContext(){var v=MS_VIEW.stocks,selected=v.industryIds.concat(v.themeIds);if(STATE.boardFilterId&&selected.indexOf(STATE.boardFilterId)<0)selected.push(STATE.boardFilterId);var id=selected.indexOf(v.rankBoardId)>=0?v.rankBoardId:selected[0],b=id&&boardById(id);return {id:b?b.id:'all',name:b?b.name:'全池',board:b,ranking:((DATA.emotion_relay||{}).rankings||{})[b?b.id:'all']||(b?b.stock_ranking:(DATA.stock_board_ranking||{}).all),selected:selected};}
+ function msRankFresh(row,item){if(DATA.emotion_relay&&row.emotion_relay)return erFresh(row.emotion_relay);var m=row.market_strength||{},source=m.emotion_at||m.trend_at||item.source_at;if(m.trend_score==null&&m.emotion_score==null)return false;if(typeof sessionNow!=='function')return true;var at=parseDT(source);if(!at)return false;var mode=m.mode||'',formal=mode==='正式收盘',lunch=mode.indexOf('午休参考')===0;return mtSnapshotFresh({mode:lunch?'午休参考':mode,reference_only:mode.indexOf('参考行情')>=0,valid_until:formal?String(source).slice(0,10)+' 23:59:59':lunch?String(source).slice(0,10)+' 13:00:00':new Date(at.getTime()+600000).toISOString()});}
+ function msRankRows(){var v=MS_VIEW.stocks,ctx=msRankContext(),ranks=ctx.ranking||{},map={},fallback={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){map[r.code]=r;});((ctx.board||{}).members||[]).forEach(function(r){fallback[r.code]=r;});return (ranks[v.sort==='trend'?'trend':v.sort==='emotion'?'emotion':'all']||[]).map(function(c){return map[c]||Object.assign({code:c,name:c,ranking_unavailable:true},fallback[c]||{});}).filter(function(r){var item=(ranks.items||{})[r.code]||{},m=r.market_strength||{},mt=r.ma_trend||{},tags=(m.labels||m.events||[]).concat(item.style_labels||[],mt.status==='已退出'?[]:mt.stage_label||[]);return (v.phase!=='涨停收复'||!!msRecoveryCandidate(mt))&&msMatchDirections(r)&&(!v.q||String(r.code+' '+r.name).indexOf(v.q)>=0)&&(!v.phase||tags.indexOf(v.phase)>=0)&&(v.scope==='all'||v.scope==='trend'&&item.trend&&mtSnapshotFresh(mt)||v.scope==='emotion'&&item.emotion&&msRankFresh(r,item)||v.scope==='focus'&&(item.trend&&mtSnapshotFresh(mt)||item.emotion&&msRankFresh(r,item))||v.scope==='both'&&item.trend&&mtSnapshotFresh(mt)&&item.emotion&&msRankFresh(r,item));});}
+-function msRankTools(){var ctx=msRankContext(),v=MS_VIEW.stocks,h='<div class="ms-toolbar">';if(ctx.selected.length>1)h+=msSelect('rankBoardId',ctx.selected.map(function(id){var b=boardById(id);return [id,b?b.name:id];}),'stocks','排名参照板块');return h+msSelect('scope',[['all','全部成员（默认）'],['trend','趋势观察'],['emotion',DATA.emotion_relay?'接力观察':'情绪强势'],['focus','任一观察'],['both','趋势与接力同时满足']],'stocks','成员范围')+msSelect('sort',[['board','板块地位优先'],['trend','趋势力度排序'],['emotion',DATA.emotion_relay?'接力地位排序':'情绪强度排序']],'stocks','个股排名方式')+msSelect('phase',[['','全部标签'],['MA5初期推进','MA5初期推进'],['MA10承接整理','MA10承接整理'],['MA20横盘再启动','MA20横盘再启动'],['涨停收复','涨停收复（近5日）'],['趋势前排','趋势前排'],...(DATA.emotion_relay?[['空间高标','空间高标'],['题材领先候选','题材领先候选'],['同身位竞争','同身位竞争'],['同题材接续候选','同题材接续候选']]:[['情绪前排','情绪前排']])],'stocks','个股标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="stocks" data-ms-search-field="q" oninput="msSearchInput(event,this,\'stocks\',\'q\')"><button class="btn" onclick="msRankCSV()">导出当前完整排名 CSV</button></div><p class="ms-muted">排名参照：'+esc(ctx.name)+' · 确认主板成员 '+((ctx.ranking||{}).expected||0)+' 只；趋势力度有效 '+((ctx.ranking||{}).trend_valid||0)+'、'+(DATA.emotion_relay?'接力候选':'情绪有效')+' '+((ctx.ranking||{}).emotion_valid||0)+'。'+esc(DATA.emotion_relay?'综合参考顺序保留原排名；接力列按角色、高度、在板和反馈独立排序，不使用价格活跃分代表龙头地位。':DATA.stock_board_ranking.sorting)+' 多选时可切换排名参照板块，其他方向条件仍取交集。</p>';}
++function msRankTools(){var ctx=msRankContext(),v=MS_VIEW.stocks,h='<div class="ms-toolbar">';if(ctx.selected.length>1)h+=msSelect('rankBoardId',ctx.selected.map(function(id){var b=boardById(id);return [id,b?b.name:id];}),'stocks','排名参照板块');return h+msSelect('scope',[['all','全部成员（默认）'],['trend','趋势观察'],['emotion',DATA.emotion_relay?'接力观察':'情绪强势'],['focus','任一观察'],['both','趋势与接力同时满足']],'stocks','成员范围')+msSelect('sort',[['board','板块地位优先'],['trend','趋势力度排序'],['emotion',DATA.emotion_relay?'接力地位排序':'情绪强度排序']],'stocks','个股排名方式')+msSelect('phase',[['','全部标签'],['MA5初期推进','MA5初期推进'],['MA10承接整理','MA10承接整理'],['MA20横盘再启动','MA20横盘再启动'],['涨停收复','涨停收复（近5日）'],['趋势前排','趋势前排'],...(DATA.emotion_relay?[['空间高标','空间高标'],['题材领先候选','题材领先候选'],['同身位竞争','同身位竞争'],['周期最高标','周期最高标'],['监管接续候选','监管接续候选'],['断板补涨候选','断板补涨候选'],['停牌接续候选','停牌接续候选'],['伴生关系观察','伴生关系观察'],['同题材前轮高标','同题材前轮高标'],['停牌核心观察','停牌核心观察']]:[['情绪前排','情绪前排']])],'stocks','个股标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="stocks" data-ms-search-field="q" oninput="msSearchInput(event,this,\'stocks\',\'q\')"><button class="btn" onclick="msRankCSV()">导出当前完整排名 CSV</button></div><p class="ms-muted">排名参照：'+esc(ctx.name)+' · 确认主板成员 '+((ctx.ranking||{}).expected||0)+' 只；趋势力度有效 '+((ctx.ranking||{}).trend_valid||0)+'、'+(DATA.emotion_relay?'接力候选':'情绪有效')+' '+((ctx.ranking||{}).emotion_valid||0)+'。'+esc(DATA.emotion_relay?'综合参考顺序保留原排名；接力列按角色、高度、在板和反馈独立排序，不使用价格活跃分代表龙头地位。':DATA.stock_board_ranking.sorting)+' 多选时可切换排名参照板块，其他方向条件仍取交集。</p>';}
+ function msRankTable(rows,limit){var ctx=msRankContext(),ranking=ctx.ranking||{},shown=limit?rows.slice(0,limit):rows,h='<div class="tw"><table class="market-strength-table ms-research-table ms-rank-table"><thead><tr><th>板块排名</th><th class="l">个股 / 所属方向</th><th>当日涨幅</th><th>趋势力度 / 板块名次</th><th>'+(DATA.emotion_relay?'接力地位 / 板块名次':'情绪强度 / 板块名次')+'</th><th class="l">类型 / 均线阶段 / 状态</th></tr></thead><tbody>';
+  shown.forEach(function(r){var m=r.market_strength||{},mt=r.ma_trend||{},item=(ranking.items||{})[r.code]||{},fresh=msRankFresh(r,item),labels=item.style_labels||[],tags=msRankStyleTags(r,item,ctx.name,fresh);tags+=msRecoveryTag(mt);if(mt.pending)tags+=msTag('数据待核验','均线阶段：'+mt.reason+'；情绪强度独立判断');if(!mt.stage&&msRecoveryCandidate(mt))tags+=msTag('MA10跟踪',mt.reason,'ms-follow-tag');if(mt.stage)tags+=msTag(msMAStageLabel(mt),mt.reason+(mt.exit_at?'；历史退出 '+mt.exit_at:''))+' '+msTag(mt.status,mt.reason+(mt.exit_at?'；确认退出时间 '+mt.exit_at:''));if(item.missing||r.ranking_unavailable)tags+=msTag('数据待核验','该确认成员本轮没有完整个股数据');h+='<tr data-strength-id="'+esc(r.code)+'" data-board-rank="'+(item.rank||'')+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td><span class="ms-rank" '+msTipAttrs('板块地位',ctx.name+'完整成员第'+item.rank+'位，搜索和标签过滤不重算名次。')+'>'+(item.rank||'—')+'</span></td><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code)+'</span>'+msAffiliation(r,'stocks')+'</td><td>'+pctHtml(r.change_pct,2)+'</td><td>'+msBadge(m,'trend')+'<span class="cd">'+(item.trend_rank==null?'待核验':'板块第 '+item.trend_rank+' / '+ranking.trend_valid)+'</span></td><td>'+(DATA.emotion_relay?erRankCell(r,item,ranking):msBadge(m,'emotion')+'<span class="cd">'+(item.emotion_rank==null?'待核验':'板块第 '+item.emotion_rank+' / '+ranking.emotion_valid)+'</span>')+'</td><td class="l"><div class="ms-tag-list">'+tags+'</div><span class="cd">源行情 '+esc(item.source_at||'待核验')+'</span>'+(mt.exit_at?'<span class="cd">确认退出 '+esc(mt.exit_at)+'</span>':'')+'</td></tr>';});return h+'</tbody></table></div>'+msMore(rows,shown,'stocks');}
+ function msExportRows(rows,view,name){var ctx=msRankContext(),contexts={view:view,rankBoardId:ctx.id};if(!DATA.ui_lazy){downloadMSCSV(buildStockCSV(rows,DATA,contexts),name);return Promise.resolve();}var generation=DATA.ui_generation;return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:generation,codes:rows.map(function(r){return r.code;}),contexts:contexts})}).then(function(r){if(!r.ok)throw new Error(r.status===409?'数据版本已过期，请更新后导出':'导出失败 '+r.status);return r.text();}).then(function(text){downloadMSCSV(text,name);}).catch(function(e){toast(e.message);throw e;});}

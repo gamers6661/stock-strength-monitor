@@ -1,0 +1,39 @@
+--- before/scoring.py
++++ after/scoring.py
+@@ -36,6 +36,7 @@
+ import theme_assist
+ import radar
+ import scan_cache
++import market_strength
+ 
+ CLOSE_REFRESH_VERSION = '收盘价格优先发布3'
+ 
+@@ -263,7 +264,6 @@
+     # 竞价历史只读本地；指数读取同源当日报价，源尚未发布时显示待更新。
+     import board_trend
+     board_trend.attach(snap, fetch=False, quote_fetch=True, previous_snapshot=previous_snapshot)
+-    board_opportunity.enrich(snap, quotes, pool, previous_snapshot, persist=True)
+     import weekly_members
+     snap['member_refresh'] = weekly_members.status()
+     completed_at = datetime.now()
+@@ -1279,8 +1279,7 @@
+     attack_model.enrich(snap, quotes, price_contexts, previous_snapshot)
+     intraday.intraday_path.attach(snap, path_history)
+     attack_model.retain_missing_observations(snap)
+-    board_opportunity.enrich(snap, quotes, opportunity_pool, previous_snapshot,
+-                             persist=True, excluded_names=newly_excluded)
++    # Current strength is built once below, after all price/data contexts are complete.
+     visible_rows = stocks + catalog
+     model["entry_watch_count"] = sum(bool(row.get("entry_watch")) for row in visible_rows)
+     model["current_strong_count"] = sum(bool(row.get("current_strong_candidate")) for row in visible_rows)
+@@ -1359,8 +1358,8 @@
+                             daily_history_loader=lambda code: history_cache[code] if code in history_cache else df.load_kline(conn,'kline','code',code))
+     price_only.sanitize(snap)
+     session_context.attach(snap,quotes,formal,formal_calendar,contexts=price_contexts)
+-    radar.build_opportunities(snap,quotes,opportunity_pool,price_contexts,formal,
+-                             formal_calendar,previous_snapshot,persist=True)
++    market_strength.attach(snap, quotes, opportunity_pool, formal, formal_calendar,
++                           contexts=price_contexts, now=quote_capture_at, previous=previous_snapshot)
+ 
+     timer.mark("盘中与结构", "观察留档与研究")
+     append_history(snap)

@@ -1,0 +1,24 @@
+--- scoring.py.before
++++ scoring.py
+@@ -252,9 +252,9 @@
+             "pending_count": 0,
+             "price_basis_version": intraday.PRICE_BASIS_VERSION,
+             "reason": f"竞价报价不用于 MA{period} 回踩判断，等待正常交易"}
+-    # 竞价沿用完成日线；板块新增观察只读本地，不拖延当日报价采集。
++    # 竞价历史只读本地；指数读取同源当日报价，源尚未发布时显示待更新。
+     import board_trend
+-    board_trend.attach(snap, fetch=False)
++    board_trend.attach(snap, fetch=False, quote_fetch=True, previous_snapshot=previous_snapshot)
+     completed_at = datetime.now()
+     snap["scan_completed_at"] = completed_at.isoformat(sep=" ", timespec="seconds")
+     snap["generated_at"] = completed_at.strftime("%Y-%m-%d %H:%M:%S")
+@@ -1247,7 +1247,8 @@
+     completed_bars = {c: strength.completed(v) for c, v in klines.items()}
+     import board_trend
+     snap["board_trend_model"] = board_trend.attach(
+-        snap, strength.trading_calendar(completed_bars), fetch=True)
++        snap, strength.trading_calendar(completed_bars), fetch=True,
++        previous_snapshot=previous_snapshot)
+     catalog, catalog_stats = coverage.build(
+         quotes, klines, {s["code"] for s in stocks}, raw_reasons,
+         {m["code"]: m for m in raw_all}, model["asof"],

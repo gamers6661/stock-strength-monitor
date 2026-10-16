@@ -1,0 +1,140 @@
+--- datafeed.py.before
++++ datafeed.py
+@@ -1980,12 +1980,12 @@
+     return blob
+ 
+ 
+-def fetch_ths_detail_members(detail_code, max_page=60, section="gn"):
++def fetch_ths_detail_members(detail_code, max_page=60, section="gn", allow_partial=False):
+     """从同花顺概念/行业详情页读取真实成分股代码。
+ 
+     详情页的普通 HTML 分页不需要 ``hexin-v``；需要该 cookie 的是旧版
+-    ajax 成分接口。普通页每页 10 只，页面上的 ``page_info`` 给出总页数，
+-    因此这里按页读取并从 stockpage 链接提取六位代码。
++    ajax 成分接口。普通页的 ``page_info`` 给出总页数，按页读取真实代码。
++    行业补库可显式请求部分结果，返回codes/complete/error；常规调用仍须完整成功。
+     """
+     code = str(detail_code or "").strip()
+     if not code:
+@@ -1993,10 +1993,20 @@
+     section = "thshy" if str(section).lower() in {"thshy", "industry", "hy"} else "gn"
+     base = f"http://q.10jqka.com.cn/{section}/detail/code/{code}/"
+     out, total_pages = [], 1
++    def fail(message):
++        if allow_partial and out:
++            return dict(codes=out, complete=False, error=message)
++        raise RuntimeError(message)
+     for page in range(1, max_page + 1):
+         url = base if page == 1 else f"{base}page/{page}/"
+-        txt = http_get(url, headers={"Referer": base}, encoding="gbk",
+-                       timeout=20, retry=1)
++        try:
++            txt = http_get(url, headers={"Referer": base}, encoding="gbk",
++                           timeout=20, retry=1)
++        except Exception as exc:
++            if allow_partial and out:
++                return fail(f'第{page}页读取失败：{type(exc).__name__}: {exc}')
++            raise
++        seen_before = set(out)
+         found = re.findall(r"stockpage\.10jqka\.com\.cn/(\d{6})", txt, re.I)
+         for c in found:
+             if c not in out:
+@@ -2004,13 +2014,22 @@
+         if page == 1:
+             m = re.search(r"page_info[^>]*>.*?(\d+)\s*/\s*(\d+)", txt, re.I | re.S)
+             if m:
+-                try:
+-                    total_pages = min(max_page, max(1, int(m.group(2))))
+-                except (TypeError, ValueError):
+-                    total_pages = 1
+-        if page >= total_pages or not found:
++                total_pages = max(1, int(m.group(2)))
++                if total_pages > max_page:
++                    return fail(f"同花顺成员分页超出读取范围：{total_pages}>{max_page}")
++            elif len(set(found)) >= 20:
++                return fail('同花顺成员分页信息缺失，当前页完整性未核验')
++        # 返回空页/验证码或重复第一页时不能把前面几页冒充完整成员名单。
++        if not found:
++            return fail(f"同花顺成员第{page}页无有效代码")
++        info = re.search(r"page_info[^>]*>.*?(\d+)\s*/\s*(\d+)", txt, re.I | re.S)
++        if info and int(info.group(1)) != page:
++            return fail(f"同花顺成员分页未对齐：请求{page}，返回{info.group(1)}")
++        if page > 1 and not (set(found)-seen_before):
++            return fail(f"同花顺成员第{page}页重复，名单未完整取得")
++        if page >= total_pages:
+             break
+-    return out
++    return dict(codes=out, complete=True, error=None) if allow_partial else out
+ 
+ 
+ def _is_verified_ths_member_cache(blob):
+@@ -2165,13 +2184,15 @@
+     direct_targets = list(detail_by_name.items())
+     print(f"[THEME] 拉取 {len(direct_targets)} 个同花顺行业详情成分股 ...")
+     t0 = time.time()
+-    out, done, failed = {}, 0, []
++    out, done, failed, partial, errors = {}, 0, [], [], {}
+ 
+     def ths_industry_work(item):
+         name, dc = item
+         try:
+-            codes = fetch_ths_detail_members(dc, section="thshy")
+-            return name, codes, (RuntimeError("同花顺行业详情页无成分股") if not codes else None)
++            result = fetch_ths_detail_members(dc, section="thshy", allow_partial=True)
++            codes = result['codes']
++            return name, codes, (RuntimeError(result['error'] or '同花顺行业详情页无成分股')
++                                 if not result['complete'] or not codes else None)
+         except Exception as e:
+             return name, [], e
+ 
+@@ -2182,6 +2203,9 @@
+             done += 1
+             if err:
+                 failed.append(name)
++                errors[name] = str(err)
++                if codes:
++                    partial.append(name)
+             for c in codes:
+                 out.setdefault(c, []).append(name)
+             if progress and done % 15 == 0:
+@@ -2196,25 +2220,27 @@
+ 
+     old_blob = _read_json_file(p) if p.exists() else None
+     old_map = old_blob.get("map") if isinstance(old_blob, dict) else None
+-    old_n = len(old_map or {}) if isinstance(old_map, dict) else 0
+-    failed_ratio = len(failed) / max(1, len(direct_targets))
+-    catastrophic = bool(old_n and (not out or
+-                     (len(out) < max(200, int(old_n * 0.25)) and failed_ratio >= 0.25)))
+-    if catastrophic:
+-        print(f"[WARN] 同花顺行业成分页整体不可用，新结果 {len(out)} 只，沿用旧缓存 {old_n} 只")
+-        _source_mark("ths_industry_members", "stale_cache", coverage=old_n,
+-                     detail=f"new={len(out)}; failed={len(failed)}", stale=True)
+-        return old_blob
+-
++    # 单个行业拉取失败保留该行业上次有来源的成员；成功行业按新名单替换。
++    # 不因一次空页把某个板块从本地目录里清空。
++    if isinstance(old_map, dict) and (old_blob.get('stat') or {}).get('member_source') == 'ths-industry-detail-v1':
++        failed_set = set(failed)
++        for c, names in old_map.items():
++            keep = [name for name in names if name in failed_set and name in detail_by_name]
++            if keep:
++                out[c] = sorted(set(out.get(c, [])+keep), key=lambda n: order.get(n, 10**9))
++    checked_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+     stat = {"industries": len(direct_targets), "stocks": len(out),
+-            "failed": failed[:30], "elapsed": round(time.time() - t0, 1),
++            "failed": failed, "elapsed": round(time.time() - t0, 1),
++            "partial": partial, "errors": errors,
++            "checked_at": checked_at,
+             "member_source": "ths-industry-detail-v1",
+             "catalog_fingerprint": catalog_fp,
+             "catalog_detail_count": len(catalog.get("detail") or {})}
+     blob = {"map": out, "stat": stat}
+     config.atomic_write_text(p, json.dumps(blob, ensure_ascii=False))
+-    _source_mark("ths_industry_members", "ok", elapsed=time.time() - t0,
+-                 coverage=len(out), detail=f"industries={len(direct_targets)}")
++    _source_mark("ths_industry_members", "partial" if failed else "ok", elapsed=time.time() - t0,
++                 coverage=len(out), detail=f"industries={len(direct_targets)}; incomplete={len(failed)}",
++                 stale=bool(failed))
+     print(f"[THEME] 同花顺行业成分补全完成：{len(direct_targets)} 个行业 / "
+           f"{len(out)} 只股票 / 失败 {len(failed)} 个 / 用时 {stat['elapsed']}s")
+     return blob

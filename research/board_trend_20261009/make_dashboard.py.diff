@@ -1,0 +1,11 @@
+--- make_dashboard.py.before
++++ make_dashboard.py
+@@ -61,6 +61,8 @@
+         return None
+     snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+     attach_klines(snap)
++    import board_trend
++    board_trend.attach(snap, fetch=False)
+     tpl = TPL.read_text(encoding="utf-8")
+     if PLACEHOLDER not in tpl:
+         print("[ERR] 模板缺少数据占位符")

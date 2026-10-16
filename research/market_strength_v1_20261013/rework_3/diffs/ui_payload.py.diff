@@ -1,0 +1,28 @@
+--- before/ui_payload.py
++++ after/ui_payload.py
+@@ -252,6 +252,25 @@
+     return json.loads(blob(token, 'full', page))
+ 
+ 
++def export_board_csv(token, identities, page=None):
++    if not isinstance(identities, list) or len(identities) > 10000 or any(not isinstance(x, str) or len(x) > 160 for x in identities) or len(set(identities)) != len(identities):
++        raise ValueError('Invalid board selection')
++    import csv
++    import io
++    output = io.StringIO(newline='')
++    writer = csv.writer(output, lineterminator='\n')
++    writer.writerow(['ID','名称','趋势分','情绪分','主导周期','阶段','版本','UI版本','完整模型依据'])
++    with closing(connect(token, page)) as con:
++        for identity in identities:
++            row = con.execute("SELECT value FROM detail WHERE kind='board' AND id=?", (identity,)).fetchone()
++            if not row:
++                raise ValueError('Unknown board')
++            board = json.loads(row[0]); model = board['market_strength']
++            writer.writerow([identity, board['name'], model['trend_score'], model['emotion_score'],
++                             model['dominant_period'], model['phase'], model['version'], token, dumps(model)])
++    return ('\ufeff'+output.getvalue()).encode('utf-8')
++
++
+ def export_csv(token, codes, contexts):
+     if not isinstance(codes, list) or not 0 <= len(codes) <= 10000 or len(set(codes)) != len(codes):
+         raise ValueError('Invalid export selection')

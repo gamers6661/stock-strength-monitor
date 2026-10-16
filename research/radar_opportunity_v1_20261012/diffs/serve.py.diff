@@ -1,0 +1,46 @@
+--- before/serve.py
++++ serve.py
+@@ -44,6 +44,7 @@
+ import board_trend
+ import board_center
+ import board_opportunity
++import radar_opportunity
+ import board_quote
+ import weekly_members
+ import price_only
+@@ -88,6 +89,8 @@
+          "code_board_trend_version": board_trend.VERSION,
+          "code_board_catalog_version": board_center.VERSION,
+          "code_board_opportunity_version": board_opportunity.VERSION,
++         "code_radar_opportunity_version": radar_opportunity.VERSION,
++         "code_radar_opportunity_hash": radar_opportunity.IMPLEMENTATION_HASH,
+          "code_strength_version": stock_strength.VERSION,
+          "code_intraday_model_version": intraday.VERSION,
+          "code_attack_model_version": attack_model.LIVE_VERSION,
+@@ -126,6 +129,7 @@
+         if page is None or not page.exists():
+             raise RuntimeError("看板页面未生成")
+         config.atomic_write_text(config.ROOT / "snapshot_report.md", report.build(snapshot))
++        radar_opportunity.record_publication(snapshot,ui_payload.active_generation(),page.stat().st_mtime_ns)
+         try:
+             SNAPSHOT_META.update({
+                 "snapshot_generated_at": snapshot.get("generated_at"),
+@@ -139,6 +143,9 @@
+                 "snapshot_board_catalog_version": snapshot.get('board_catalog_version'),
+                 "snapshot_board_opportunity_version": (snapshot.get('board_opportunity_model') or {}).get('version'),
+                 "snapshot_board_opportunity_counts": (snapshot.get('board_opportunity_model') or {}).get('counts'),
++                "snapshot_radar_opportunity_version": (snapshot.get('radar_opportunity') or {}).get('version'),
++                "snapshot_radar_opportunity_counts": (snapshot.get('radar_opportunity') or {}).get('counts'),
++                "snapshot_radar_opportunity_hash": (snapshot.get('radar_opportunity') or {}).get('implementation_hash'),
+                 "snapshot_board_index_ready": (snapshot.get("board_trend_model") or {}).get("ready"),
+                 "snapshot_consolidation_version": (snapshot.get('trend_consolidation') or {}).get('version'),
+                 "snapshot_consolidation_count": (snapshot.get('trend_consolidation') or {}).get('count'),
+@@ -449,6 +456,8 @@
+                            and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
+                            and snapshot.get('board_catalog_version') == board_center.VERSION
+                            and (snapshot.get('board_opportunity_model') or {}).get('version') == board_opportunity.VERSION
++                           and (snapshot.get('radar_opportunity') or {}).get('version') == radar_opportunity.VERSION
++                           and (snapshot.get('radar_opportunity') or {}).get('implementation_hash') == radar_opportunity.IMPLEMENTATION_HASH
+                            and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+                            and (snapshot.get('wyckoff_structure') or {}).get('version') == wyckoff_structure.VERSION
+                            and (snapshot.get('session_context') or {}).get('version') == session_context.VERSION

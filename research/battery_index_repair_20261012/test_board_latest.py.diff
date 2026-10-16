@@ -1,0 +1,97 @@
+--- before/test_board_latest.py
++++ test_board_latest.py
+@@ -118,6 +118,67 @@
+         self.assertFalse(r['ma20_support_established'])
+ 
+ 
++class HistoryRevalidationTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
++        self.path=Path(self.tmp.name)/'boards.db'
++        self.bars,self.days=sample()
++        B.save('881281',self.bars,'2025.js',self.path)
++        self.corrected=copy.deepcopy(self.bars)
++        self.corrected[-1].update(close=130,high=131)
++        self.now=(datetime.fromisoformat(self.days[-1])+timedelta(days=3)).replace(hour=10,minute=5)
++        self.quote=dict(code='881281',name='电池',date=self.now.date().isoformat(),quote_at=self.now.isoformat(sep=' '),
++                        price=131,previous_close=130,sampled_low=130,sampled_high=131,
++                        change_pct=(131/130-1)*100,source='同花顺板块指数分时',price_basis='同花顺指数原值')
++        self.board=dict(name='电池',index_trend=B.calculate(self.bars,self.days,self.days[-1]))
++        self.board['index_trend'].update(code='881281',name='电池',source='同花顺行业指数')
++
++    def repair(self):
++        return B.revalidate_history([self.board],{'881281':self.quote},self.days,self.now,'早盘',self.path)
++
++    def test_complete_same_date_cache_is_revalidated_on_close_mismatch(self):
++        with patch.object(B,'parse_year',return_value=(None,self.corrected)) as fetch:
++            result=self.repair()
++            self.assertEqual(result['repaired'],1)
++            fetch.assert_called_once_with('881281','2025',revalidate=True)
++        self.assertEqual(B.load('881281',self.path)[-1]['close'],130)
++        current=B.current_observation(self.board['index_trend'],B.load('881281',self.path),self.days,self.quote,self.now,'早盘')
++        self.assertTrue(current['ready'])
++        self.assertAlmostEqual(current['ma5'],sum([126,127,128,130,131])/5)
++        with patch.object(B,'parse_year') as fetch:
++            self.assertEqual(self.repair()['needed'],0);fetch.assert_not_called()
++
++    def test_bad_annual_is_not_saved_and_failure_is_throttled(self):
++        original=B.load('881281',self.path)
++        with patch.object(B,'parse_year',return_value=(None,self.bars)) as fetch:
++            self.assertEqual(self.repair()['failed'],1)
++            self.assertEqual(self.repair()['deferred'],1)
++            self.assertEqual(fetch.call_count,1)
++        self.assertEqual(B.load('881281',self.path),original)
++
++    def test_wrong_name_network_failure_and_duplicate_dates_preserve_history(self):
++        for returned,bars,error in [('错误名称',self.corrected,None),(None,self.corrected,OSError('offline')),
++                                    (None,self.corrected+[self.corrected[-1]],None)]:
++            # Independent attempts must not share the previous failure cooldown.
++            with B.connect(self.path) as con:con.execute('DELETE FROM board_fetch_state')
++            with patch.object(B,'parse_year',return_value=(returned,bars),side_effect=error):
++                self.assertEqual(self.repair()['failed'],1)
++            self.assertEqual(B.load('881281',self.path)[-1]['close'],129)
++
++    def test_stale_or_wrong_quote_identity_never_triggers_repair(self):
++        for change in [dict(name='锂电池'),dict(code='881101'),dict(quote_at=self.days[-1]+' 15:00:00')]:
++            original=self.quote;self.quote=dict(original,**change)
++            with patch.object(B,'parse_year') as fetch:
++                self.assertEqual(self.repair()['needed'],0);fetch.assert_not_called()
++            self.quote=original
++
++    def test_unfinished_today_bar_not_written_into_completed_history(self):
++        today=dict(self.corrected[-1],date=self.quote['date'],close=131,high=132)
++        with patch.object(B,'parse_year',return_value=(None,self.corrected+[today])):
++            self.assertEqual(self.repair()['repaired'],1)
++        self.assertEqual(B.load('881281',self.path)[-1]['date'],self.days[-1])
++
++
+ class QuoteCacheTest(unittest.TestCase):
+     def setUp(self):
+         clock=patch.object(Q,'datetime',wraps=datetime)
+@@ -236,8 +297,25 @@
+                 result=Q.fetch(['881281'],p)['881281']
+             self.assertEqual(result['quote_at'],first['quote_at'])
+             self.assertEqual(result['fetch_error'],'指数报价时间超前')
+-            self.assertEqual(get.call_count,1)
++            self.assertEqual(get.call_count,3)
+             self.assertEqual(json.loads(p.read_text())['quotes']['881281']['quote_at'],first['quote_at'])
++
++    def test_invalid_batch_clock_recovers_from_valid_single_quote(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            with patch.object(Q.datafeed,'http_get',side_effect=[self.raw('1500',140),self.raw()]) as get:
++                result=Q.fetch(['881281'],Path(tmp)/'q.json')['881281']
++            self.assertEqual(get.call_count,2)
++            self.assertEqual(result['quote_at'],'2026-10-09 10:05:00')
++            self.assertNotIn('fetch_error',result)
++
++    def test_auction_invalid_batch_clock_still_does_not_expand_requests(self):
++        self.clock.now.return_value=datetime(2026,10,9,9,20)
++        with tempfile.TemporaryDirectory() as tmp:
++            with patch.object(Q.datafeed,'http_get',return_value=self.raw('1500',140)) as get:
++                result=Q.fetch(['881281'],Path(tmp)/'q.json')['881281']
++            self.assertEqual(get.call_count,1)
++            self.assertNotIn('quote_at',result)
++            self.assertEqual(result['fetch_error'],'指数报价时间超前')
+ 
+     def test_invalid_clock_cache_is_evicted_even_on_network_failure(self):
+         for at in ('1200','0929','1500'):

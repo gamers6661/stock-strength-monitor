@@ -1,0 +1,13 @@
+--- before/csv_export.js
++++ after/csv_export.js
+@@ -1,4 +1,10 @@
+ function buildStockCSV(res,DATA,contexts){
++  if(DATA.ma_trend){
++    var head=['代码','名称','现价','当日涨幅%','均线阶段','当前状态','有效观察','本阶段支撑触线价','暂态均线','距支撑ATR','起点日期','起点通道','起点量比','起点实体ATR','整理量比','底部反弹ATR','反弹依据','同步方向','方向入选比例%','行情源时间','退出时间','原因','数据缺口','模式','均线版本','均线实现哈希','UI版本','情绪分','历史力度参考','完整均线依据'];
++    var cell=function(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';};
++    var lines=res.map(function(s){var m=s.ma_trend||{},o=m.origin||{},p=m.platform||{},b=m.board||{},rb=m.rebound||{},old=s.market_strength||{};return [s.code,s.name,m.price,m.change_pct,m.stage_label,m.status,m.eligible?'是':'否',m.support_price,m.ma_value,m.distance_atr,o.date,o.kind,o.volume_ratio,o.body_atr,p.volume_ratio,rb.distance_atr,rb.basis,b.name,b.trend_pct,m.quote_at,m.exit_at,m.reason,(m.data_reasons||[]).join('；'),m.mode,m.version,DATA.ma_trend.implementation_hash,DATA.ui_generation,old.emotion_score,old.trend_score,JSON.stringify(m)].map(cell).join(',');});
++    return '\ufeff'+head.join(',')+'\n'+lines.join('\n');
++  }
+   if(DATA.market_strength || res.some(function(s){return !!s.market_strength;})){
+     var cols=['代码','名称','当日涨幅%','趋势分','情绪分','趋势等级','情绪等级','主导周期','阶段','事件','原因','风险','趋势截至','情绪截至','模式','规则版本','实现哈希','UI版本','完整模型依据'];
+     var quote=function(v){return v==null?'': '"'+String(v).replace(/"/g,'""')+'"';};

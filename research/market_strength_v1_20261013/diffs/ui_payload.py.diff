@@ -1,0 +1,59 @@
+--- before/ui_payload.py
++++ after/ui_payload.py
+@@ -88,17 +88,27 @@
+ def summary(full, token):
+     result = dict(full)
+     list_fields = set(json.loads((config.ROOT / 'stock_list_fields.json').read_text(encoding='utf-8')))
++    list_fields.add('market_strength')
+     for group in ('stocks', 'coverage_catalog'):
+         rows = []
+         for s in full.get(group, []):
+             row = {k: v for k, v in s.items() if k in list_fields and k not in ('k', 'kd', 'theme_relations', 'stock_strength_evidence')}
+             if isinstance(row.get('intraday_path'), dict):
+                 row['intraday_path'] = {k: v for k, v in row['intraday_path'].items() if k != 'recent'}
++            if row.get('market_strength'):
++                import market_strength
++                row['market_strength']=market_strength.brief(row['market_strength'])
+             rows.append(row)
+         result[group] = rows
+-    result['board_catalog'] = [dict(b, members=[{'code': r['code'], 'change_pct': r.get('change_pct')}
++    result['board_catalog'] = [dict(b, members=[{'code': r['code'], 'change_pct': r.get('change_pct'), 'market_strength': r.get('market_strength')}
+                                                  for r in b.get('members', [])])
+                                for b in full.get('board_catalog', [])]
++    if full.get('market_strength'):
++        import market_strength
++        for b in result['board_catalog']:
++            full_m=b['market_strength'];b['market_strength']=market_strength.brief(full_m)
++            b['market_strength']['emotion_parts']={'R0':full_m['emotion_parts'].get('R0')}
++            b['opportunity']=dict(b['opportunity'],market_strength=b['market_strength'])
+     if full.get('radar_opportunity'):
+         model=dict(full['radar_opportunity'])
+         model['by_code']={c:radar_brief(r) for c,r in model['by_code'].items()}
+@@ -116,6 +126,9 @@
+     keys=('code','name','version','day','judged_at','source_at','R0','E0','M0','price','daily_tier','daily_asof',
+           'live_attack_score','risk','status','current','main_label','labels','trade_restriction','board_relation_status','display_label','opportunity_kinds','sort_rank')
+     result={k:row.get(k) for k in keys}
++    if row.get('market_strength'):
++        import market_strength
++        result['market_strength']=market_strength.brief(row['market_strength'])
+     result['boards']=[{k:b.get(k) for k in ('name','type','selected','peers_qualified')} for b in row.get('boards',[])]
+     result['first_observed_at']=row.get('first_observed_at') or min((v['event']['first_observed_at'] for v in row.get('categories',{}).values() if v.get('event')),default=None)
+     return result
+@@ -184,7 +197,7 @@
+                     con.execute('INSERT INTO meta VALUES(?,?)', (key + '.gz', gzip.compress(value, compresslevel=1)))
+                 con.execute('INSERT INTO meta VALUES(?,?)', ('template', template.encode('utf-8')))
+                 con.execute('INSERT INTO meta VALUES(?,?)', ('csv_formatter', (config.ROOT / 'csv_export.js').read_bytes()))
+-                csv_meta={k:full.get(k) for k in ('quote_capture_at','generated_at','scan_completed_at','strength_model')}
++                csv_meta={k:full.get(k) for k in ('quote_capture_at','generated_at','scan_completed_at','strength_model','market_strength')}
+                 csv_meta['ui_generation']=token
+                 con.execute('INSERT INTO meta VALUES(?,?)', ('csv_meta', dumps(csv_meta).encode('utf-8')))
+                 html = template.replace('/*__DATA__*/null', config.script_json(packet)).encode('utf-8')
+@@ -263,7 +276,7 @@
+         raise RuntimeError('Node.js is required for the shared CSV formatter')
+     # Formatting is shared with the existing offline page, retaining all 228 columns.
+     request = dumps({'rows': rows, 'data': {k: meta.get(k) for k in
+-                     ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model','ui_generation')},
++                     ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model','market_strength','ui_generation')},
+                      'contexts': contexts, 'formatter': formatter[0].decode('utf-8')})
+     result = subprocess.run([node, str(config.ROOT / 'csv_runner.js')], input=request.encode('utf-8'),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90,

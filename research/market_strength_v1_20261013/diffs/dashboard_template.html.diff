@@ -1,0 +1,63 @@
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -907,6 +907,7 @@
+ .radar-opportunity-detail p{overflow-wrap:anywhere;line-height:1.6;font-size:12px}
+ .radar-opportunity-detail details{margin-top:12px}
+ .radar-opportunity-detail summary{cursor:pointer;font-weight:600;margin-bottom:8px}
++#stratbar{display:none!important}
+ </style>
+ </head>
+ <body>
+@@ -1057,7 +1058,7 @@
+       <div class="toolbar-in">
+         <div class="search" style="width:238px">
+           <span class="ic">⌕</span>
+-          <input id="q" placeholder="代码 / 名称（搜索全池）/ 题材 / 行业">
++          <input id="q" placeholder="代码 / 名称（搜索全池）">
+         </div>
+         <div class="seg" id="seg-period" style="display:none"><button data-k="all" class="on">强度排序</button></div>
+         <button class="btn" id="btn-filter">筛选 <span class="bdg" id="fcount" style="display:none">0</span></button>
+@@ -1078,7 +1079,7 @@
+ <section class="pane" id="p-radar">
+   <div class="hero" style="padding-bottom:26px">
+     <h1 style="font-size:clamp(2rem,3.6vw,3rem)">选股雷达</h1>
+-    <p id="rad-sub">独立机会雷达；日线A/B/C保留为背景。</p>
++    <p id="rad-sub">当前强势：趋势强或情绪强，任一成立即入选。</p>
+   </div>
+   <div class="main" style="padding-top:0">
+     <div id="radar-views" class="seg" style="margin-bottom:16px"></div>
+@@ -1094,7 +1095,7 @@
+ <section class="pane" id="p-boards">
+   <div class="hero" style="padding-bottom:26px">
+     <h1 style="font-size:clamp(2rem,3.6vw,3rem)">板块与题材</h1>
+-    <p>指数趋势、回踩位置与成员扩散分别筛选。点击标签查看判断依据，点击板块查看成员。</p>
++    <p>当前强势按主板成员共振计算；同花顺官方指数单独作为参照。</p>
+   </div>
+   <div class="main" style="padding-top:0">
+     <div class="grid g4" id="bd-metrics" style="margin-bottom:26px"></div>
+@@ -1114,7 +1115,7 @@
+ <section class="pane" id="p-themes">
+   <div class="hero" style="padding-bottom:26px">
+     <h1 style="font-size:clamp(2rem,3.6vw,3rem)">题材雷达</h1>
+-    <p>题材当日活跃与中期趋势分列；点击题材查看内部三类候选及全部成员。</p>
++    <p>当前强势按主板成员趋势与情绪两轴计算；点击题材查看依据和全部成员。</p>
+   </div>
+   <div class="main" style="padding-top:0">
+     <div id="theme-center"></div>
+@@ -2589,7 +2590,7 @@
+ 
+ /* ── 选股雷达：A/B/C 是趋势候选关注层级，全体强度排名另列。 ── */
+ var RADAR_TIER='A';
+-/*__RADAR_SCRIPT__*/
++
+ function setRadarTier(k){ RADAR_TIER=k; renderRadar(); }
+ function radarItems(){
+   var R=(DATA.radar||{})[strat()]||{};
+@@ -4631,6 +4632,7 @@
+   if(!name)return toast('概念名称为空，无法查看');
+   pickBoardMembers('theme:'+name);
+ }
++/*__RADAR_SCRIPT__*/
+ installLazyDetails();
+ init();
+ 

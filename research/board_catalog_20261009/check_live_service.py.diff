@@ -1,0 +1,24 @@
+--- check_live_service.py.before
++++ check_live_service.py
+@@ -12,6 +12,7 @@
+ import wyckoff_structure
+ import session_context
+ import board_trend
++import board_center
+ 
+ 
+ def get(url):
+@@ -31,6 +32,13 @@
+     assert status["code_model_version"] == strength.VERSION
+     assert status["code_strength_version"] == stock_strength.VERSION
+     assert status["code_board_trend_version"] == board_trend.VERSION
++    assert status['code_board_catalog_version'] == board_center.VERSION
++    assert status['snapshot_board_catalog_version'] == snapshot['board_catalog_version'] == served['board_catalog_version'] == board_center.VERSION
++    industry_names = {b['name'] for b in served['board_catalog'] if b['type'] == 'industry'}
++    theme_names = {b['name'] for b in served['board_catalog'] if b['type'] == 'theme'}
++    catalog = board_center._catalog()
++    assert catalog['industry'] <= industry_names, '同花顺行业目录入口缺失'
++    assert catalog['theme'] <= theme_names, '同花顺概念目录入口缺失'
+     assert status["code_intraday_model_version"] == intraday.VERSION
+     assert status["code_intraday_rule_version"] == config.INTRADAY_RULE_VERSION
+     assert status["last_publish_ok"] is True

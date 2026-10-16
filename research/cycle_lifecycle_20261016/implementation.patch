@@ -1,0 +1,654 @@
+--- before/config.py
++++ after/config.py
+@@ -32,7 +32,7 @@
+     'broken_repair_pct': 3., 'broken_close_position': .7,
+ }
+ MA_TREND = {
+-    'version': 'ma-trend-2026-10-16.4',
++    'version': 'ma-trend-2026-10-16.5',
+     'origin_days': 5, 'origin_base_days': 5,
+     'impulse_day_pct': 4., 'impulse_two_day_pct': 6., 'impulse_rise_atr': 1.2,
+     'volume_ratio': 1.8, 'close_position': .75,
+--- before/ma_trend.py
++++ after/ma_trend.py
+@@ -119,10 +119,12 @@
+ def ma20_backup(platform):
+     """Only a qualified, fixed floor may defend a lost MA20."""
+     if not platform or not platform.get('confirmed') or not positive(platform.get('low')):return False
+-    ratio=platform.get('current_volume_ratio',platform.get('volume_ratio'))
++    # Qualification locks a defensive floor. Age and subsequent volume changes
++    # affect the observation position, not the existence of that fixed support.
++    ratio=platform.get('volume_ratio')
+     return (platform.get('rise_pct',0)>=P['ma20_rise_pct'] and platform.get('rise_atr',0)>=P['ma20_rise_atr']
+-            and platform.get('current_days',platform.get('days',0))<=P['platform_max_days']
+-            and platform.get('current_width_atr',platform.get('width_atr',math.inf))<=P['platform_width_atr']
++            and platform.get('days',0)<=P['platform_max_days']
++            and platform.get('width_atr',math.inf)<=P['platform_width_atr']
+             and number(ratio) and ratio<=P['platform_volume_ratio']
+             and (not P['ma20_width_pct_hard'] or platform.get('current_width_pct',platform.get('width_pct',math.inf))<=P['platform_width_pct']))
+ 
+@@ -340,21 +342,31 @@
+     return None
+ 
+ 
+-def ma20_restart_followthrough(bars,i,features,event,platform,entry,root):
++def ma20_restart_followthrough(bars,i,features,event,platform,entry,root,stage=20):
+     if not event or i<=event['index']:return None
+     b=bars[i]
+     if (b['close']<=bars[i-1]['close'] or b['close']<=event['price']
+-            or b['close']<ma20_defense(features['ma'][20][i],platform)
++            or b['close']<(ma20_defense(features['ma'][20][i],platform) if stage==20 else features['ma'][10][i])
+             or not all(b['close']>=features['ma'][n][i] and features['ma'][n][i]>features['ma'][n][i-1] for n in (5,10))):return None
+-    proof=dict(kind='MA20整理后再启动',date=b['date'],event_date=event['date'],close=b['close'],
++    proof=dict(kind='MA20整理后再启动' if stage==20 else 'MA10承接后再启动',date=b['date'],event_date=event['date'],close=b['close'],
+         event_close=event['price'],previous_close=bars[i-1]['close'],ma5=features['ma'][5][i],ma10=features['ma'][10][i],
+-        prior_stage=20,prior_origin=root['date'],prior_rise_pct=entry['rise_pct'],prior_rise_atr=entry['rise_atr'],
+-        prior_ma20_touched=bool(entry.get('touch_confirmed')),basis='MA20整理后收复MA5，后续完成日继续推进且两线向上')
++        prior_stage=stage,prior_origin=root['date'],prior_rise_pct=entry['rise_pct'],prior_rise_atr=entry['rise_atr'],
++        prior_ma20_touched=bool(entry.get('touch_confirmed')),basis='同轮MA'+str(stage)+'整理后收复MA5，后续完成日继续推进且两线向上')
+     return confirmed_price_origin(bars,event['index'],features,proof['kind'],proof)
+ 
+ 
++def wave_gain(bars,i,root,features):
++    """Accumulate this unbroken cycle's gain, never an already exited cycle."""
++    if not root:return {}
++    peak=max(range(root['index'],i+1),key=lambda j:(bars[j]['close'],-j))
++    amount=bars[peak]['close']-root['base_low']
++    return dict(rise_pct=100*amount/root['base_low'],rise_atr=amount/root['atr'],
++        peak_close=bars[peak]['close'],peak_date=bars[peak]['date'],origin=copy.deepcopy(root),
++        base_low=root['base_low'],base_at=root['base_at'])
++
++
+ def daily(bars,calendar,limit_pct=None):
+-    """Replay completed closes to retain origins and stage exits without future data."""
++    """Replay one cycle: a strong MA5 entry, sequential handoffs, and real exits."""
+     bars=observed_history.traded_bars(bars)
+     if not bars:return dict(stage=None,reason='暂无有效成交日',pending=False,sample_only=True)
+     dates=[b['date'] for b in bars]
+@@ -371,178 +383,128 @@
+     if key in _DAILY_CACHE:return copy.deepcopy(_DAILY_CACHE[key])
+     features={'ma':{n:[average(bars,i,n) for i in range(len(bars))] for n in LABELS},
+               'atr':[atr(bars,i) for i in range(len(bars))],'limit_pct':limit_pct}
+-    active=None;root=None;last_exit=None;roots=[];platform={};entered=None;exits=[]
++    active=None;root=None;leg=None;last_exit=None;roots=[];platform={};entered=None;exits=[]
+     invalid_platforms=set();lifecycle=None;transitions=[];last_confirmation=None
+-    ma20_platform={};last_exit_index=-1;ma20_root=None;last_platform={};recovery=None;ma20_entry={};restart=None;last_phase=None
++    ma20_platform={};last_exit_index=-1;recovery=None;ma20_entry={};restart=None;last_phase=None;restart_event=None;progressing=False
++    primary=None;candidates={};gain={}
++    def transition(day,old,new,reason,**proof):
++        transitions.append(dict(date=day,from_stage=old,to_stage=new,reason=reason,cycle_id=root['date'],**proof))
+     for i in range(21,len(bars)):
++        day=bars[i]['date'];close=bars[i]['close'];line5=features['ma'][5][i]
+         signal=origin(bars,i,features)
+         new_recovery=recovery_event(bars,i,features,last_exit) if not active else None
+-        restart_root=ma20_restart_followthrough(bars,i,features,restart,platform,ma20_entry,root) if active==20 else None
+-        if (active==20 and not restart_root and signal
+-                and all(bars[i]['close']>=features['ma'][n][i] and features['ma'][n][i]>features['ma'][n][i-1] for n in (5,10))):
+-            start=restart['index'] if restart else i
+-            proof=dict(kind='MA20整理后再启动',date=bars[i]['date'],event_date=bars[start]['date'],
+-                close=bars[i]['close'],event_close=bars[start]['close'],ma5=features['ma'][5][i],ma10=features['ma'][10][i],
+-                prior_stage=20,prior_origin=root['date'],prior_rise_pct=ma20_entry['rise_pct'],prior_rise_atr=ma20_entry['rise_atr'],
+-                prior_ma20_touched=bool(ma20_entry.get('touch_confirmed')),independent_signal=copy.deepcopy(signal),
+-                basis='MA20整理后既有强势入口确认，两线向上')
+-            restart_root=confirmed_price_origin(bars,start,features,proof['kind'],proof)
+-        if restart_root:
+-            last_phase=dict(stage=20,date=bars[i]['date'],origin=copy.deepcopy(root),platform=copy.deepcopy(platform),
+-                support=ma20_defense(features['ma'][20][i],platform),reason='收复MA5后完成日继续推进，转入本轮MA5阶段',cause='stage_restart')
+-            root=restart_root;roots.append(copy.deepcopy(root));active=5;platform={};entered=bars[i]['date'];lifecycle='沿线推进'
+-            ma20_root=copy.deepcopy(root);ma20_platform={};last_platform={};ma20_entry={};restart=None
+-            last_confirmation=dict(copy.deepcopy(root),date=bars[i]['date'])
+-            transitions.append(dict(date=bars[i]['date'],from_stage=20,to_stage=5,reason='MA20整理后再启动',event_date=root['date']))
+-        follow=recovery_followthrough(bars,i,features,recovery) if not active and not new_recovery else None
+-        if follow:
+-            root=follow;roots.append(copy.deepcopy(follow));active=5;platform={};entered=bars[i]['date'];lifecycle='沿线推进'
+-            ma20_root=copy.deepcopy(follow);ma20_platform={};last_platform={}
+-            last_confirmation=dict(copy.deepcopy(follow),date=bars[i]['date'])
+-            recovery.update(active=False,state='强势入口已确认',ended_at=bars[i]['date'],reason='涨停收复后完成日沿MA5继续推进确认')
+-            transitions.append(dict(date=bars[i]['date'],from_stage=None,to_stage=5,reason='涨停收复后推进确认',event_date=follow['date']))
+-        if not active:signal=recent_reclaim_anchor(bars,i,features,last_exit,signal) or signal
+-        if signal:
+-            roots.append(signal)
+-            if active:last_confirmation=copy.deepcopy(signal)
+-            if not ma20_root or (not active and i>last_exit_index):
+-                ma20_root=copy.deepcopy(signal);ma20_platform={};last_platform={}
+-                if active==20:active=None;platform={}
+-        close=bars[i]['close'];line5=features['ma'][5][i]
+-        if (not active and ma20_root and last_exit and last_exit['stage']==10
+-                and (last_exit.get('origin') or {}).get('date')==ma20_root['date']
+-                and close<features['ma'][20][i]
+-                and not (ma20_backup(ma20_platform) and close>=ma20_platform['low'])):
+-            # A pending strong leg can wait for MA20, but cannot survive a
+-            # completed MA20 failure and reconnect to a rise months later.
+-            ma20_root=None;ma20_platform={};last_platform={}
+-        ceiling=platform.get('high') if platform.get('confirmed') else ma20_entry.get('peak_close')
+-        if (active==20 and positive(ceiling) and close>=ceiling+P['breakout_atr']*features['atr'][i]
+-                and (ma20_root or {}).get('restart_rebased_from')!=root['date']):
+-            # Even an unconfirmed new leg gets its own fixed base. The MA20
+-            # stage may keep tracking, but cannot lend its old large gain.
+-            ma20_root=copy.deepcopy(root)
+-            ma20_root.update(index=i,date=bars[i]['date'],base_low=platform.get('low') or ma20_entry['low'],
+-                base_at=platform.get('start') or ma20_entry['asof'],atr=features['atr'][i-1],restart_rebased_from=root['date'])
+-            ma20_platform={};last_platform={};lifecycle='再启动待确认'
+-        preceding=last_platform or (platform if active==10 and platform.get('confirmed') else {})
+-        if (active!=20 and preceding and preceding['id']!=(ma20_root or {}).get('prior_platform')
+-                and close>=preceding['high']+P['breakout_atr']*features['atr'][i]):
+-            # A new rising leg cannot borrow the previous leg's large gain or floor.
+-            original=copy.deepcopy(ma20_root)
+-            ma20_root=copy.deepcopy(signal or original)
+-            ma20_root.update(index=i,date=bars[i]['date'],base_low=preceding['low'],
+-                base_at=preceding['start'],atr=features['atr'][i-1],prior_cycle=original['date'],prior_platform=preceding['id'])
+-            if not signal:
+-                baseline=mean(b['volume'] for b in bars[i-5:i]) if all(positive(b.get('volume')) for b in bars[i-5:i+1]) else None
+-                ma20_root.update(kind='平台突破后新上涨',basis='完成日平台突破',price=close,
+-                    volume_ratio=bars[i]['volume']/baseline if baseline else None)
+-            ma20_platform={};last_platform={}
+-            if active==20:active=None;platform={};lifecycle='新上涨阶段'
+-        # Lock a real high platform before a failed MA10 bar. Never lower its floor
+-        # with that bar, and never use the rise threshold alone as a sideways signal.
+-        blocked=bool(last_exit and last_exit['stage']==20 and (last_exit.get('origin') or {}).get('date')==(ma20_root or {}).get('date'))
+-        primary=ma20_rise(bars,i,ma20_root,features) if not blocked else None
++        # Only a confirmed strong MA5 entry can create a cycle. Later stages
++        # never scan dormant origins or recreate an exited cycle.
++        if not active:
++            follow=recovery_followthrough(bars,i,features,recovery) if not new_recovery else None
++            entry=follow or recent_reclaim_anchor(bars,i,features,last_exit,signal) or signal
++            if entry:roots.append(entry)
++            recent=[x for x in roots if i-x['index']<P['origin_days'] and x['index']>last_exit_index]
++            if recent and close>=line5 and line5>features['ma'][5][i-1]:
++                root=copy.deepcopy(recent[-1])
++                if last_exit_index>=0:
++                    # The new launch may use the preceding reversal low, but
++                    # never a low from before the previous cycle ended.
++                    base=min(bars[max(last_exit_index,root['index']-P['origin_base_days']):root['index']],key=lambda b:b['low'])
++                    root.update(base_low=base['low'],base_at=base['date'],cycle_base_boundary=last_exit['date'])
++                leg=copy.deepcopy(root);active=5;platform={};entered=day
++                ma20_platform={};ma20_entry={};restart=None;restart_event=None;progressing=False;lifecycle='沿线推进'
++                last_confirmation=dict(copy.deepcopy(root),date=(root.get('confirmation') or {}).get('date',day))
++                transition(day,None,5,'完成日强势入口确认',event_date=root['date'])
++        elif signal:last_confirmation=copy.deepcopy(signal)
++        primary=ma20_rise(bars,i,root,features) if active else None
++        gain=wave_gain(bars,i,root,features) if active else {}
++        failed_platform=None
++        if active:
++            # A locked floor belongs to this leg's latest peak. Never move it
++            # down using the very bar that broke it, or carry it into a restart.
++            if ma20_platform:
++                platform_progress(ma20_platform,bars,i,features['atr'][i])
++                if close<ma20_platform['low'] or gain['peak_date']>ma20_platform['peak_date']:
++                    if close<ma20_platform['low']:failed_platform=copy.deepcopy(ma20_platform)
++                    invalid_platforms.add((20,ma20_platform['id']));ma20_platform={}
++            formed=latest_platform(bars,i,root,features,require_position=False)
++            if formed and not ma20_platform and (20,formed['id']) not in invalid_platforms:
++                ma20_platform=formed
++            if active==20:platform=copy.deepcopy(ma20_platform)
++            if active==10 and platform and gain['peak_date']>platform['peak_date']:
++                platform=catchment(bars,i,root,features)
+         if active==5 and close<line5:
+-            transitions.append(dict(date=bars[i]['date'],from_stage=5,to_stage=10,reason='正式收盘失守MA5，转MA10承接'))
+-            active=10;platform=catchment(bars,i,root,features);entered=bars[i]['date'];lifecycle='承接观察'
+-        support=ma20_defense(features['ma'][20][i],platform) if active==20 else features['ma'].get(active,[None]*len(bars))[i]
+-        if active and close<support:
+-            if active==10 and not blocked and ((primary and close>=features['ma'][20][i]) or ma20_backup(ma20_platform) and ma20_platform['low']<=close<features['ma'][20][i]):
+-                transitions.append(dict(date=bars[i]['date'],from_stage=10,to_stage=20,reason='MA10失守，转MA20守线或合格平台承接'))
+-                active=20;root=copy.deepcopy(ma20_root);platform=copy.deepcopy(ma20_platform);entered=bars[i]['date'];lifecycle='整理观察'
++            transition(day,5,10,'正式收盘失守MA5，转MA10承接')
++            active=10;platform=catchment(bars,i,root,features);entered=day;lifecycle='承接观察';restart=None;progressing=False
++        if active==10 and close<features['ma'][10][i]:
++            if ((primary and close>=features['ma'][20][i])
++                    or ma20_backup(ma20_platform) and close>=ma20_platform['low']):
++                transition(day,10,20,'MA10失守，同轮上涨达标，转MA20或合格平台承接')
++                active=20;platform=copy.deepcopy(ma20_platform);entered=day;lifecycle='整理观察';restart=None;restart_event=None;progressing=False
+                 ma20_entry=copy.deepcopy(primary or platform)
+                 ma20_entry['touch_confirmed']=bool(primary and primary['ready'])
+             else:
+-                reason=('正式收盘同时失守MA20与平台底部' if ma20_backup(platform) else '正式收盘失守MA20且无合格后备平台') if active==20 else '正式收盘失守MA10，未满足MA20守线或平台承接条件'
+-                if active==10:
+-                    peak=max(b['close'] for b in bars[root['index']:i+1]);gain=peak-root['base_low']
+-                    reason+='（前段上涨'+str(round(100*gain/root['base_low'],2))+'% / '+str(round(gain/root['atr'],2))+' ATR；要求≥20%且≥4 ATR，并守住MA20或合格平台）'
+-                last_exit=dict(stage=active,date=bars[i]['date'],reason=reason,price=r(close),support=support,
+-                    platform=copy.deepcopy(platform),origin=copy.deepcopy(root))
+-                if active==10 and not ((primary and close>=features['ma'][20][i])
+-                        or ma20_backup(ma20_platform) and close>=ma20_platform['low']):
+-                    # Insufficient strength at the end of MA10 ends that leg.
+-                    # A later rise needs its own strong origin, not this base.
+-                    ma20_root=None;last_platform={}
+-                if active==20:ma20_root=None;last_platform={};restart=None
+-                if platform:invalid_platforms.add((active,platform['id']))
+-                exits.append(last_exit);last_exit_index=i;active=None;platform={};ma20_platform={}
++                reason='正式收盘失守MA10，未满足MA20守线或平台承接条件'
++                reason+='（同轮前段上涨'+str(round(gain['rise_pct'],2))+'% / '+str(round(gain['rise_atr'],2))+' ATR；要求≥20%且≥4 ATR）'
++                last_exit=dict(stage=10,date=day,reason=reason,price=r(close),support=features['ma'][10][i],
++                    platform=copy.deepcopy(platform),origin=copy.deepcopy(root),leg_origin=copy.deepcopy(leg),cycle_id=root['date'])
++        elif active==20 and close<ma20_defense(features['ma'][20][i],platform):
++            # Keep the failed locked floor in the exit evidence even after it
++            # becomes unusable for subsequent observations.
++            reason='正式收盘同时失守MA20与平台底部' if failed_platform else '正式收盘失守MA20且无合格后备平台'
++            floor=(failed_platform or {}).get('low')
++            last_exit=dict(stage=20,date=day,reason=reason,price=r(close),
++                support=min(features['ma'][20][i],floor) if floor else features['ma'][20][i],
++                platform=copy.deepcopy(failed_platform or platform),origin=copy.deepcopy(root),
++                leg_origin=copy.deepcopy(leg),cycle_id=root['date'])
++        if active and last_exit and last_exit['date']==day:
++            transition(day,active,None,last_exit['reason']);last_exit['transitions']=copy.deepcopy([t for t in transitions if t['cycle_id']==root['date']])
++            exits.append(copy.deepcopy(last_exit));last_exit_index=i;active=None;platform={};ma20_platform={}
++            primary=None;gain={};ma20_entry={};restart=None;progressing=False;lifecycle='本轮趋势结束'
+         candidates={n:p for n,p in structure(bars,i,root,features).items() if (n,p['id']) not in invalid_platforms} if active else {}
+         if active==10 and 10 in candidates and not platform.get('confirmed'):
+             platform=candidates[10];lifecycle='整理观察'
+-        if not active:
+-            recent=[x for x in roots if i-x['index']<P['origin_days'] and x['index']>last_exit_index]
+-            if recent and close>=line5 and line5>features['ma'][5][i-1]:
+-                root=copy.deepcopy(recent[-1]);active=5;platform={};entered=bars[i]['date'];lifecycle='沿线推进'
+-                last_confirmation=dict(copy.deepcopy(root),date=(root.get('confirmation') or {}).get('date',root['date']));ma20_platform={}
+-        blocked=bool(last_exit and last_exit['stage']==20 and (last_exit.get('origin') or {}).get('date')==(ma20_root or {}).get('date'))
+-        primary=ma20_rise(bars,i,ma20_root,features) if not blocked else None
+-        formed=latest_platform(bars,i,ma20_root,features,require_position=False) if not blocked else None
+-        if formed and (20,formed['id']) not in invalid_platforms:
+-            if not ma20_platform or ma20_platform['id']!=formed['id']:
+-                ma20_platform=formed;last_platform=copy.deepcopy(formed)
+-                if active==20 and not platform:platform=copy.deepcopy(formed)
+-        if ma20_platform:
+-            platform_progress(ma20_platform,bars,i,features['atr'][i])
+-            if close<ma20_platform['low'] or ma20_platform['current_days']>P['platform_max_days']:
+-                invalid_platforms.add((20,ma20_platform['id']));ma20_platform={}
+-        if active!=20 and not blocked and ((primary and primary['ready']) or ma20_backup(ma20_platform) and close<features['ma'][20][i] and close>=ma20_platform['low']):
+-                # MA10 may have failed before five settled bars existed. That exit
+-                # does not prevent a later, independently completed current MA20 setup.
+-                previous_stage=active
+-                active=20;root=copy.deepcopy(ma20_root);platform=copy.deepcopy(ma20_platform)
+-                ma20_entry=copy.deepcopy(primary or platform)
+-                ma20_entry['touch_confirmed']=bool(primary and primary['ready'])
+-                entered=bars[i]['date'];lifecycle='整理观察'
+-                transitions.append(dict(date=entered,from_stage=previous_stage,to_stage=20,
+-                    reason='最近强势上涨后回踩MA20成立，平台仅作为第二道支撑'))
+-        if active in (10,20) and platform:
+-            platform_progress(platform,bars,i,features['atr'][i])
+-            if platform.get('confirmed') and close>=platform['high']+P['breakout_atr']*features['atr'][i]:lifecycle='再启动待确认' if active==20 else '推进延续'
+-            if platform.get('confirmed') and platform['current_days']>P['platform_max_days'] and active!=20:
+-                # Expiry ends this wave just as a support failure does. Keeping
+-                # an older last_exit here paired two unrelated waves in the UI.
+-                last_exit=dict(stage=active,date=bars[i]['date'],reason='MA'+str(active)+'整理平台观察到期',
+-                    price=r(close),support=platform['low'] if active==20 else features['ma'][active][i],
+-                    platform=copy.deepcopy(platform),origin=copy.deepcopy(root),cause='platform_expiry')
+-                exits.append(last_exit)
+-                invalid_platforms.add((active,platform['id']));active=None;platform={};ma20_platform={};lifecycle='平台观察到期';last_exit_index=i
+-        if active==20:
+-            if primary and primary['ready']:ma20_entry.update(touch_confirmed=True,touch_confirmed_at=bars[i]['date'])
+-            if close<line5:restart=None
++        if active in (10,20):
++            if platform:platform_progress(platform,bars,i,features['atr'][i])
++            if active==20:
++                if primary and primary['ready']:ma20_entry.update(touch_confirmed=True,touch_confirmed_at=day)
++            # Recovery changes the state inside MA10/MA20. Standing above MA5
++            # never reclassifies this established consolidation as initial MA5.
++            if progressing and close<line5:progressing=False;lifecycle='整理观察'
++            recovered=ma20_restart_followthrough(bars,i,features,restart,platform,
++                ma20_entry if active==20 else gain,root,stage=active) if not progressing else None
++            if recovered:
++                previous=active
++                last_phase=dict(stage=previous,date=day,origin=copy.deepcopy(root),leg_origin=copy.deepcopy(leg),
++                    platform=copy.deepcopy(platform),support=ma20_defense(features['ma'][20][i],platform) if previous==20 else features['ma'][10][i],
++                    reason='同轮MA'+str(previous)+'整理后再启动确认，进入本阶段推进状态',cause='stage_progression',cycle_id=root['date'])
++                leg=recovered;restart_event=copy.deepcopy(recovered);lifecycle='推进延续';progressing=True;restart=None
++                last_confirmation=dict(copy.deepcopy(recovered),date=day)
++            elif progressing:lifecycle='推进延续';restart=None
++            elif close<line5:restart=None
+             elif not restart and close>bars[i-1]['close']:
+-                restart=dict(date=bars[i]['date'],index=i,price=close)
+-        else:restart=None
++                restart=dict(date=day,index=i,price=close,stage=active,cycle_id=root['date'])
+         if new_recovery:recovery=new_recovery
+         if recovery and recovery['active']:
+-            recovery['validated_at']=bars[i]['date']
++            recovery['validated_at']=day
+             recovery['age_sessions']=sum(b['date']>=recovery['date'] for b in bars[:i+1])
+-            if close<features['ma'][10][i]:
+-                recovery.update(active=False,state='候选已失效',ended_at=bars[i]['date'],reason='完成日收盘失守MA10')
+-            elif active:
+-                recovery.update(active=False,state='强势入口已确认',ended_at=bars[i]['date'],reason='独立强势入口完成确认')
++            if close<features['ma'][10][i]:recovery.update(active=False,state='候选已失效',ended_at=day,reason='完成日收盘失守MA10')
++            elif active:recovery.update(active=False,state='强势入口已确认',ended_at=day,reason='完成日强势入口或后续推进已确认')
+             elif recovery['age_sessions']>P['limit_recovery_candidate_days']:
+-                recovery.update(active=False,state='候选已过期',ended_at=bars[i]['date'],reason='超出最近5个交易日候选窗口')
++                recovery.update(active=False,state='候选已过期',ended_at=day,reason='超出最近5个交易日候选窗口')
+     i=len(bars)-1
+-    out=dict(stage=active,origin=root,platform=platform,entry_date=entered,last_exit=last_exit,
+-             recovery_candidate=recovery,
+-             exits=exits[-4:],asof=bars[-1]['date'],pending=False,
+-             reason='完成日阶段成立' if active else '当前没有合格均线阶段',atr=r(atr(bars,i)),
+-             ma={str(n):r(average(bars,i,n)) for n in LABELS},
+-             origin_age=i-root['index'] if root else None,lifecycle=lifecycle,
+-             ma5_holds=sum(bars[j]['close']>=features['ma'][5][j] for j in range(max(4,i-3),i+1)),
+-             recent_origin=copy.deepcopy(roots[-1]) if roots and i-roots[-1]['index']<P['origin_days'] else None,
+-             last_confirmation=last_confirmation,transitions=transitions[-8:],ma20_candidate=ma20_platform,
+-             ma20_primary_candidate=primary,
+-             ma20_entry=ma20_entry,
+-             ma20_restart_observation=restart,last_phase=last_phase,
+-             ma10_candidate=(candidates.get(10) if active else None) or (catchment(bars,i,root,features) if active==5 else platform if active==10 else {}),
+-             history_days=len(bars),history_from=bars[0]['date'])
++    out=dict(stage=active,origin=root,leg_origin=leg,cycle_id=root['date'] if root else None,
++        restart_event=restart_event,restart_observation=restart,progressing=progressing,platform=platform,entry_date=entered,last_exit=last_exit,
++        recovery_candidate=recovery,exits=exits[-4:],asof=dates[-1],pending=False,
++        reason='完成日阶段成立' if active else '当前没有合格均线阶段',atr=r(atr(bars,i)),
++        ma={str(n):r(average(bars,i,n)) for n in LABELS},
++        origin_age=i-leg['index'] if leg else None,lifecycle=lifecycle,
++        ma5_holds=sum(bars[j]['close']>=features['ma'][5][j] for j in range(max(4,i-3),i+1)),
++        recent_origin=copy.deepcopy(roots[-1]) if roots and i-roots[-1]['index']<P['origin_days'] else None,
++        last_confirmation=last_confirmation,transitions=[t for t in transitions if root and t['cycle_id']==root['date']],
++        ma20_candidate=ma20_platform,ma20_primary_candidate=primary,ma20_entry=ma20_entry,
++        ma20_restart_observation=restart if active==20 else None,last_phase=last_phase,
++        ma10_gain=gain,ma10_candidate=(candidates.get(10) if active else None) or (catchment(bars,i,root,features) if active==5 else platform if active==10 else {}),
++        history_days=len(bars),history_from=dates[0])
+     if len(_DAILY_CACHE)>3500:_DAILY_CACHE.clear()
+     _DAILY_CACHE[key]=copy.deepcopy(out)
+     return out
+-
+ 
+ def empty(code):
+     return dict(version=VERSION,code=code,stage=None,stage_label='暂无合格阶段',eligible=False,pending=False,
+@@ -609,15 +571,16 @@
+             if number(proof.get(k)):proof[k]*=factor
+         if proof.get('independent_signal'):scale_origin(proof['independent_signal'])
+     def scale_platform(value):
+-        for k in ('low','high','atr20','peak_close','base_low','line','allowance'):
++        for k in ('low','high','atr20','peak_close','base_low','line','allowance','defense_floor'):
+             if number(value.get(k)):value[k]*=factor
+         if value.get('origin'):scale_origin(value['origin'])
++        if value.get('defense_platform'):scale_platform(value['defense_platform'])
+     for k in ('atr',):
+         if number(out.get(k)):out[k]*=factor
+-    for key in ('origin','recent_origin','last_confirmation'):
++    for key in ('origin','leg_origin','restart_event','recent_origin','last_confirmation'):
+         if out.get(key):scale_origin(out[key])
+     scale_platform(out.get('platform') or {})
+-    for key in ('ma10_candidate','ma20_candidate','ma20_primary_candidate','ma20_entry'):
++    for key in ('ma10_candidate','ma20_candidate','ma20_primary_candidate','ma20_entry','ma10_gain'):
+         if out.get(key):scale_platform(out[key])
+     for key in ('last_exit','last_phase'):
+         if out.get(key):
+@@ -626,12 +589,15 @@
+                 if number(event.get(k)):event[k]*=factor
+             scale_platform(event.get('platform') or {})
+             if event.get('origin'):scale_origin(event['origin'])
++            if event.get('leg_origin'):scale_origin(event['leg_origin'])
+     for event in out.get('exits') or []:
+         for k in ('price','support'):
+             if number(event.get(k)):event[k]*=factor
+         scale_platform(event.get('platform') or {})
+         if event.get('origin'):scale_origin(event['origin'])
++        if event.get('leg_origin'):scale_origin(event['leg_origin'])
+     if out.get('ma20_restart_observation'):out['ma20_restart_observation']['price']*=factor
++    if out.get('restart_observation'):out['restart_observation']['price']*=factor
+     out['ma']={k:v*factor for k,v in out.get('ma',{}).items() if number(v)}
+     if out.get('recovery_candidate'):
+         for k in ('price','ma5','ma10'):out['recovery_candidate'][k]*=factor
+@@ -672,6 +638,8 @@
+         m.update(status='停牌观察',reference_only=True,reason='单股重试仍未取得当日成交，按停牌规则保留最后有效阶段',
+             stage=setup.get('stage'),stage_label=LABELS.get(setup.get('stage'),'暂无合格阶段'),origin=setup.get('origin'),
+             suspension=q['data_availability'],history_days=len(native),ma=setup.get('ma'))
++        for key in ('cycle_id','leg_origin','restart_event','restart_observation','transitions','last_exit','last_phase'):
++            m[key]=copy.deepcopy(setup.get(key))
+         return m,None
+     if setup.get('sample_only'):
+         m.update(status='有效样本观察',history_days=len(native),ma=setup.get('ma'))
+@@ -706,17 +674,20 @@
+     stage=setup.get('stage');root=setup.get('origin');platform=setup.get('platform') or {}
+     primary=setup.get('ma20_primary_candidate') or {}
+     same_wave=bool(root and (old.get('origin') or {}).get('date')==root['date'])
+-    if not formal and same_wave and stage==5 and old.get('stage')==10 and (old.get('tracking') or {}).get('transitions'):
+-        stage=10;platform=copy.deepcopy(old.get('platform') or setup.get('ma10_candidate') or {})
++    same_leg=bool((setup.get('leg_origin') or {}).get('date')==(old.get('leg_origin') or old.get('origin') or {}).get('date'))
++    carried=False
++    if (not formal and old.get('version')==VERSION and same_wave and same_leg
++            and stage in (5,10) and old.get('stage') in (10,20) and old['stage']>stage
++            and any(str(t.get('at') or t.get('date') or '')[:10]>setup['asof'] for t in (old.get('tracking') or {}).get('transitions',[]))):
++        stage=old['stage'];platform=copy.deepcopy(old.get('platform') or setup.get('ma10_candidate') or {})
++        carried=True
+     line20=context['thresholds'][20];_,allowance=ma20_position(price,context['provisional_ma'][20],unit)
+     primary_now=bool(primary and context['provisional_ma'][20]>=context['daily_ma'][20]
+         and line20-allowance<=q['low']<=line20+P['near_atr']*unit and price>=line20)
+     backup=setup.get('ma20_candidate') or {}
+     backup_now=bool(ma20_backup(backup) and backup['low']<=price<line20)
+-    same_ma20=bool(primary and (primary.get('origin') or {}).get('date')==(old.get('origin') or {}).get('date'))
+-    if not formal and ((stage!=20 and (primary_now or backup_now)) or old.get('stage')==20 and same_ma20):
+-        stage=20;root=copy.deepcopy(primary.get('origin') or (backup.get('origin') or root))
+-        platform=copy.deepcopy(backup or (old.get('platform') or {}) if same_ma20 else backup)
++    # A price near MA20 is position evidence only. It cannot create a stage;
++    # intraday handoffs go through route_failure, just like completed closes.
+     same_wave=bool(root and (old.get('origin') or {}).get('date')==root['date'])
+     provisional=False
+     # A fresh current-price breakout can enter early without pretending volume is completed.
+@@ -737,6 +708,8 @@
+             m.update(status='已退出',reason=m['tracking']['exit_reason'])
+         m.update(history_days=setup.get('history_days'),history_from=setup.get('history_from'),
+                  origin=root,last_confirmation=setup.get('last_confirmation'),transitions=setup.get('transitions'))
++        for key in ('cycle_id','leg_origin','restart_event','restart_observation','last_phase'):
++            m[key]=copy.deepcopy(setup.get(key))
+         candidate=m.get('recovery_candidate') or {}
+         if candidate.get('active'):
+             support=context['thresholds'][10]
+@@ -768,14 +741,21 @@
+              ma_support_price=context['thresholds'][stage],ma_value=context['provisional_ma'][stage],atr20=unit,
+              ma5_support=context['thresholds'][5],
+              distance_atr=r((price-support)/unit),near=0<=price-support<=P['near_atr']*unit,
+-             provisional=provisional,last_exit=setup.get('last_exit'),eligible=True,status='守线观察',
++             provisional=provisional,last_exit=setup.get('last_exit'),eligible=True,exit_at=None,status='守线观察',
+              lifecycle=setup.get('lifecycle'),origin_age=setup.get('origin_age'),
+              history_days=setup.get('history_days'),history_from=setup.get('history_from'),
+              last_confirmation=setup.get('last_confirmation'),transitions=setup.get('transitions',[]),
+              reason=(root or {}).get('kind','')+'起点；'+LABELS[stage]+'结构成立',
+              background='中期未恢复' if context['provisional_ma'][20]<context['daily_ma'][20] or price<context['thresholds'][20] else '中期保持')
++    for key in ('cycle_id','leg_origin','restart_event','restart_observation','ma10_gain','progressing'):
++        m[key]=copy.deepcopy(setup.get(key))
++    if provisional:m.update(cycle_id=None,leg_origin=copy.deepcopy(root))
++    if m.get('progressing') and price<context['thresholds'][5]:m['progressing']=False
++    if carried:
++        m['entry_date']=old.get('entry_date') or m['entry_date']
++        m['transitions']=copy.deepcopy(old.get('transitions') or m['transitions'])
+     if stage==20:
+-        m['ma20_entry']=copy.deepcopy((setup.get('ma20_entry') if setup.get('stage')==20 else None) or primary or platform)
++        m['ma20_entry']=copy.deepcopy((old.get('ma20_entry') if carried else None) or (setup.get('ma20_entry') if setup.get('stage')==20 else None) or primary or platform)
+         if primary_now:m['ma20_entry'].update(touch_confirmed=True,touch_confirmed_at=day)
+         m['ma20_tracking']=not (m['ma20_entry'].get('touch_confirmed') or backup_now)
+         m['ma20_restart_observation']=copy.deepcopy(setup.get('ma20_restart_observation'))
+@@ -786,6 +766,10 @@
+     same_wave=bool(root and (old.get('origin') or {}).get('date')==root['date'])
+     same_platform=stage==20 and bool(platform.get('id')) and platform.get('id')==(old.get('platform') or {}).get('id')
+     track=copy.deepcopy(old.get('tracking') or {}) if not formal and old.get('stage')==stage and (same_platform or same_wave) else {}
++    if track.get('exit_at','9999')[:10]<=setup['asof']:track={}
++    if track:
++        current=[t for t in track.get('transitions',[]) if str(t.get('at') or t.get('date') or '')[:10]>setup['asof']]
++        m['transitions']=copy.deepcopy(setup.get('transitions',[]))+copy.deepcopy(current)
+     m['tracking']=track
+     context=dict(context,support=support,setup=setup,formal=formal,
+                  ma10_platform=setup.get('ma10_candidate') or {},ma20_platform=backup,ma20_primary=primary,ma20_primary_now=primary_now)
+@@ -821,7 +805,7 @@
+ 
+ 
+ def position_state(m,setup,context,day):
+-    price=m['price'];unit=m['atr20'];n=m['stage'];p=m['platform'];root=m['origin']
++    price=m['price'];unit=m['atr20'];n=m['stage'];p=m['platform'];root=m.get('leg_origin') or m['origin']
+     if m['provisional']:return '启动待确认'
+     if n==5:
+         age=setup['origin_age']+(day>setup['asof']);m['origin_age']=age
+@@ -830,6 +814,14 @@
+         if context['provisional_ma'][5]<=context['daily_ma'][5] or setup['ma5_holds']<required:return '沿线推进不足'
+         if age>1 and price-m['support_price']>P['ma5_focus_atr']*unit:return '推进延续'
+         return None
++    if n==10:
++        gain=m.get('ma10_gain') or setup.get('ma10_gain') or p
++        if gain.get('rise_pct',0)<P['ma10_rise_pct'] or gain.get('rise_atr',0)<P['ma10_rise_atr']:
++            m['structure_state']='同轮MA5失守后保留MA10承接跟踪；本段涨幅未达正式观察门槛'
++            return '前段上涨不足'
++    if n in (10,20) and m.get('progressing') and price>=context['thresholds'][5]:
++        m['structure_state']='MA'+str(n)+'整理后已确认再启动，当前沿MA5推进；保留原阶段，不自动列为近线观察'
++        return '推进延续'
+     if n==10 and not p.get('confirmed',True):
+         m['structure_state']='MA5失守后的承接观察；紧缩整理平台尚未确认'
+         if context['provisional_ma'][10]<context['daily_ma'][10]:return '均线仍向下'
+@@ -875,11 +867,17 @@
+         reason=event['reason']+('；MA10失守且没有合格MA20守线或平台承接' if stage==10 else
+             '；MA20与平台同时失守' if stage==20 and ma20_backup(m.get('platform')) else '；MA20失守且无合格后备平台' if stage==20 else '')
+         m.update(eligible=False,pending=False,status='已退出',exit_at=event['at'],reason=reason)
++        stopped=dict(at=event['at'],from_stage=stage,to_stage=None,reason=reason,cycle_id=m.get('cycle_id'))
++        m.setdefault('transitions',[]).append(stopped)
++        m['tracking'].setdefault('transitions',[]).append(stopped)
++        m['last_exit']=dict(stage=stage,date=event['at'],reason=reason,price=price,support=support,
++            origin=copy.deepcopy(m.get('origin')),leg_origin=copy.deepcopy(m.get('leg_origin')),
++            platform=copy.deepcopy(m.get('platform')),cycle_id=m.get('cycle_id'),transitions=copy.deepcopy(m['transitions']))
+         m['tracking'].update(exit_at=event['at'],exit_reason=reason,exit_support=support,reentry_from=price)
+         return
+     n=10 if stage==5 else 20
+     platform=platform or {}
+-    transition=dict(at=event['at'],from_stage=stage,to_stage=n,reason=event['reason'])
++    transition=dict(at=event['at'],from_stage=stage,to_stage=n,reason=event['reason'],cycle_id=m.get('cycle_id'))
+     m['tracking'].setdefault('transitions',[]).append(transition);m['transitions'].append(transition)
+     m.setdefault('minute_observation_at',m.get('entry_at'))
+     support=ma20_defense(context['thresholds'][20],platform) if n==20 else context['thresholds'][10]
+@@ -887,14 +885,13 @@
+         support_basis='MA20与平台双支撑' if n==20 else 'MA10触线价',ma_support_price=context['thresholds'][n],
+         ma_value=context['provisional_ma'][n],distance_atr=r((price-support)/unit),
+         near=0<=price-support<=P['near_atr']*unit,pending=False,eligible=True,exit_at=None,
+-        entry_at=event['at'],status='MA5失守·MA10承接观察' if n==10 else 'MA10失守·MA20承接观察',
++        entry_at=event['at'],entry_date=event['at'][:10],status='MA5失守·MA10承接观察' if n==10 else 'MA10失守·MA20承接观察',
+         reason=event['reason']+'；转'+LABELS[n],lifecycle='承接观察' if n==10 else '整理观察')
+     m['events'].append('降级至MA'+str(n));context['support']=support
+     if n==20:
+         m['ma20_entry']=copy.deepcopy(context.get('ma20_primary') or {})
+         m['ma20_entry']['touch_confirmed']=bool(context.get('ma20_primary_now'))
+         m['ma20_tracking']=not (context.get('ma20_primary_now') or ma20_backup(platform) and price<context['thresholds'][20])
+-        m['origin']=copy.deepcopy(m['ma20_entry'].get('origin') or platform.get('origin') or m['origin'])
+         set_ma20_support(m,context)
+     if price<=support-P['break_atr']*unit or context['formal'] and price<support:
+         route_failure(m,context,q,dict(at=event['at'],reason='明显破位' if not context['formal'] else '正式收盘失守'))
+@@ -938,7 +935,7 @@
+ 
+ def sort_key(m):
+     event=0 if '底部反弹' in m.get('events',[]) else 1 if '快速收回' in m.get('events',[]) else 2 if m.get('near') else 3
+-    root=m.get('origin') or {};platform=m.get('platform') or {};board=m.get('board') or {}
++    root=m.get('leg_origin') or m.get('origin') or {};platform=m.get('platform') or {};board=m.get('board') or {}
+     if m['stage']==5:detail=(-int(str(root.get('date') or '0').replace('-','')),-float(root.get('body_atr') or 0),-float(root.get('volume_ratio') or 0))
+     else:
+         volume=(m.get('volume') or {}).get('consolidation_ratio',platform.get('current_volume_ratio'))
+@@ -1096,6 +1093,13 @@
+         if m['eligible']:
+             assert m['stage'] in LABELS and m['origin'] and positive(m['support_price']) and m['status']!='已退出'
+             assert not m['pending'] and not m.get('provisional') and not m.get('position_state')
++            assert m['cycle_id']==m['origin']['date']
++            chain=m['transitions'];assert chain and chain[0]['from_stage'] is None and chain[0]['to_stage']==5
++            assert all(t['cycle_id']==m['cycle_id'] and (t['from_stage'],t['to_stage']) in ((None,5),(5,10),(10,20)) for t in chain)
++            assert chain[-1]['to_stage']==m['stage']
++            for left,right in zip(chain,chain[1:]):assert left['to_stage']==right['from_stage']
++            if m['stage']==10:
++                assert m['ma10_gain']['rise_pct']>=P['ma10_rise_pct'] and m['ma10_gain']['rise_atr']>=P['ma10_rise_atr']
+             proof=m['origin'].get('confirmation') or {}
+             assert m['origin']['volume_ratio'] is not None or proof
+             if proof:
+@@ -1130,4 +1134,10 @@
+                 if m.get('secondary_support_price') is not None and P['ma20_retained_gain']:
+                     assert m['platform']['retained_pct']>=P['ma20_rise_pct'] and m['platform']['retained_atr']>=P['ma20_rise_atr']
+         if m['status']=='已退出':assert not m['eligible'] and m['exit_at']
++        if m.get('progressing') and m['status']!='已退出' and not m.get('pending') and not m.get('reference_only'):
++            event=m['restart_event'];proof=event['confirmation']
++            assert m['stage'] in (10,20) and proof['prior_stage']==m['stage']
++            assert proof['prior_origin']==m['origin']['date']<=event['date']<proof['date']<=m['asof']
++            assert proof['close']>max(proof['previous_close'],proof['event_close'])
++            assert m['origin']['date']==m['cycle_id']
+     return True
+--- before/ma_trend_ui.js
++++ after/ma_trend_ui.js
+@@ -33,7 +33,7 @@
+ function renderRadar(){MS_VIEW.radar.axis='trend';MS_VIEW.radar.initialized=true;mtRender();}
+ function mtCSV(){return msExportRows(mtRows(),'radar','均线雷达_'+DATA.ui_generation+'.csv');}
+ function mtStatus(m){var badge=msRecoveryTag(m),status=m.candidate_mode&&!mtSnapshotFresh(m)?'快照已过期':m.status||'未入选';return '<div class="ma-status-stack">'+(badge||'')+(badge&&status==='涨停收复·新启动候选'?'':'<span '+msTipAttrs(status,m.reason+(m.exit_at?'；确认退出时间 '+m.exit_at:''))+' class="ma-state '+(m.eligible?'ma-active':'ma-inactive')+'">'+esc(status)+'</span>')+'</div>';}
+-function mtDates(m){var o=m.origin||{},f=o.confirmation||{},w=m.ma20_restart_observation;return '<span class="cd">'+(f.kind==='MA20整理后再启动'?'再启动观察 ':f.kind?'本轮起涨 ':'本轮启动 ')+esc(o.date||'—')+(f.date?' · 阶段确认 '+esc(f.date):'')+'</span>'+(w?'<span class="cd">本次再启动观察 '+esc(w.date)+' · 待后续完成日确认</span>':'')+'<span class="cd">最近强势确认 '+esc((m.last_confirmation||{}).date||f.date||o.date||'—')+'</span>'; }
++function mtDates(m){var o=m.origin||{},f=o.confirmation||{},w=m.restart_observation||m.ma20_restart_observation,e=m.restart_event||{},c=e.confirmation||{};return '<span class="cd" '+msTipAttrs('本轮启动')+'>'+(f.kind?'本轮起涨 ':'本轮启动 ')+esc(o.date||'—')+(f.date?' · 启动确认 '+esc(f.date):'')+'</span><span class="cd" '+msTipAttrs('阶段进入')+'>阶段确认 '+esc(m.entry_date||f.date||o.date||'—')+'</span>'+(e.date?'<span class="cd" '+msTipAttrs('再启动确认')+'>本段再启动 '+esc(e.date)+' · 再启动确认 '+esc(c.date||'—')+'</span>':'')+(w?'<span class="cd" '+msTipAttrs('再启动观察')+'>本次再启动观察 '+esc(w.date)+' · 待后续完成日确认</span>':'')+'<span class="cd">最近强势确认 '+esc((m.last_confirmation||{}).date||f.date||o.date||'—')+'</span>'; }
+ function mtOrigin(m){if(mtHistorical(m)||!m.stage&&!msRecoveryCandidate(m))return '<span class="ms-muted">当前无均线阶段</span>';var c=msRecoveryCandidate(m),o=m.origin||{},p=m.ma20_entry||m.platform||{};if(c)return '<div class="ma-current-event"><b>本轮收复 '+esc(c.date)+'</b><span class="ma-event-age">第 '+c.age_sessions+' / '+c.window_sessions+' 个交易日</span><span class="cd">事件量比 '+mtValue(c.volume_ratio)+' · '+esc(c.state)+'</span></div>';if(m.candidate_mode)return '<span class="ms-muted">当前无有效候选</span>';return '<b '+msTipAttrs(o.kind||'无强势起点')+'>'+esc(o.kind||'无强势起点')+'</b>'+mtDates(m)+'<span class="cd">事件量比 '+mtValue(o.volume_ratio)+' · 上涨 '+pctHtml(o.day_return_pct)+'</span><span class="cd">前段上涨 '+pctHtml(p.rise_pct)+' · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</span>';}
+ function mtTable(rows,limit){var shown=limit?rows.slice(0,limit):rows,h='<div class="tw"><table class="market-strength-table ms-research-table ma-trend-table"><thead><tr><th class="l">名称 / 所属方向</th><th>阶段 / 当前状态</th><th>支撑 / 距离</th><th class="l">强势起点 / 最近确认</th><th class="l">反弹 / 板块同步</th><th>当日涨幅</th></tr></thead><tbody>';
+  shown.forEach(function(r){var m=mtCurrentView(r.ma_trend||{}),o=m.origin||{},p=m.platform||{},b=m.board||{},rb=m.rebound||{};
+@@ -45,7 +45,7 @@
+  var heading=document.querySelector('#p-radar h1');if(heading)heading.textContent='选股雷达';
+  var subtitle=document.getElementById('radar-sub');if(subtitle)subtitle.textContent=mtModel().mode+' · 行情截至 '+(mtModel().source_at||'—')+' · 沪深主板';
+  var v=MS_VIEW.radar;if(v.scope==='exited')v.scope='all';var rows=mtRows(),label=focused&&focused.getAttribute('aria-label'),start=focused&&focused.selectionStart,end=focused&&focused.selectionEnd;
+- var h=msDirectionPicker('radar')+mtTools()+'<p class="ms-muted">通过量价强势前提后，按MA5 / MA10 / MA20分阶段观察。当前筛选 '+rows.length+' 只。MA5有效失守转MA10；MA10失守转符合条件的MA20观察。MA20优先守线，失守后看合格平台；两者均失守退出。MA20上方整理跟踪与正式近线观察分开；收复MA5后另记观察日和确认日。过期快照不展示为当前有效观察。</p>';
++ var h=msDirectionPicker('radar')+mtTools()+'<p class="ms-muted">通过量价强势前提后，按MA5 / MA10 / MA20分阶段观察。当前筛选 '+rows.length+' 只。MA5有效失守转MA10；MA10失守转符合条件的MA20观察。MA20优先守线，失守后看合格平台；两者均失守退出。MA20上方整理跟踪与正式近线观察分开；收复MA5后另记观察日和确认日，确认后为原阶段的推进状态，不切回MA5阶段。本轮启动日期保留，阶段进入与本段再启动分别记录；平台超窗不等于趋势结束。过期快照不展示为当前有效观察。</p>';
+  [5,10,20].forEach(function(n){var selected=rows.filter(function(r){var m=r.ma_trend||{};return m.stage===n&&(v.scope==='exited'||!mtHistorical(m));});if(v.phase&&['5','10','20'].indexOf(v.phase)>=0&&Number(v.phase)!==n)return;
+   var names={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'},tips={5:'放量上攻、有效突破或涨停突破，沿MA5运行',10:'MA5失守后转入承接；紧缩平台形成与底部反弹单列',20:'最近强势上涨≥20%且≥4 ATR；回踩MA20守住或略破快速收回准入，跌破后由合格平台承接'};
+   if(v.scope==='exited')names[n]='历史退出 · '+names[n];
+@@ -58,7 +58,7 @@
+  if(typeof msHideTooltip==='function')msHideTooltip();host.innerHTML=h;if(label==='雷达股票搜索'||label==='搜索板块题材'){var next=host.querySelector('[aria-label="'+label+'"]');if(next){next.focus({preventScroll:true});if(start!=null)next.setSelectionRange(start,end);}}
+ }
+ function mtRecoveryDetail(m){var c=msRecoveryCandidate(m);if(!c)return '';return '<details class="card ma-trend-detail"><summary>涨停收复判断依据 · 本轮候选</summary><div><p>'+msRecoveryTag(m)+'</p><p>本轮收复 '+esc(c.date)+' · 第 '+c.age_sessions+' / '+c.window_sessions+' 个交易日</p><p>'+esc(c.basis)+'；事件量比 '+mtValue(c.volume_ratio)+'，独立展示。</p><p>候选MA10触线价 '+mtValue(m.support_price,4)+' · 暂态MA10 '+mtValue(m.ma_value,4)+'</p><p>'+esc(m.mode)+' · 最新核验 '+esc(m.quote_at)+' · 完成日截至 '+esc(m.asof)+'</p><p class="ms-muted">仅保留最近5个交易日内最新一轮有效候选；MA10有效失守、正式强势入口确认或窗口到期后隐藏候选标签。</p><p>'+esc(m.reason)+'</p></div></details>';}
+-function mtConfirmation(m){var o=m.origin||{},f=o.confirmation||{};if(!f.date)return '';var independent=f.independent_signal||{};return '<p><b '+msTipAttrs(f.kind)+'>'+esc(f.kind)+'</b></p>'+mtDates(m)+'<p>事件收盘 '+mtValue(f.event_close)+' → 确认收盘 '+mtValue(f.close)+'；确认日MA5 '+mtValue(f.ma5)+' / MA10 '+mtValue(f.ma10)+'</p><p>'+esc(f.basis||'后续完成日高于前日及事件日收盘，守住MA5，MA5及MA10上行，期间MA10未失守')+'</p>'+(independent.kind?'<p>独立入口 '+esc(independent.kind)+' · 确认日量比 '+mtValue(independent.volume_ratio)+'</p>':'')+(f.prior_stage===20?'<p>前段上涨 '+pctHtml(f.prior_rise_pct)+' / '+mtValue(f.prior_rise_atr)+' ATR；'+(f.prior_ma20_touched?'已核验MA20回踩':'此前为MA20上方整理跟踪，未标作实际回踩MA20')+'</p>':'');}
++function mtConfirmation(m,event){var o=event||m.origin||{},f=o.confirmation||{};if(!f.date)return '';var independent=f.independent_signal||{};return '<p><b '+msTipAttrs(f.kind)+'>'+esc(f.kind)+'</b></p>'+(event?'<p>同轮再启动观察 '+esc(o.date)+' · 确认 '+esc(f.date)+'；本轮原始启动 '+esc((m.origin||{}).date)+'</p>':mtDates(m))+'<p>事件收盘 '+mtValue(f.event_close)+' → 确认收盘 '+mtValue(f.close)+'；确认日MA5 '+mtValue(f.ma5)+' / MA10 '+mtValue(f.ma10)+'</p><p>'+esc(f.basis||'后续完成日高于前日及事件日收盘，守住MA5，MA5及MA10上行，期间MA10未失守')+'</p>'+(independent.kind?'<p>独立入口 '+esc(independent.kind)+' · 确认日量比 '+mtValue(independent.volume_ratio)+'</p>':'')+(f.prior_stage===20?'<p>前段上涨 '+pctHtml(f.prior_rise_pct)+' / '+mtValue(f.prior_rise_atr)+' ATR；'+(f.prior_ma20_touched?'已核验MA20回踩':'此前为MA20上方整理跟踪，未标作实际回踩MA20')+'</p>':'');}
+ function mtDetail(m){
+  if(!m||mtHistorical(m))return '';
+  if(msRecoveryCandidate(m))return mtRecoveryDetail(m);
+@@ -70,6 +70,7 @@
+  if(m.support_price!=null)h.push('<p>防守依据 '+esc(m.support_basis||'—')+' · 本阶段支撑触线价 '+mtValue(m.support_price,4)+' · 暂态均线 '+mtValue(m.ma_value,4)+'</p>'+mtDefense(m));
+  if(o.confirmation)h.push(mtConfirmation(m));
+  else if(o.date)h.push('<p><b '+msTipAttrs(o.kind)+'>'+esc(o.kind)+'</b> · '+esc(o.basis||'')+'</p>'+mtDates(m)+'<p>单日上涨 '+pctHtml(o.day_return_pct)+' / 两日 '+pctHtml(o.two_day_return_pct)+'；'+(o.rise_days||'—')+'日净上攻 '+mtValue(o.rise_atr)+' ATR（放量上攻门槛 '+p.impulse_rise_atr+'）；量比 '+mtValue(o.volume_ratio)+'（上攻 '+p.volume_ratio+' / 突破 '+p.breakout_volume_ratio+'）；收盘位置 '+mtValue(o.close_position==null?null:o.close_position*100,1)+'%</p>');
++ if(m.restart_event)h.push(mtConfirmation(m,m.restart_event));
+  h.push('<p class="ms-muted">实际覆盖 '+(m.history_days||'—')+' 个完成交易日（'+esc(m.history_from||'—')+' 至 '+esc(m.asof||'—')+'）</p>');
+  if(rise.rise_pct!=null)h.push('<p>前段上涨 '+pctHtml(rise.rise_pct)+' / '+mtValue(rise.rise_atr)+' ATR；固定低点 '+mtValue(rise.base_low)+'（'+esc(rise.base_at||'—')+'）</p>');
+  if(pl.latest_cycle)h.push('<p>最近上涨 '+esc(pl.rise_start||pl.base_at||'—')+' → '+esc(pl.rise_end||pl.peak_date||'—')+'；整理起于 '+esc(pl.start||'—')+'；平台底部保留 '+pctHtml(pl.retained_pct)+' / '+mtValue(pl.retained_atr)+' ATR。振幅 '+mtValue(pl.width_pct)+'%（超过10%仅提示），宽度 '+mtValue(pl.width_atr)+' ATR（≤2）。</p>');
+@@ -85,9 +86,9 @@
+ function mtDefense(m){return m.stage===20?'<span class="cd">第一道 MA20触线价 '+mtValue(m.primary_support_price,3)+'<br>第二道 '+(m.secondary_support_price==null?'暂无合格平台':'固定平台底部 '+mtValue(m.secondary_support_price,3))+' · '+esc(m.defense_mode||'')+'</span>':'';}
+ function mtHistoryDetail(m){
+  var e=mtHistorical(m)?{stage:m.stage,date:m.exit_at,reason:m.reason,origin:m.origin,platform:m.platform,support:m.support_price}:[m.last_phase,m.last_exit].filter(Boolean).sort(function(a,b){return String(b.date||'').localeCompare(String(a.date||''));})[0];
+- if(!e)return '';var o=e.origin||{},p=e.platform||{},label={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'}[e.stage]||'过往阶段';
++ if(!e)return '';var sameCycle=e.cause==='stage_progression'&&!mtHistorical(m),o=e.origin||{},p=e.platform||{},label={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'}[e.stage]||'过往阶段';
+  e=Object.assign({},e,{transitions:(m.transitions||[]).filter(function(t){return mtHistorical(m)||String(t.at||t.date||'').slice(0,10)<(m.origin||{}).date;})});
+- return '<details class="card ma-stage-history" data-ma-history style="margin-top:20px"><summary>过往均线阶段记录 · '+esc(label)+'</summary><div style="padding-top:12px;display:grid;gap:8px"><p class="ms-muted">已结束记录，仅供回看，不参与当前阶段筛选与标签。</p><p><b>'+esc(label)+'</b> · 结束 '+esc(e.date||m.exit_at||'—')+'</p><p>该轮启动 '+esc(o.date||'—')+((o.confirmation||{}).date?' · 启动确认 '+esc(o.confirmation.date):'')+' · 防守价 '+mtValue(e.support,3)+'</p><p>'+esc(e.reason||'')+'</p>'+(p.start?'<p>该轮整理 '+esc(p.start)+' · 固定底部 '+mtValue(p.low,3)+'</p>':'')+'<details><summary>完整过往依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e,null,2))+'</pre></details></div></details>';
++ return '<details class="card ma-stage-history" data-ma-history style="margin-top:20px"><summary>过往均线阶段记录 · '+esc(label)+'</summary><div style="padding-top:12px;display:grid;gap:8px"><p class="ms-muted">'+(sameCycle?'同轮阶段内推进确认的历史记录；当前阶段以页首标签为准。':'已结束记录，仅供回看，不参与当前阶段筛选与标签。')+'</p><p><b>'+esc(label)+'</b> · '+(sameCycle?'推进确认 ':'结束 ')+esc(e.date||m.exit_at||'—')+'</p><p>该轮启动 '+esc(o.date||'—')+((o.confirmation||{}).date?' · 启动确认 '+esc(o.confirmation.date):'')+' · 防守价 '+mtValue(e.support,3)+'</p><p>'+esc(e.reason||'')+'</p>'+(p.start?'<p>该轮整理 '+esc(p.start)+' · 固定底部 '+mtValue(p.low,3)+'</p>':'')+'<details><summary>完整过往依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e,null,2))+'</pre></details></div></details>';
+ }
+ function mtMoveHistoryToEnd(host){var history=host&&host.querySelector('[data-ma-history]');if(history)host.appendChild(history);}
+ function mtOverview(){var meta=mtModel(),breadth=DATA.breadth||{},temperature=DATA.market_emotion||{},host=document.getElementById('ms-overview-host');
+--- before/stock_rank_ui.js
++++ after/stock_rank_ui.js
+@@ -10,12 +10,18 @@
+  '候选已失效':'涨停收复候选的MA10有效失守；保留事件日期和失效依据供回看。',
+  '阶段待确认':'已出现独立候选事件，但尚未通过MA5/MA10/MA20正式阶段准入。',
+  'MA20整理跟踪':'本轮上涨已达到20%及4 ATR，失守MA10但仍守住MA20，先继续跟踪；尚未回踩MA20或形成合格平台，不计入有效近线观察。',
+- '再启动待确认':'MA20整理后已重新站上MA5，等待后续完成日继续上涨、超过观察日收盘且MA5及MA10上行。尚未转为已确认的MA5阶段。',
++ '再启动待确认':'MA10或MA20整理后已重新站上MA5，等待后续完成日继续上涨、超过观察日收盘且MA5及MA10上行。确认后进入原阶段的推进状态，阶段标签不切回MA5。',
+  '涨停收复后推进确认':'近5个交易日的有效涨停收复后，至少一个完成日收盘高于前日和收复日、守住MA5且MA5及MA10上行，期间MA10未失守。收复日记为本轮起点，后续确认日单独记录。',
+  '涨停起涨后强势确认':'旧波段结束后出现涨停收复MA5，但当时未通过正式入口。后续5日内通过原有强势入口且两线向上，才关联该次起涨日；不会回填起涨日已入选。',
+- 'MA20整理后再启动':'MA20整理跟踪期间收复MA5，后续完成日继续上涨、超过观察日收盘且MA5及MA10上行，转回MA5；既有强势入口也可独立确认。再启动观察日与确认日分别记录，旧波段仅供回看。',
+- 'MA5初期推进':'有完成日放量上攻、有效突破、涨停突破或已确认的收复/整理再启动，随后沿MA5推进。确认失守MA5转入MA10承接，不直接退出。',
+- 'MA10承接整理':'本轮强势推进失守MA5后转入MA10承接。承接观察与紧缩整理平台分别说明；有效失守MA10，转由符合条件的MA20守线或合格平台承接，否则退出。',
++ 'MA20整理后再启动':'同一轮趋势的MA20阶段收复MA5，后续完成日继续上涨、超过观察日收盘且MA5及MA10上行，进入MA20阶段内的推进状态。保留MA20阶段和整轮原始启动日，另记再启动观察日和确认日；推进不等于近线推荐。',
++ 'MA10承接后再启动':'同一轮趋势的MA10阶段收复MA5，后续完成日继续上涨、超过观察日收盘且MA5及MA10上行，进入MA10阶段内的推进状态。原阶段和整轮启动日不变。',
++ '本轮启动':'本轮首次有效强势事件的日期。阶段降级和同轮再启动均不改写；整轮支撑失效退出后，才允许建立新一轮启动。',
++ '阶段进入':'进入当前MA5、MA10或MA20阶段的确认日期。阶段转换不等于整轮趋势结束。',
++ '再启动观察':'同轮MA10或MA20整理后重新站上MA5并上涨的观察事件，等待后续完成日继续推进确认。',
++ '再启动确认':'后续完成日高于前日和观察日收盘，守住MA5及MA10且两线向上。进入原MA10或MA20阶段内的推进状态，阶段标签与原始启动日期保留。',
++ '前段上涨不足':'已经从同轮MA5转入MA10跟踪，但本上涨段尚未达到10%且3 ATR的正式观察门槛；继续以MA10防守，不因MA5失守直接结束整轮趋势。',
++ 'MA5初期推进':'本轮首次通过完成日放量上攻、有效突破、涨停突破或涨停收复后确认，随后沿MA5推进。已进入MA10/MA20的股票收复MA5，显示原阶段内的推进状态。确认失守MA5转入MA10承接，不直接退出。',
++ 'MA10承接整理':'同轮MA5推进后失守MA5，转入MA10承接；前段上涨至少10%且3 ATR才属于正式观察，未达标保留承接跟踪。本轮强势推进失守MA5后转入MA10承接。承接观察与紧缩整理平台分别说明；有效失守MA10，转由符合条件的MA20守线或合格平台承接，否则退出。',
+  'MA20横盘再启动':'最近一轮上涨≥20%且≥4 ATR后，回踩MA20不破或略破快速收回即可准入。MA20有效失守后，再核对至少5日、宽度≤2 ATR、缩量及保留上涨成果的固定平台；两道支撑都失守才退出。旧波段不作为当前阶段。',
+  '趋势力度':'5/10/20日收益力度和连续结构的独立参考分，≥65为强。它不决定均线趋势入选，也不表示本轮启动日期。',
+  '情绪强度':'当前模型：当日进攻60%、保持20%、近5日活跃20%，≥65为强。属于短线强度参考，尚不能单独证明连板、龙头或补涨潜力。',
+--- before/csv_export.js
++++ after/csv_export.js
+@@ -12,16 +12,16 @@
+     if(!board&&id!=='all'){var found=(DATA.board_catalog||[]).filter(function(b){return b.id===id;})[0];if(found)board={name:found.name,ranking:found.stock_ranking};}
+     var ranking=id==='all'?DATA.stock_board_ranking.all:board&&board.ranking||{},title=id==='all'?'全池':board&&board.name||id;
+     if(DATA.emotion_relay)ranking=DATA.emotion_relay.rankings[id]||ranking;
+-    var columns=['代码','名称','参照板块','板块排名','趋势力度板块名次','情绪板块名次','趋势力度分','情绪强度分','类型标签','均线阶段','当前状态','当日涨幅%','行情源时间','本轮启动日','阶段确认日','再启动观察日','最近强势确认日','历史覆盖交易日','完成日截至','UI版本','排名规则版本','涨停收复候选日期','涨停收复候选状态','完整排名依据','完整均线依据'];
++    var columns=['代码','名称','参照板块','板块排名','趋势力度板块名次','情绪板块名次','趋势力度分','情绪强度分','类型标签','均线阶段','当前状态','当日涨幅%','行情源时间','本轮启动日','阶段确认日','再启动观察日','最近强势确认日','历史覆盖交易日','完成日截至','UI版本','排名规则版本','涨停收复候选日期','涨停收复候选状态','本段启动日','再启动确认日','完整排名依据','完整均线依据'];
+     if(DATA.emotion_relay){columns[5]='接力板块名次';columns[7]='价格活跃参考分';}
+     var escapeCell=function(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';};
+-    return '\ufeff'+columns.join(',')+'\n'+res.map(function(r){var item=(ranking.items||{})[r.code]||{},ms=r.market_strength||{},mt=currentMA(r.ma_trend||{});return [r.code,r.name,title,item.rank,item.trend_rank,item.emotion_rank,ms.trend_score,ms.emotion_score,(item.style_labels||[]).join(' / '),mt.stage_label,mt.status,r.change_pct,item.source_at,(mt.origin||{}).date,((mt.origin||{}).confirmation||{}).date||mt.entry_date,(mt.ma20_restart_observation||{}).date||(((mt.origin||{}).confirmation||{}).prior_stage===20?(mt.origin||{}).date:null),(mt.last_confirmation||mt.origin||{}).date,mt.history_days,mt.asof,DATA.ui_generation,DATA.stock_board_ranking.version,candidate(mt).date,candidate(mt).state,JSON.stringify(item),JSON.stringify(r.ma_trend||{})].map(escapeCell).join(',');}).join('\n');
++    return '\ufeff'+columns.join(',')+'\n'+res.map(function(r){var item=(ranking.items||{})[r.code]||{},ms=r.market_strength||{},mt=currentMA(r.ma_trend||{});return [r.code,r.name,title,item.rank,item.trend_rank,item.emotion_rank,ms.trend_score,ms.emotion_score,(item.style_labels||[]).join(' / '),mt.stage_label,mt.status,r.change_pct,item.source_at,(mt.origin||{}).date,mt.entry_date||((mt.origin||{}).confirmation||{}).date,(mt.restart_observation||mt.ma20_restart_observation||mt.restart_event||{}).date,(mt.last_confirmation||mt.origin||{}).date,mt.history_days,mt.asof,DATA.ui_generation,DATA.stock_board_ranking.version,candidate(mt).date,candidate(mt).state,(mt.leg_origin||mt.origin||{}).date,((mt.restart_event||{}).confirmation||{}).date,JSON.stringify(item),JSON.stringify(r.ma_trend||{})].map(escapeCell).join(',');}).join('\n');
+   }
+   if(DATA.ma_trend){
+-    var head=['代码','名称','现价','当日涨幅%','均线阶段','当前状态','有效观察','本阶段支撑触线价','暂态均线','距支撑ATR','起点日期','阶段确认日','再启动观察日','最近强势确认日','起点通道','起点量比','起点实体ATR','整理量比','底部反弹ATR','反弹依据','同步方向','方向入选比例%','行情源时间','退出时间','原因','数据缺口','模式','均线版本','均线实现哈希','UI版本','情绪分','历史力度参考','防守依据','起点单日涨幅%','起点两日涨幅%','前段上涨%','前段上涨ATR','平台成立日','平台核验日','有效截至','涨停收复候选日期','涨停收复候选状态','完整均线依据'];
++    var head=['代码','名称','现价','当日涨幅%','均线阶段','当前状态','有效观察','本阶段支撑触线价','暂态均线','距支撑ATR','起点日期','阶段确认日','再启动观察日','最近强势确认日','起点通道','起点量比','起点实体ATR','整理量比','底部反弹ATR','反弹依据','同步方向','方向入选比例%','行情源时间','退出时间','原因','数据缺口','模式','均线版本','均线实现哈希','UI版本','情绪分','历史力度参考','防守依据','起点单日涨幅%','起点两日涨幅%','前段上涨%','前段上涨ATR','平台成立日','平台核验日','有效截至','涨停收复候选日期','涨停收复候选状态','本段启动日','再启动确认日','完整均线依据'];
+     var cell=function(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';};
+     head.splice(head.length-1,0,'MA20第一道触线价','第二道固定平台底部','当前防守方式');
+-    var lines=res.map(function(s){var m=currentMA(s.ma_trend||{}),o=m.origin||{},p=m.platform||{},b=m.board||{},rb=m.rebound||{},rise=m.ma20_entry||p,old=s.market_strength||{};return [s.code,s.name,m.price,m.change_pct,m.stage_label,m.status,m.eligible?'是':'否',m.support_price,m.ma_value,m.distance_atr,o.date,(o.confirmation||{}).date||m.entry_date,(m.ma20_restart_observation||{}).date||((o.confirmation||{}).prior_stage===20?o.date:null),(m.last_confirmation||o).date,o.kind,o.volume_ratio,o.body_atr,m.volume&&m.volume.consolidation_ratio,rb.distance_atr,rb.basis,b.name,b.trend_pct,m.quote_at,m.exit_at,m.reason,(m.data_reasons||[]).join('；'),m.mode,m.version,DATA.ma_trend.implementation_hash,DATA.ui_generation,old.emotion_score,old.trend_score,m.support_basis,o.day_return_pct,o.two_day_return_pct,rise.rise_pct,rise.rise_atr,p.formed_at,p.validated_at,m.valid_until,candidate(m).date,candidate(m).state,m.primary_support_price,m.secondary_support_price,m.defense_mode,JSON.stringify(s.ma_trend||{})].map(cell).join(',');});
++    var lines=res.map(function(s){var m=currentMA(s.ma_trend||{}),o=m.origin||{},p=m.platform||{},b=m.board||{},rb=m.rebound||{},rise=m.ma20_entry||p,old=s.market_strength||{};return [s.code,s.name,m.price,m.change_pct,m.stage_label,m.status,m.eligible?'是':'否',m.support_price,m.ma_value,m.distance_atr,o.date,m.entry_date||(o.confirmation||{}).date,(m.restart_observation||m.ma20_restart_observation||m.restart_event||{}).date,(m.last_confirmation||o).date,o.kind,o.volume_ratio,o.body_atr,m.volume&&m.volume.consolidation_ratio,rb.distance_atr,rb.basis,b.name,b.trend_pct,m.quote_at,m.exit_at,m.reason,(m.data_reasons||[]).join('；'),m.mode,m.version,DATA.ma_trend.implementation_hash,DATA.ui_generation,old.emotion_score,old.trend_score,m.support_basis,o.day_return_pct,o.two_day_return_pct,rise.rise_pct,rise.rise_atr,p.formed_at,p.validated_at,m.valid_until,candidate(m).date,candidate(m).state,(m.leg_origin||o).date,((m.restart_event||{}).confirmation||{}).date,m.primary_support_price,m.secondary_support_price,m.defense_mode,JSON.stringify(s.ma_trend||{})].map(cell).join(',');});
+     return '\ufeff'+head.join(',')+'\n'+lines.join('\n');
+   }
+   if(DATA.market_strength || res.some(function(s){return !!s.market_strength;})){

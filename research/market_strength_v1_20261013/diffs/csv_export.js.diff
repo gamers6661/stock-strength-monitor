@@ -1,0 +1,13 @@
+--- before/csv_export.js
++++ after/csv_export.js
+@@ -1,4 +1,10 @@
+ function buildStockCSV(res,DATA,contexts){
++  if(DATA.market_strength || res.some(function(s){return !!s.market_strength;})){
++    var cols=['代码','名称','当日涨幅%','趋势分','情绪分','趋势等级','情绪等级','主导周期','阶段','事件','原因','风险','趋势截至','情绪截至','模式','规则版本','实现哈希','UI版本','完整模型依据'];
++    var quote=function(v){return v==null?'': '"'+String(v).replace(/"/g,'""')+'"';};
++    var rows=res.map(function(s){var m=s.market_strength||{};return [s.code,s.name,s.change_pct,m.trend_score,m.emotion_score,m.trend_level,m.emotion_level,m.dominant_period,m.phase,(m.events||[]).join('、'),(m.reasons||[]).join('；'),(m.risks||[]).join('；'),m.trend_at,m.emotion_at,m.mode,m.version,(DATA.market_strength||{}).implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');});
++    return '\ufeff'+[cols.join(',')].concat(rows).join('\n');
++  }
+   function context(s){return contexts[s.code]||{};}
+   function quoteFreshAtClientNow(s){return context(s).fresh;}
+   function quoteStatusAtClientNow(s){return context(s).status;}

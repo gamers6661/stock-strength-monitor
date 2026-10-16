@@ -1,0 +1,23 @@
+--- before/check_live_service.py
++++ after/check_live_service.py
+@@ -34,6 +34,10 @@
+     assert status['code_market_strength_version']==status['snapshot_market_strength_version']==market_strength.VERSION
+     assert status['code_market_strength_hash']==status['snapshot_market_strength_hash']==market_strength.IMPLEMENTATION_HASH
+     market_strength.validate(snapshot)
++    if snapshot.get('ma_trend'):
++        import ma_trend
++        assert status['code_ma_trend_hash']==status['snapshot_ma_trend_hash']==ma_trend.IMPLEMENTATION_HASH
++        ma_trend.validate(snapshot)
+     html = get(base + "/dashboard.html").decode("utf-8")
+     text_report = (config.ROOT / "snapshot_report.md").read_text(encoding="utf-8")
+     marker = "var DATA = "
+@@ -91,6 +95,9 @@
+         assert response['item']['opportunity'] == example['opportunity']
+     assert '当前强势' in html and 'market-strength-table' in html
+     assert served['market_strength']==snapshot['market_strength']
++    if snapshot.get('ma_trend'):
++        assert served['ma_trend']==snapshot['ma_trend']
++        ma_trend.validate(served)
+     market_strength.validate(served)
+     if served['session'] in ('集合竞价', '竞价结束'):
+         import copy

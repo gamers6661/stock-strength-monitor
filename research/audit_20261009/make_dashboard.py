@@ -1,0 +1,80 @@
+# -*- coding: utf-8 -*-
+"""把 snapshot.json 注入模板，产出可双击打开的独立看板 dashboard.html"""
+import json
+import sys
+
+import config
+
+TPL = config.ROOT / "dashboard_template.html"
+OUT = config.ROOT / "dashboard.html"
+PLACEHOLDER = "/*__DATA__*/null"
+
+
+def attach_klines(snap, top_n=None):
+    """给可点击的个股附加精简收盘走势，确保详情有图可看。"""
+    if top_n is None:
+        top_n = len(snap.get("stocks") or [])
+    try:
+        import datafeed as df
+        conn = df.db()
+    except Exception as e:
+        print(f"[WARN] 无法读取K线，看板将不含走势图：{e}")
+        return snap
+    n_ok = 0
+    scored = (snap.get("stocks") or [])[:top_n]
+    visible = scored + (snap.get("coverage_catalog") or [])
+    chart_codes = {s["code"] for s in scored}
+    chart_codes.update(s["code"] for s in snap.get("coverage_catalog") or []
+                       if s.get("trend_online"))
+    completed_asof = (snap.get("strength_model") or {}).get("asof")
+    for s in visible:
+        try:
+            ks = df.load_kline(conn, "kline", "code", s["code"], limit=60)
+        except Exception:
+            continue
+        asof = s.get("signal_date") or completed_asof
+        if asof:
+            ks = [k for k in ks if k["date"] <= asof]
+            # quick 快照收盘后使用腾讯收盘报价补齐当日完成K，数据库历史K可能仍到昨日。
+            if ks and s.get("signal_date") and ks[-1]["date"] < s["signal_date"] and s.get("signal_close"):
+                ks.append({"date": s["signal_date"], "close": s["signal_close"]})
+        if ks and float(ks[-1]["close"]) > 0:
+            s["last_completed_date"] = str(ks[-1]["date"])
+            s["last_completed_close"] = round(float(ks[-1]["close"]), 2)
+            if len(ks) >= 2 and float(ks[-2]["close"]) > 0:
+                s["last_completed_change_pct"] = round(
+                    (float(ks[-1]["close"]) / float(ks[-2]["close"]) - 1) * 100, 2)
+        elif s.get("last_close") and float(s["last_close"]) > 0:
+            # 报价中的昨收可作价格参考；缺少完成日线时不臆造涨跌幅或收盘日期。
+            s["last_completed_close"] = round(float(s["last_close"]), 2)
+        if len(ks) >= 5 and s["code"] in chart_codes:
+            s["k"] = [round(float(k["close"]), 2) for k in ks]
+            s["kd"] = [str(k["date"])[5:] for k in ks]
+            n_ok += 1
+    print(f"[OK] 已附加 {n_ok} 只个股的走势序列")
+    return snap
+
+
+def build():
+    if not config.SNAPSHOT_JSON.exists():
+        print("[ERR] 还没有数据快照，请先运行：python scoring.py full")
+        return None
+    snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+    import price_only
+    price_only.sanitize(snap)
+    attach_klines(snap)
+    import board_trend
+    board_trend.attach(snap, fetch=False)
+    tpl = TPL.read_text(encoding="utf-8")
+    if PLACEHOLDER not in tpl:
+        print("[ERR] 模板缺少数据占位符")
+        return None
+    payload = json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
+    html = tpl.replace(PLACEHOLDER, payload)
+    config.atomic_write_text(OUT, html)   # 原子写：避免浏览器读到半截页面
+    print(f"[OK] 看板已生成：{OUT}  ({len(html)/1024:.0f} KB)")
+    return OUT
+
+
+if __name__ == "__main__":
+    build()

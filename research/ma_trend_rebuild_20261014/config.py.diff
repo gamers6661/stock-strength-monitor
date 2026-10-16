@@ -1,0 +1,19 @@
+--- before/config.py
++++ after/config.py
+@@ -12,6 +12,16 @@
+ import threading
+ 
+ ROOT = Path(__file__).resolve().parent
++MA_TREND = {
++    'version': 'ma-trend-2026-10-14.1',
++    'origin_days': 5, 'body_atr': .8, 'volume_ratio': 1.5,
++    'close_position': .7, 'breakout_days': 20, 'breakout_atr': .1,
++    'ma10_days': 2, 'ma20_days': 3, 'platform_width_atr': 2.5,
++    'platform_rise_atr': .5, 'prior_rise_atr': 1.,
++    'near_atr': .4, 'entry_near_atr': .8, 'rebound_atr': .3,
++    'repair_minutes': 15, 'break_atr': .5, 'minute_fetch_limit': 24,
++    'board_min_members': 6, 'board_min_coverage': 80.,
++}
+ MARKET_STRENGTH = {
+     'version': 'market-strength-2026-10-13.4',
+     'periods': [5, 10, 20], 'strong_min': 65, 'very_strong_min': 80, 'normal_min': 45,

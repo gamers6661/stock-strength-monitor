@@ -1,0 +1,335 @@
+--- baseline/csv_export.js
++++ csv_export.js
+@@ -1,9 +1,9 @@
+ function buildStockCSV(res,DATA,contexts){
+   contexts=contexts||{};
+   if(contexts.view==='emotion'&&DATA.emotion_relay){
+-    var head=['代码','名称','已完成日截至','昨日完成板位','昨日板位完整','当前板位','当前板位完整','模式','当前在板','接力角色','事件','风险','今日涨幅%','真实涨停价','换手%','成交额(亿元)','成交量(亿股)','封单金额(亿元)','源行情','有效截至','接续参照','同题材关系','周期核心','全天停牌','最后成交日','伴生关系','异动披露与参考','封板强度依据','高标断板后续','规则版本','实现哈希','UI版本','完整接力依据'];
++    var head=['代码','名称','已完成日截至','昨日完成板位','昨日板位完整','当前板位','当前板位完整','模式','当前在板','接力角色','事件','风险','今日涨幅%','真实涨停价','换手%','成交额(亿元)','成交量(万股)','封单金额(亿元)','源行情','有效截至','接续参照','同题材关系','周期核心','全天停牌','最后成交日','伴生关系','异动披露与参考','封板强度依据','高标断板后续','规则版本','实现哈希','UI版本','完整接力依据'];
+     var quote=function(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';};
+-    return '\ufeff'+head.join(',')+'\n'+res.map(function(r){var m=r.emotion_relay||{};return [r.code,r.name,m.prior_date,m.prior_height,m.prior_exact,m.height,m.height_exact,m.mode,m.sealed,(m.roles||[]).join(' / '),(m.events||[]).join(' / '),(m.risks||[]).join(' / '),m.feedback_pct,m.limit_price,m.turnover_pct,typeof m.amount_wan==='number'?m.amount_wan/1e4:null,m.volume_yi,typeof (m.cap_strength||{}).seal_amount_yuan==='number'?m.cap_strength.seal_amount_yuan/1e8:null,m.quote_at,m.valid_until,JSON.stringify(m.continuation||[]),JSON.stringify(m.relations||[]),JSON.stringify(m.cycle||{}),m.suspended_current,m.last_trade_date,JSON.stringify(m.companions||[]),JSON.stringify(m.regulation||{}),JSON.stringify(m.cap_strength||{}),JSON.stringify(m.break_watch||{}),DATA.emotion_relay.version,DATA.emotion_relay.implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');}).join('\n');
++    return '\ufeff'+head.join(',')+'\n'+res.map(function(r){var m=r.emotion_relay||{};return [r.code,r.name,m.prior_date,m.prior_height,m.prior_exact,m.height,m.height_exact,m.mode,m.sealed,(m.roles||[]).join(' / '),(m.events||[]).join(' / '),(m.risks||[]).join(' / '),m.feedback_pct,m.limit_price,m.turnover_pct,typeof m.amount_wan==='number'?m.amount_wan/1e4:null,typeof m.volume_yi==='number'?m.volume_yi*1e4:null,typeof (m.cap_strength||{}).seal_amount_yuan==='number'?m.cap_strength.seal_amount_yuan/1e8:null,m.quote_at,m.valid_until,JSON.stringify(m.continuation||[]),JSON.stringify(m.relations||[]),JSON.stringify(m.cycle||{}),m.suspended_current,m.last_trade_date,JSON.stringify(m.companions||[]),JSON.stringify(m.regulation||{}),JSON.stringify(m.cap_strength||{}),JSON.stringify(m.break_watch||{}),DATA.emotion_relay.version,DATA.emotion_relay.implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');}).join('\n');
+   }
+   function candidate(m){return m.recovery_current&&m.recovery_candidate&&m.recovery_candidate.active?m.recovery_candidate:{};}
+   if(contexts.view==='ranking' && DATA.stock_board_ranking){
+@@ -82,8 +82,8 @@
+   res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.consolidation_elapsed_days,c.consolidation_elapsed_asof,c.consolidation_day_number,c.rebound_line?'MA'+c.rebound_line:'',c.rebound_touch_at,c.rebound_confirmed_at,c.rebound_evidence,c.rebound_active===true?'是':c.rebound_confirmed?'否':''].map(cell).join(',');});
+   lines[0]+=','+['跟踪MA20边界','MA20连续失守次数','MA20连续收复次数','收盘MA20（日线口径）','MA10降级','支撑位置提示','提示截至','提示价格口径','平台底部（提示口径）','旧规则MA10退出留档'].map(cell).join(',');
+   res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.tracking_ma20,c.ma20_below_samples,c.ma20_recovery_samples,c.close_review_ma20,c.ma10_downgraded===true?'是':'否',(c.support_alerts||[]).map(function(a){return a.label+' ¥'+a.price+' 距'+a.distance_atr+'ATR';}).join('；'),c.support_alert_at,c.reference_only&&c.close_review_day&&c.support_alert_at===c.close_review_day+' 15:00:00'?'同源正式日线':'已核验报价',c.support_platform_low,c.legacy_ma10_exit_at].map(cell).join(',');});
+-  lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考(亿股)','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
+-  res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,typeof w.volume0==='number'?w.volume0/1e8:null,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
++  lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考(万股)','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
++  res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,typeof w.volume0==='number'?w.volume0/1e4:null,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
+   lines[0]+=','+['衔接模型','昨收基准日','昨收主榜','昨日日线档位','当日综合判断','衔接报价截至','当前价格进攻分','价格距昨收ATR','衔接风险','ATR算法','前日变化来源','前五日变化来源','威科夫特征'].map(cell).join(',');
+   res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
+   lines[0]+=','+['最新价格判断','当前平台状态','报价判断模式','整理条件状态','整理条件依据','本地日线数','历史窗口核验','当前原平台突破门槛','已完成整理日数'].map(cell).join(',');
+--- baseline/dashboard_template.html
++++ dashboard_template.html
+@@ -1270,6 +1270,7 @@
+   return unitYi(Number(wan)*10000,'元');
+ }
+ function unitYi(value,unit){if(value==null||!isFinite(Number(value)))return '—';var y=Number(value)/1e8;return y.toFixed(Math.abs(y)>0&&Math.abs(y)<.01?4:2)+'亿'+(unit||'');}
++function volumeWan(shares){if(shares==null||!isFinite(Number(shares)))return '—';return (Number(shares)/1e4).toFixed(2)+'万股';}
+ 
+ function scoreColor(v){v=Math.max(0,Math.min(100,n(v)));
+   if(v>=80)return '#e8271a'; if(v>=68)return '#f08c00';
+@@ -1705,6 +1706,11 @@
+ function renderFresh(){
+   var mins=freshness();
+   var el=document.getElementById('fresh-txt'), dot=document.getElementById('fresh-dot');
++  if(sessionNow()==='盘前'||DATA.reference_view&&DATA.reference_view.kind==='preopen'){
++    var reference=DATA.reference_view||{},completed=(DATA.market_strength||{}).close_verification||{};
++    el.textContent=(sessionNow()==='盘前'?'盘前':'上一完成日参考')+' · 沿用 '+(reference.asof||(DATA.strength_model||{}).asof||completed.date)+' 收盘结果 · 实际源时间 '+(reference.source_quote_at||completed.source_at||'—');
++    dot.style.background='#8e8e93';dot.style.boxShadow='none';return;
++  }
+   var im=(DATA&&DATA.intraday_model)||{}, auctionOnly=DATA&&['集合竞价','竞价结束'].indexOf(DATA.session)>=0;
+   var stamp=(auctionOnly?im.auction_latest_quote_at:im.latest_valid_quote_at)||'';
+   var closed=(DATA&&DATA.market_strength||{}).close_verification||{},closeDay=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+@@ -1732,6 +1738,7 @@
+   if(sess==='集合竞价'||sess==='竞价结束'){
+     el.textContent=finalReady?'竞价结束 · 9:25参考 '+n(auctionFinal.count)+' 只 · 等待9:30开盘':
+       (sess==='竞价结束'?'竞价结束 · 末价待确认':'集合竞价')+' · 报价 '+n(im.auction_quote_count)+' 只 · 源时间 '+(im.auction_latest_quote_at||'待更新');
++    if(typeof msReferenceDay==='function'&&msReferenceDay())el.textContent+=' · 趋势/接力沿用 '+msReferenceDay()+' 收盘';
+     dot.style.background=finalReady||mins!=null&&mins<=10?'#12a45c':'#f08c00';dot.style.boxShadow='none';return;
+   }
+   if(sess==='早盘'&&!liveOpen){
+--- baseline/make_dashboard.py
++++ make_dashboard.py
+@@ -62,11 +62,19 @@
+         if availability:s['data_availability']=availability
+         if availability and availability.get('kind')=='inferred_suspension':
+             s['chart_data_state']=dict(availability,label='停牌（按缺失规则推定）')
++            suspension=(s.get('emotion_relay') or {}).get('suspension') or {}
++            if suspension and not suspension.get('inferred'):
++                s['chart_data_state']=dict(kind='verified_suspension',label='停牌（公告已核验）',
++                    checked_at=availability.get('checked_at'),basis=suspension.get('reason') or '已取得日期有效的停牌记录')
+         actual=s.get('chart_history') or s.get('strength_history') or []
+         if actual:
+             observation=observed_history.annotation(actual,calendar,day)
+             if observed_history.quote_traded(s,day):
+                 observation['suspension_days']=[d for d in observation['suspension_days'] if d!=day]
++            suspension=(s.get('emotion_relay') or {}).get('suspension') or {}
++            if suspension and not suspension.get('inferred'):
++                observation['verified_suspension_days']=[d for d in observation['suspension_days']
++                    if str(suspension.get('start') or '')[:10]<=d and (not suspension.get('end') or d<str(suspension['end'])[:10])]
+             s['chart_observation']=observation
+         if asof:
+             ks = [k for k in ks if k["date"] <= asof]
+@@ -98,10 +106,13 @@
+     day = day or str(relay.get('quote_at') or '')[:10] or asof
+     paused = relay.get('suspended_current') or (not relay.get('valid') and any(
+         b.get('halted') and b.get('date') == day for b in relay.get('history', [])))
+-    if (not asof or row.get('chart_history') or row.get('strength_history')):
++    if not asof:
+         return False
+     completed = [b for b in observed_history.traded_bars(bars) if b.get('date') and b['date'] <= asof and intraday._valid_historical_price_bar(b)]
+     if not completed:
++        return False
++    existing=row.get('chart_history') or row.get('strength_history') or []
++    if existing and existing[-1].get('date','')>=completed[-1]['date']:
+         return False
+     bases = {(b.get('price_basis'), b.get('price_basis_source')) for b in completed}
+     trusted = {('qfq', source) for source in intraday._QFQ_HISTORY_SOURCES}
+--- baseline/radar_ui.js
++++ radar_ui.js
+@@ -137,7 +137,7 @@
+  [5,10,20].forEach(function(n){var p=(m.trend_parts_by_period||{})[n]||{};h+='<tr><td>'+n+'日</td>'+['historical_R','R','historical_G','G','K','T'].map(function(k){return '<td>'+fmt(p[k],2)+'</td>';}).join('')+'</tr>';});
+  h+='</tbody></table></div><p>'+esc(m.version||'')+' · '+esc(m.mode||'')+' · 截至 '+esc(m.trend_at||m.emotion_at||'—')+' · UI '+esc(DATA.ui_generation||'')+'</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据来源与缺口</summary>'+esc((m.data_reasons||[]).join('；')||'当前计算数据完整')+'</details></section>';return h;
+ }
+-function msHistoryGaps(s){var o=s.chart_observation||{},days=o.suspension_days||[];return days.length?'<details class="ms-history-gaps"><summary>停牌标注（缺失规则推定） · '+days.length+'日</summary><p>'+days.map(esc).join(' / ')+'</p><p class="ms-muted">缺失交易日按停牌处理，仅绘制有效成交日；无公告证据的日期属于规则推定。</p></details>':'';}
++function msHistoryGaps(s){var o=s.chart_observation||{},days=o.suspension_days||[];return days.length?'<details class="ms-history-gaps"><summary>停牌标注 · '+days.length+'日</summary><p>'+days.map(function(d){return esc(d)+((o.verified_suspension_days||[]).indexOf(d)>=0?'（已核验）':'（推定）');}).join(' / ')+'</p><p class="ms-muted">缺失交易日按停牌处理，仅绘制有效成交日；无公告证据的日期属于规则推定。</p></details>':'';}
+ function msChartAcquisitionNote(s){var state=s.chart_data_state;return state?msTag(state.label,state.basis+' 采集时间 '+state.checked_at,'risk')+' ':'';}
+ function showStock(code,boardId){var s=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0];if(!s)return;
+  var sources=[s.chart_history,s.strength_history],bars=sources.find(function(items){return Array.isArray(items)&&items.length>=1&&items.every(function(b){return b&&['open','high','low','close'].every(function(k){return typeof b[k]==='number'&&isFinite(b[k])&&b[k]>0;})&&b.low<=Math.min(b.open,b.close)&&b.high>=Math.max(b.open,b.close)&&b.low<=b.high;});})||[],hasOHLC=bars.length>=1,paused=!!(s.emotion_relay&&(s.emotion_relay.suspended_current||!s.emotion_relay.valid&&(s.emotion_relay.history||[]).some(function(b){return b.halted&&b.date===String(DATA.quote_capture_at||'').slice(0,10);})));MS_CHART=null;
+@@ -157,8 +157,8 @@
+  bars.forEach(function(b,i){var color=b.close>=b.open?'#dc403e':'#15966c',xx=x(i),body=Math.max(1,step*.58);g.strokeStyle=color;g.beginPath();g.moveTo(xx,y(b.high));g.lineTo(xx,y(b.low));g.stroke();g.fillStyle=color;g.fillRect(xx-body/2,Math.min(y(b.open),y(b.close)),body,Math.max(1,Math.abs(y(b.open)-y(b.close))));var vh=(b.volume||0)/maxVol*(h-volTop-20);g.fillRect(xx-body/2,h-20-vh,body,vh);});
+  ['#e19a2d','#8a6bb1','#367ad6'].forEach(function(color,i){g.strokeStyle=color;g.lineWidth=1.2;g.beginPath();var started=false;mas[i].forEach(function(v,j){if(v==null)return;if(!started){g.moveTo(x(j),y(v));started=true;}else g.lineTo(x(j),y(v));});g.stroke();g.fillStyle=color;g.fillText('MA'+[5,10,20][i],pad+i*65,12);});
+  if(price>0){g.setLineDash([4,4]);g.strokeStyle='#768294';g.beginPath();g.moveTo(pad,y(price));g.lineTo(w-15,y(price));g.stroke();g.setLineDash([]);g.fillStyle='#768294';g.fillText('现价 '+fmt(price,2),w-105,12);}
+- g.fillStyle='#8b929d';g.fillText(bars[0].date,pad,h-3);g.fillText(bars[bars.length-1].date,w-85,h-3);g.fillText('成交量（亿股）',pad,volTop-3);g.fillText(unitYi(maxVol,'股'),pad,volTop+10);bars.forEach(function(b,i){if((b.suspension_before||[]).length){g.fillStyle='#687f9d';g.fillText('停',x(i)-4,top+9);}});
+- cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+unitYi(b.volume,'股')+((b.suspension_before||[]).length?' · 前段停牌（推定） '+b.suspension_before.join(' / '):'');};
++ g.fillStyle='#8b929d';g.fillText(bars[0].date,pad,h-3);g.fillText(bars[bars.length-1].date,w-85,h-3);g.fillText('成交量（万股）',pad,volTop-3);g.fillText(volumeWan(maxVol),pad,volTop+10);bars.forEach(function(b,i){if((b.suspension_before||[]).length){g.fillStyle='#687f9d';g.fillText('停',x(i)-4,top+9);}});
++ cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+volumeWan(b.volume)+((b.suspension_before||[]).length?' · 前段停牌（推定） '+b.suspension_before.join(' / '):'');};
+ }
+ function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],idx=(b.market_strength||{}).index_reference||{};var html=msDetail(b.market_strength||{})+'<section class="card"><h3>官方指数参照</h3><p>'+esc(idx.source||'同花顺指数')+' · '+pctHtml(idx.change_pct==null?idx.ret1:idx.change_pct,2)+' · '+esc(idx.quote_at||idx.asof||'—')+'</p><p class="ms-muted">成员共振与官方指数分别计算。</p></section><section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members,'members')+'</section>';openDrawer(esc(b.name),'板块研究 · 成员共振与指数参照',html,true);}
+ function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';STATE.boardFilterId=null;MS_VIEW.stocks=msStockDefaults();}
+--- baseline/scoring.py
++++ scoring.py
+@@ -133,6 +133,9 @@
+         raise DataNotReady("本轮集合竞价报价时间明显落后；保留上一完成日结果")
+ 
+     snap = dict(previous_snapshot)
++    snap.pop('reference_view',None)
++    snap.pop('scan_performance',None)
++    snap.pop('kline_acquisition',None)
+     auction_phase = df.session_label(captured_at)
+     snap.update(session=auction_phase, mode="auction",
+                 scan_started_at=scan_started_at.isoformat(sep=" ", timespec="seconds"),
+@@ -273,9 +276,16 @@
+     price_only.sanitize(snap)
+     snap["close_refresh_version"] = CLOSE_REFRESH_VERSION
+     radar.build_opportunities(snap,quotes,pool,{},formal,calendar,previous_snapshot,persist=True)
+-    ma_trend.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch_minutes=False)
+     import emotion_relay
+-    emotion_relay.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch=False,persist=False)
++    import completed_reference
++    if completed_reference.usable(previous_snapshot):
++        snap['reference_view']=dict(kind='completed_before_open',asof=previous_snapshot['strength_model']['asof'],
++            checked_at=str(captured_at),source_quote_at=previous_snapshot['market_strength']['close_verification'].get('source_at'),
++            label='竞价报价独立展示；趋势及接力沿用上一完成日结果，正式开盘后重新核算')
++    else:
++        ma_trend.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch_minutes=False)
++        emotion_relay.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch=False,persist=False)
++    board_center.attach_auction(snap)
+     config.atomic_write_text(config.SNAPSHOT_JSON,
+                              json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     print(f"[RUN] 集合竞价有效报价 {len(observed)}/{len(codes)}；沿用完成日线与收盘名单")
+@@ -920,7 +930,10 @@
+     if snap["session"] in ("集合竞价", "竞价结束"):
+         return _auction_snapshot(previous_snapshot, mode, scan_started_at, boundary)
+     if snap["session"] == "盘前":
+-        raise DataNotReady("盘前尚无当日竞价报价；保留上一完成日结果")
++        import completed_reference
++        snap=completed_reference.build(previous_snapshot,scan_started_at,mode)
++        config.atomic_write_text(config.SNAPSHOT_JSON,json.dumps(snap,ensure_ascii=False,separators=(',',':')))
++        return snap
+ 
+     # 1. 股票池
+     pool = df.build_pool(force=rebuild_pool)
+--- baseline/serve.py
++++ serve.py
+@@ -299,7 +299,10 @@
+         scan_seconds = time.monotonic()-started
+         scan_cache.PROGRESS.update(active=True, stage='页面发布')
+         publish_outputs(snapshot)
+-        source_at = intraday.parse_quote_timestamp((snapshot.get('intraday_model') or {}).get('latest_valid_quote_at'))
++        quote_model=snapshot.get('intraday_model') or {}
++        source_at = intraday.parse_quote_timestamp(quote_model.get('auction_latest_quote_at')
++            if snapshot.get('session') in ('集合竞价','竞价结束') else
++            (snapshot.get('reference_view') or {}).get('source_quote_at') or quote_model.get('latest_valid_quote_at'))
+         INIT['last_pipeline_performance'] = dict(version=scan_cache.VERSION,
+             seconds=round(time.monotonic()-started, 3), scan_seconds=round(scan_seconds, 3),
+             publish_seconds=round(time.monotonic()-started-scan_seconds, 3),
+@@ -520,7 +523,7 @@
+             now = datetime.now()
+             close_pending = (now.weekday() < 5 and now.hour*60+now.minute >= 15*60+5
+                              and not close_review_done(now, snapshot if matches else {}))
+-            if not matches or close_pending:
++            if not matches or close_pending or scoring.df.session_label(now)=='盘前':
+                 print("[INIT] 本地快照与已加载模型不一致，先完成一次新版扫描 ...")
+                 scan_and_publish(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")
+             else:
+@@ -531,6 +534,20 @@
+         INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+         INIT["last_scan_error"] = None
+         print(f"[INIT] 就绪（耗时 {time.time() - t0:.0f} 秒）")
++    except scoring.DataNotReady as e:
++        # An expected data boundary must not turn a usable prior page into an error.
++        if snapshot.get('stocks') or snapshot.get('coverage_catalog'):
++            try:
++                publish_outputs(snapshot)
++                INIT.update(phase='ready',error=None,last_scan_ok=None,last_scan_error=None,
++                            last_scan_note=str(e),last_scan=datetime.now().isoformat(timespec='seconds'))
++            except Exception as publish_error:
++                INIT.update(phase='error',error=f'{type(publish_error).__name__}: {publish_error}',
++                    last_scan_ok=False,last_scan_error=f'{type(publish_error).__name__}: {publish_error}')
++                traceback.print_exc()
++        else:
++            INIT.update(phase='waiting_data',error=None,last_scan_ok=None,last_scan_error=None,last_scan_note=str(e))
++        print(f"[INIT] 等待当日数据，保留已完成结果：{e}")
+     except Exception as e:
+         INIT["phase"] = "error"
+         INIT["error"] = f"{type(e).__name__}: {e}"
+@@ -798,7 +815,8 @@
+ 
+     def _send_init_page(self):
+         phase = INIT["phase"]
+-        err = f"错误：{INIT['error']}" if phase == "error" else "首次全量扫描约 3-5 分钟"
++        err = (f"错误：{INIT['error']}" if phase == "error" else
++               "暂无上一完成日结果，等待当日竞价数据" if phase=='waiting_data' else "首次全量扫描约 3-5 分钟")
+         html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+ <meta http-equiv="refresh" content="5">
+ <title>股票监测 · 初始化中</title>
+--- /dev/null
++++ completed_reference.py
+@@ -0,0 +1,68 @@
++"""Preopen view: replay completed local evidence, preserving the source clocks."""
++import copy,gzip,json
++from contextlib import closing
++from datetime import datetime
++import config
++
++def usable(previous):
++    import market_strength as M,ma_trend as T,emotion_relay as E
++    day=(previous.get('strength_model') or {}).get('asof')
++    return bool(day and (previous.get('market_strength') or {}).get('close_verification',{}).get('date')==day
++        and (previous.get('emotion_relay') or {}).get('mode')=='正式收盘'
++        and all((previous.get(name) or {}).get('implementation_hash')==mod.IMPLEMENTATION_HASH
++            for name,mod in [('market_strength',M),('ma_trend',T),('emotion_relay',E)]))
++
++
++def latest_acquisition(day,before):
++    path=config.CACHE_DIR/'intraday_history'/'acquisitions'/(day+'.jsonl.gz')
++    selected=None
++    try:
++        with gzip.open(path,'rt',encoding='utf-8') as stream:
++            for line in stream:
++                try:
++                    r=json.loads(line);at=datetime.fromisoformat(r['captured_at'])
++                    if at.date().isoformat()!=day or at>before or r.get('session')!='已收盘':continue
++                    if selected is None or r['captured_at']>selected['captured_at']:selected=r
++                except (ValueError,KeyError,TypeError):continue
++    except FileNotFoundError:pass
++    return selected
++
++
++def build(previous,now,mode='quick'):
++    import datafeed as df,strength,intraday,market_strength as M,ma_trend as T,emotion_relay as E,relay_history as H
++    if not previous.get('stocks') and not previous.get('coverage_catalog'):
++        from scoring import DataNotReady
++        raise DataNotReady('盘前暂无上一完成日结果，等待交易数据')
++    snap=copy.deepcopy(previous)
++    day=(snap.get('strength_model') or {}).get('asof') or str(snap.get('quote_capture_at') or '')[:10]
++    migration=any((snap.get(name) or {}).get('implementation_hash')!=mod.IMPLEMENTATION_HASH
++        for name,mod in [('market_strength',M),('ma_trend',T),('emotion_relay',E)])
++    if migration:
++        rows=snap.get('stocks',[])+snap.get('coverage_catalog',[]);pool={r['code']:r for r in rows}
++        record=latest_acquisition(day,now)
++        capture=record['captured_at'] if record else snap.get('quote_capture_at')
++        at=datetime.fromisoformat(capture)
++        if record:
++            q={v[0]:dict(zip(record['fields'][1:],v[1:])) for v in record['rows'] if v[0] in pool}
++        else:q=copy.deepcopy((snap.get('market_strength_close_input') or {}).get('quotes') or {})
++        if not q:
++            from scoring import DataNotReady
++            raise DataNotReady('盘前模型更新所需的上一完成日原始记录未覆盖；保留历史页面')
++        with closing(df.db()) as con:h={c:df.load_kline(con,'kline','code',c,limit=160) for c in pool}
++        calendar=strength.trading_calendar(h)
++        snap.update(session='已收盘',quote_capture_at=capture)
++        snap['data_availability']={c:v['data_availability'] for c,v in q.items() if v.get('data_availability')}
++        for r in rows:r.update(copy.deepcopy(q.get(r['code']) or {}))
++        print('[PREOPEN] 用'+day+'完成日及原始收市记录更新模型，保留原报价时刻',flush=True)
++        M.attach(snap,q,pool,h,calendar,now=at);M.validate(snap)
++        T.attach(snap,q,pool,h,calendar,now=at,fetch_minutes=False,minute_data={});T.validate(snap)
++        dates=[d for d in calendar if d<day];replay=dates[-(config.EMOTION_RELAY['history_days']+config.EMOTION_RELAY['warmup_days']):]
++        evidence=H.load(pool,replay,dates,day,fetch=False)
++        E.attach(snap,q,pool,h,calendar,now=at,evidence=evidence,fetch=False,persist=False);E.validate(snap)
++    snap.update(session='盘前',mode='preopen_reference',scan_started_at=str(now),scan_completed_at=str(now),generated_at=str(now))
++    snap.pop('scan_performance',None)
++    snap.pop('kline_acquisition',None)
++    snap['reference_view']=dict(kind='preopen',asof=day,checked_at=str(now),model_replayed=migration,
++        source_quote_at=(snap.get('market_strength') or {}).get('close_verification',{}).get('source_at') or snap.get('quote_capture_at'),
++        label='盘前 · 沿用上一完成日结果；9:15后接入当日竞价')
++    return snap
+--- /dev/null
++++ test_preopen_reference.py
+@@ -0,0 +1,50 @@
++import copy,json,tempfile,unittest
++from datetime import datetime
++from pathlib import Path
++from unittest.mock import patch
++import completed_reference as C,config,scoring,serve,market_strength as M,ma_trend as T,emotion_relay as E
++
++def prior():
++    s=dict(session='已收盘',quote_capture_at='2026-10-15 17:27:24',generated_at='2026-10-15 17:33:27',
++        stocks=[dict(code='000530',price=10,change_pct=10)],strength_model=dict(asof='2026-10-15'))
++    for name,mod in [('market_strength',M),('ma_trend',T),('emotion_relay',E)]:s[name]=dict(implementation_hash=mod.IMPLEMENTATION_HASH)
++    return s
++
++class Preopen(unittest.TestCase):
++    def test_nine_ten_reuses_completed_prices_without_fetching_today(self):
++        old=prior();original=copy.deepcopy(old)
++        with patch('datafeed.realtime_quotes') as quote:
++            s=C.build(old,datetime(2026,10,16,9,10))
++        quote.assert_not_called();self.assertEqual(old,original)
++        self.assertEqual(s['stocks'],old['stocks']);self.assertEqual(s['quote_capture_at'],old['quote_capture_at'])
++        self.assertEqual(s['session'],'盘前');self.assertEqual(s['reference_view']['asof'],'2026-10-15')
++        self.assertFalse(s['reference_view']['model_replayed'])
++
++    def test_scoring_preopen_publishes_reference_instead_of_data_not_ready(self):
++        with tempfile.TemporaryDirectory() as d:
++            p=Path(d)/'snapshot.json';p.write_text(json.dumps(prior()),encoding='utf-8')
++            with patch.object(config,'SNAPSHOT_JSON',p),patch.object(scoring.df,'session_label',return_value='盘前'),patch.object(scoring,'datetime') as clock,patch.object(scoring.df,'build_pool') as pool:
++                clock.now.return_value=datetime(2026,10,16,9,10)
++                s=scoring.run(progress=False)
++            pool.assert_not_called();self.assertEqual(s['reference_view']['kind'],'preopen')
++            self.assertEqual(json.loads(p.read_text(encoding='utf-8'))['session'],'盘前')
++
++    def test_initial_not_ready_keeps_usable_page_without_error_status(self):
++        with tempfile.TemporaryDirectory() as d:
++            p=Path(d)/'snapshot.json';p.write_text(json.dumps(prior()),encoding='utf-8')
++            state={}
++            with patch.object(config,'SNAPSHOT_JSON',p),patch.object(serve,'INIT',state),patch.object(serve,'scan_and_publish',side_effect=scoring.DataNotReady('竞价报价尚未发布')),patch.object(serve,'publish_outputs') as publish:
++                serve.init_worker()
++            publish.assert_called_once();self.assertEqual(state['phase'],'ready');self.assertIsNone(state['error'])
++            self.assertIsNone(state['last_scan_error']);self.assertIn('尚未发布',state['last_scan_note'])
++
++    def test_no_history_is_waiting_not_made_up_prices(self):
++        with self.assertRaises(scoring.DataNotReady):C.build({},datetime(2026,10,16,9,10))
++
++    def test_only_verified_same_version_completed_models_can_be_kept_for_auction(self):
++        s=prior();s['market_strength']['close_verification']={'date':'2026-10-15'}
++        s['emotion_relay']['mode']='正式收盘'
++        self.assertTrue(C.usable(s));s['emotion_relay']['implementation_hash']='old'
++        self.assertFalse(C.usable(s))
++
++if __name__=='__main__':unittest.main()

@@ -1,0 +1,36 @@
+--- before/radar_opportunity.py
++++ after/radar_opportunity.py
+@@ -216,7 +216,7 @@
+     return result
+ 
+ 
+-def build(snap, quotes, pool, contexts, histories, calendar, previous=None, state=None, persist=False, now=None):
++def _archived_v1_build(snap, quotes, pool, contexts, histories, calendar, previous=None, state=None, persist=False, now=None):
+     """仅此入口推进事件；页面/离线生成只投影快照。传入state可冻结重放。"""
+     p=config.RADAR_OPPORTUNITY; now=now or stamp(snap.get('generated_at')) or datetime.now()
+     lock=directory()/'rules_frozen.json'
+@@ -592,7 +592,7 @@
+     model['close_review']=dict(day=day,ready=ready,M0=m0,coverage_pct=cover,daily_coverage_pct=daily_cover,counts=counts,events=reviews)
+ 
+ 
+-def validate(snap):
++def _archived_v1_validate(snap):
+     """验收为只读；核对完整/摘要/详情共同使用的后端名单。"""
+     model=snap['radar_opportunity'];assert model['version']==VERSION
+     assert json.loads(json.dumps(model['parameters']))==json.loads(json.dumps(config.RADAR_OPPORTUNITY))
+@@ -621,3 +621,15 @@
+         assert len({r['code'] for r in confirmed})==review['stock_counts']['收盘确认']==len(review['stock_rows'])
+         assert len({r['event_id'] for r in review['records']})==len(review['records'])
+     return model['counts']
++
++
++def build(snap, quotes, pool, contexts, histories, calendar, previous=None, state=None, persist=False, now=None):
++    """Current production projection; legacy sampling state is intentionally unused."""
++    import market_strength
++    market_strength.attach(snap,quotes,pool,histories,calendar,contexts=contexts,now=now,previous=previous)
++    return snap['radar_opportunity']
++
++
++def validate(snap):
++    import market_strength
++    return market_strength.validate(snap)

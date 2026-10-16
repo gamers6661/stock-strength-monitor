@@ -1,0 +1,40 @@
+--- before/board_opportunity.py
++++ after/board_opportunity.py
+@@ -331,7 +331,7 @@
+     return tuple(-q[k] if number(q[k]) else math.inf for k in ('E0','U0','R0','valid_count'))+(board['name'], board['id'])
+ 
+ 
+-def enrich(snapshot, quotes, pool, previous=None, persist=True, history_dir=None, index_loader=None, excluded_names=None):
++def _archived_v1_enrich(snapshot, quotes, pool, previous=None, persist=True, history_dir=None, index_loader=None, excluded_names=None):
+     """仅在线计算入口推进确认和真实日线记录。页面生成禁止调用。"""
+     p = config.BOARD_OPPORTUNITY
+     now = stamp(snapshot.get('quote_capture_at')) or stamp(snapshot.get('generated_at'))
+@@ -462,7 +462,7 @@
+     return model
+ 
+ 
+-def validate(snapshot):
++def _archived_v1_validate(snapshot):
+     """只读验收存储的公式、确认、名单和排序；不推进状态、不写历史。"""
+     model = snapshot['board_opportunity_model']
+     assert model['version'] == VERSION
+@@ -518,3 +518,19 @@
+         expected=[b['id'] for b in sorted_boards if predicate(b['opportunity'])]
+         assert model['lists'][key] == expected and model['counts'][key] == len(expected)
+     return dict(version=VERSION, boards=len(snapshot['board_catalog']), counts=model['counts'])
++
++
++def enrich(snapshot, quotes, pool, previous=None, persist=True, history_dir=None, index_loader=None, excluded_names=None, histories=None, calendar=None, contexts=None, now=None):
++    """Use the single backend result. Never collect confirmation samples."""
++    import market_strength
++    if not snapshot.get('market_strength'):
++        import scoring, strength
++        histories=histories if histories is not None else scoring.formal_histories(pool)
++        calendar=calendar if calendar is not None else strength.trading_calendar(histories)
++        market_strength.attach(snapshot,quotes,pool,histories,calendar,contexts=contexts,now=now,previous=previous)
++    return snapshot['board_opportunity_model']
++
++
++def validate(snapshot):
++    import market_strength
++    return market_strength.validate(snapshot)

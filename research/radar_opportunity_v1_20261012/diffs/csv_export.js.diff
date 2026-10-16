@@ -1,0 +1,11 @@
+--- before/csv_export.js
++++ csv_export.js
+@@ -59,6 +59,8 @@
+   res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
+   lines[0]+=','+['最新价格判断','当前平台状态','报价判断模式','整理条件状态','整理条件依据','本地日线数','历史窗口核验','当前原平台突破门槛','已完成整理日数'].map(cell).join(',');
+   res.forEach(function(s,i){var c=s.session_context||{},e=c.history_evidence||{};lines[i+1]+=','+[c.current_label,c.structure_state,c.observation_mode,c.setup_state,c.setup_reason,e.count,e.valid===true?'已核验':e.reason,c.breakout_threshold,c.completed_consolidation_days].map(cell).join(',');});
++  lines[0]+=','+['雷达规则版本','雷达数据版本','雷达当前资格','雷达主标签','雷达全部标签','雷达状态','雷达源报价','雷达R0%','雷达E0百分点','雷达M0%','雷达事件与完整依据'].map(cell).join(',');
++  res.forEach(function(s,i){var r=s.radar_opportunity||{};lines[i+1]+=','+[r.version,DATA.ui_generation,r.current,r.main_label,(r.labels||[]).join('、'),r.status,r.source_at,r.R0,r.E0,r.M0,JSON.stringify(r)].map(cell).join(',');});
+   return '\ufeff'+lines.join('\n');
+ }
+ if(typeof module!=='undefined'&&module.exports){

@@ -1,0 +1,95 @@
+--- ui_payload.py.before
++++ ui_payload.py
+@@ -165,7 +165,79 @@
+     return result
+ 
+ 
++def chart_projection(full):
++    """Freeze display-only latest candles; never feed them back into scoring."""
++    import math
++    import intraday
++
++    def number(value):
++        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
++
++    def valid(bar):
++        return (all(number(bar.get(k)) and bar[k] > 0 for k in ('open', 'high', 'low', 'close'))
++                and bar['low'] <= min(bar['open'], bar['close'])
++                and bar['high'] >= max(bar['open'], bar['close']) and bar['high'] >= bar['low'])
++
++    captured = intraday.parse_quote_timestamp(full.get('quote_capture_at') or full.get('generated_at'))
++    verified = intraday.parse_quote_timestamp(full.get('close_daily_verified_at'))
++    if not captured:
++        return full
++    day = captured.date().isoformat()
++    # A later database update must not turn an intraday generation into a closing chart.
++    formal = (full.get('session') == '已收盘' and captured.hour >= 15 and verified is not None
++              and verified.date() == captured.date() and verified.hour >= 15 and verified <= captured)
++    daily = {}
++    if formal and config.KLINE_DB.is_file():
++        try:
++            with closing(sqlite3.connect(config.KLINE_DB.resolve().as_uri() + '?mode=ro', uri=True)) as con:
++                fields = ('code', 'date', 'open', 'close', 'high', 'low', 'volume', 'price_basis', 'price_basis_source')
++                for values in con.execute('SELECT ' + ','.join(fields) + ' FROM kline WHERE date=?', (day,)):
++                    bar = dict(zip(fields, values))
++                    daily[bar.pop('code')] = bar
++        except sqlite3.Error:
++            pass  # Real quoted OHLC remains available when formal history is unavailable.
++    result = dict(full)
++    for group in ('stocks', 'coverage_catalog'):
++        projected = []
++        for row in full.get(group, []):
++            model = row.get('market_strength') or {}
++            context = model.get('price_context') or {}
++            at = intraday.parse_quote_timestamp(model.get('quote_at'))
++            bars = row.get('strength_history') or []
++            prior = [b for b in bars if b.get('date') and b['date'] < day]
++            if (not context.get('valid') or not at or at.date() != captured.date()
++                    or at > captured or context.get('quote_day') != day or not bars
++                    or not prior or context.get('last_history_date') != prior[-1].get('date')):
++                projected.append(row)
++                continue
++            factor = context.get('scale_factor')
++            bar = daily.get(row['code'])
++            source = 'quoted_ohlc'
++            if (bar and number(factor) and factor > 0 and valid(bar)
++                    and bar.get('price_basis') == context.get('history_basis')
++                    and bar.get('price_basis_source') == context.get('history_basis_source')):
++                bar = dict(bar, **{k: bar[k] * factor for k in ('open', 'high', 'low', 'close')})
++                source = 'formal_daily'
++            else:
++                volume = row.get('volume_shou')
++                bar = dict(date=day, open=row.get('open'), high=row.get('high'), low=row.get('low'),
++                           close=row.get('price'), volume=volume * 100 if number(volume) and volume >= 0 else None)
++            if not valid(bar):
++                projected.append(row)
++                continue
++            # Replace by date, rather than appending, even if a future producer includes today already.
++            by_date = {b['date']: dict(b) for b in prior if valid(b)}
++            by_date[day] = dict(bar, aligned_price_basis='quote_scale')
++            item = dict(row, chart_history=[by_date[d] for d in sorted(by_date)][-61:],
++                        chart_source=source, chart_at=at.isoformat(sep=' ', timespec='seconds'))
++            projected.append(item)
++        if group in full:
++            result[group] = projected
++    return result
++
++
+ def prepare(full, template, page):
++    full = chart_projection(full)
+     # Content hash also includes rendering/export implementation, not just market time.
+     digest = hashlib.sha256()
+     text = dumps(full)
+--- radar_ui.js.before
++++ radar_ui.js
+@@ -109,8 +109,8 @@
+  h+='</tbody></table></div><p>'+esc(m.version||'')+' · '+esc(m.mode||'')+' · 截至 '+esc(m.trend_at||m.emotion_at||'—')+' · UI '+esc(DATA.ui_generation||'')+'</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据来源与缺口</summary>'+esc((m.data_reasons||[]).join('；')||'当前计算数据完整')+'</details></section>';return h;
+ }
+ function showStock(code,boardId){var s=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0];if(!s)return;
+- var bars=s.strength_history||[],hasOHLC=bars.length>=5,hasClose=s.k&&s.k.length>=5;
+- var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(s.price,2)+' <small>'+pct(s.change_pct,2)+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC||hasClose?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(hasOHLC?'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。':'完成日收盘走势 · OHLC不足，当前价与历史口径需结合来源。')+'</p>':'<p class="ms-muted">暂无可用历史走势图</p>')+'</section>'+msDetail(s.market_strength||{});
++ var bars=s.chart_history||s.strength_history||[],hasOHLC=bars.length>=5,hasClose=s.k&&s.k.length>=5;
++ var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(s.price,2)+' <small>'+pct(s.change_pct,2)+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC||hasClose?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(hasOHLC?(s.chart_source?'日K · MA5 / MA10 / MA20 · 成交量 · 截至 '+esc(s.chart_at||bars[bars.length-1].date):'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。'):'完成日收盘走势 · OHLC不足，当前价与历史口径需结合来源。')+'</p>':'<p class="ms-muted">暂无可用历史走势图</p>')+'</section>'+msDetail(s.market_strength||{});
+  var themes=s.themes||s.concepts||[];if(!Array.isArray(themes))themes=[themes];h+='<section class="card"><h3>所属板块 / 题材</h3><p>'+esc(themes.map(function(t){return typeof t==='string'?t:t.name||'';}).join(' / ')||s.industry||'—')+'</p></section>';
+  var confirmed=(DATA.board_catalog||[]).filter(function(b){return (b.member_codes||[]).indexOf(code)>=0;});if(confirmed.length)h+='<section class="card"><h3>确认成员关系</h3><div class="ms-axis">'+confirmed.map(function(b){return '<button class="btn" onclick="pickBoardMembers(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></section>'; openDrawer(esc(s.name)+' '+esc(code),'个股研究 · 历史结构与实时进攻',h,true);
+  setTimeout(function(){var cv=document.getElementById('k-cv');if(cv){if(hasOHLC){var price=(s.market_strength||{}).quote_at&&(s.market_strength||{}).price_context&&s.market_strength.price_context.valid?s.price:null;MS_CHART={bars:bars,price:price};var tools=document.createElement('div');tools.className='ms-chart-tools';tools.innerHTML='<label>显示区间 <select aria-label="K线显示区间" onchange="msChartRange(Number(this.value))"><option value="60">60日</option><option value="40">40日</option><option value="20">20日</option></select></label><span id="k-readout">移到K线上查看日期、OHLC与成交量</span>';cv.parentNode.insertBefore(tools,cv);msDrawCandles(cv,bars,price,60);}else if(hasClose)drawTrend(cv,s.k);}},30);

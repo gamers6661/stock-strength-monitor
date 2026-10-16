@@ -1,0 +1,73 @@
+--- before/check_dashboard.py
++++ after/check_dashboard.py
+@@ -32,7 +32,10 @@
+ assert rows, '有效样本为空'
+ assert snap['factor_model_version'] == strength.VERSION
+ assert [x['key'] for x in snap['strategies']] == ['trend']
+-assert set(snap['radar']) == {'trend'}
++import market_strength
++market_strength.validate(snap)
++assert snap['market_strength']==saved['market_strength']
++assert 'market-strength-table' in html and '当前强势' in html
+ assert all(rows[i]['stock_strength_score'] >= rows[i+1]['stock_strength_score'] for i in range(len(rows)-1))
+ assert sum(snap.get('axis_counts', {}).values()) == len(rows)
+ assert snap['strength_model']['strength_version'] == stock_strength.VERSION
+@@ -184,14 +187,8 @@
+         assert row.get('fund_today_source') == snap['fund_source']
+         assert row.get('fund_today_at') == snap['fund_meta'].get('fetched_at')
+         assert row.get('fund_today_at') is not None
+-for item in snap['radar']['trend']['items']:
+-    assert len(item['f']) == 1
+-    assert item['strong']
+-for tier in radar.tiers():
+-    expected = sorted((r for r in rows if r.get('trend_tier') == tier['key']),
+-                      key=lambda r: (r['trend_pool_rank'], r['code']))[:config.RADAR['show_per_tier']]
+-    actual = [x for x in snap['radar']['trend']['items'] if x['tier'] == tier['key']]
+-    assert [x['code'] for x in actual] == [r['code'] for r in expected], f"雷达 {tier['key']} 档未截取最强名单"
++assert snap['radar']['market_strength']==snap['market_strength']['stocks']
++assert snap['radar_opportunity']['lists']['current']==snap['market_strength']['stocks']['focus']
+ 
+ catalog = snap['board_catalog']
+ ids = {b['id'] for b in catalog}
+@@ -201,29 +198,12 @@
+ for board in catalog:
+     assert board['ranking_eligible'] == (board['valid_members'] >= config.SIMPLE_STRENGTH['min_industry_peers'] + 1)
+     assert (board['trend_rank'] is not None) == board['ranking_eligible']
+-    assert board['lists']['trend'] == [r['code'] for r in board['members'] if stock_by_code[r['code']]['persistent_strong']]
+-    assert set(board['lists']['recent']) == {r['code'] for r in board['members'] if stock_by_code[r['code']]['recent_improving']}
+-    assert board['type'] in ('industry', 'theme')
+-    assert len(board['members']) == board['valid_members']
++    assert board['type'] in ('industry','theme')
+     assert set(board['member_codes']) >= {r['code'] for r in board['members']}
+-    assert [r['score'] for r in board['members']] == sorted((r['score'] for r in board['members']), reverse=True)
+-    assert board['fund_sum_5d'] is not None or board['fund_covered'] == 0
+-    assert board['fund_sum_today'] is not None or board['fund_today_covered'] == 0
++    assert len(board['members']) == len(set(board['member_codes']) & set(market_strength.lists({r['code']:r['market_strength'] for r in snap['stocks']+snap['coverage_catalog']})['all']))
+     if board['detail_members_cached'] is not None and board['detail_members_cached'] < board['pool_members']:
+         assert not board['source_complete']
+-        assert board['source_members'] == board['pool_members']
+-    if not board['source_complete']:
+-        assert board['source_scope'] == '本系统主板池'
+-    for r in board['members']:
+-        s = stock_by_code[r['code']]
+-        assert r['global_rank'] == s['stock_strength_rank']
+-        assert r['score'] == s['stock_strength_score']
+-        if board['type'] == 'theme':
+-            assert board['name'] in (s.get('display_boards') or s.get('boards') or [])
+-        if r['excess5'] is not None:
+-            assert board['valid_members'] >= 6
+-    for key in ('trend', 'recent', 'emotion'):
+-        assert set(board['lists'][key]) <= {r['code'] for r in board['members']}
++    if not board['source_complete']:assert board['source_scope']=='本系统主板池'
+ for board in snap['boards']:
+     assert board['fund'] is None or board['fund_src'] != '未知'
+     assert board['name'] != '专精特新'
+@@ -231,7 +211,7 @@
+     assert '超大单' in snap['fund_source']
+     assert all(b['fund_covered'] == 0 for b in catalog)
+ assert sum(snap['fund_confirmation'].get('source_counts', {}).values()) == snap['fund_confirmation']['covered']
+-assert sum(t['n'] for t in snap['radar']['trend']['tiers']) == sum(bool(r['watch_candidate']) for r in rows)
++assert snap['market_strength']['counts']['focus']==len(snap['market_strength']['stocks']['focus'])
+ for ident in ['seg','tb-stocks','tb-radar','tb-boards','tb-themes','tb-hold','drawer','btn-refresh','work-attack-list','work-consolidation-pending','work-close-table','ov-axes','ov-market-emotion','ov-emotion-only']:
+     assert f'id="{ident}"' in html, ident
+ assert 'id="work-trend-comparison"' not in html

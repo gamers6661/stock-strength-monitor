@@ -1,0 +1,1423 @@
+--- before/board_center.py
++++ after/board_center.py
+@@ -8,7 +8,7 @@
+ import config
+ import stock_strength
+ 
+-VERSION = '板块成员竞价4'
++VERSION = '板块成员竞价5'
+ 
+ 
+ def attach_auction(snapshot):
+--- before/closing_price.py
++++ after/closing_price.py
+@@ -33,7 +33,7 @@
+     if not intraday._valid_historical_price_bar(native) or not positive(native.get('volume')):return None
+     sources={('qfq',s) for s in intraday._QFQ_HISTORY_SOURCES}|{('raw',s) for s in intraday._RAW_HISTORY_SOURCES}
+     if (native.get('price_basis'),native.get('price_basis_source')) not in sources:return None
+-    context=intraday.align_price_basis(q,bars,calendar,observation_day=now.date().isoformat())
++    context=intraday.align_price_basis(q,bars,calendar,observation_day=now.date().isoformat(),allow_partial=True)
+     if not context.get('valid') or not positive(context.get('scale_factor')):return None
+     # Today's native bar must use the same scale/source as the aligned history.
+     previous=next((b for b in reversed(bars) if b.get('date')==context['last_history_date']),None)
+@@ -43,6 +43,7 @@
+         if not positive(q.get(qkey)) or tick(converted[key])!=tick(q[qkey]):return None
+     return dict(date=native['date'],verified_at=str(verified),quote_at=str(at),history_source=native['price_basis_source'],history_basis=native['price_basis'],scale_factor=factor,
+         prices={k:float(tick(v)) for k,v in converted.items()},verified_suspension_days=[],
++        inferred_suspension_days=(context.get('history_observation') or {}).get('suspension_days',[]),
+         basis='已完成独立日线按经核验尺度转换，逐项匹配报价开高低收；保留实际收盘后源时刻')
+ 
+ def matches(proof,q,now):
+--- before/config.py
++++ after/config.py
+@@ -13,7 +13,7 @@
+ 
+ ROOT = Path(__file__).resolve().parent
+ EMOTION_RELAY = {
+-    'version': 'mainboard-relay-2026-10-15.3',
++    'version': 'mainboard-relay-2026-10-15.4',
+     'history_days': 20, 'warmup_days': 10, 'raw_history_days': 65, 'workers': 6,
+     'request_seconds': 8, 'fetch_budget_seconds': 55,
+     'min_peer_count': 5, 'min_peer_coverage_pct': 80.,
+@@ -32,7 +32,7 @@
+     'broken_repair_pct': 3., 'broken_close_position': .7,
+ }
+ MA_TREND = {
+-    'version': 'ma-trend-2026-10-15.5',
++    'version': 'ma-trend-2026-10-15.6',
+     'origin_days': 5, 'origin_base_days': 5,
+     'impulse_day_pct': 4., 'impulse_two_day_pct': 6., 'impulse_rise_atr': 1.2,
+     'volume_ratio': 1.8, 'close_position': .75,
+@@ -54,7 +54,7 @@
+     'board_min_members': 6, 'board_min_coverage': 80.,
+ }
+ MARKET_STRENGTH = {
+-    'version': 'market-strength-2026-10-15.5',
++    'version': 'market-strength-2026-10-15.6',
+     'periods': [5, 10, 20], 'strong_min': 65, 'very_strong_min': 80, 'normal_min': 45,
+     'stock_full_returns': {5: 8, 10: 12, 20: 20},
+     'board_full_returns': {5: 5, 10: 8, 20: 12},
+--- before/csv_export.js
++++ after/csv_export.js
+@@ -1,9 +1,9 @@
+ function buildStockCSV(res,DATA,contexts){
+   contexts=contexts||{};
+   if(contexts.view==='emotion'&&DATA.emotion_relay){
+-    var head=['代码','名称','已完成日截至','昨日完成板位','昨日板位完整','当前板位','当前板位完整','模式','当前在板','接力角色','事件','风险','今日涨幅%','真实涨停价','换手%','源行情','有效截至','接续参照','同题材关系','周期核心','全天停牌','最后成交日','伴生关系','异动披露与参考','封板强度依据','高标断板后续','规则版本','实现哈希','UI版本','完整接力依据'];
++    var head=['代码','名称','已完成日截至','昨日完成板位','昨日板位完整','当前板位','当前板位完整','模式','当前在板','接力角色','事件','风险','今日涨幅%','真实涨停价','换手%','成交额(亿元)','成交量(万股)','封单金额(亿元)','源行情','有效截至','接续参照','同题材关系','周期核心','全天停牌','最后成交日','伴生关系','异动披露与参考','封板强度依据','高标断板后续','规则版本','实现哈希','UI版本','完整接力依据'];
+     var quote=function(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';};
+-    return '\ufeff'+head.join(',')+'\n'+res.map(function(r){var m=r.emotion_relay||{};return [r.code,r.name,m.prior_date,m.prior_height,m.prior_exact,m.height,m.height_exact,m.mode,m.sealed,(m.roles||[]).join(' / '),(m.events||[]).join(' / '),(m.risks||[]).join(' / '),m.feedback_pct,m.limit_price,m.turnover_pct,m.quote_at,m.valid_until,JSON.stringify(m.continuation||[]),JSON.stringify(m.relations||[]),JSON.stringify(m.cycle||{}),m.suspended_current,m.last_trade_date,JSON.stringify(m.companions||[]),JSON.stringify(m.regulation||{}),JSON.stringify(m.cap_strength||{}),JSON.stringify(m.break_watch||{}),DATA.emotion_relay.version,DATA.emotion_relay.implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');}).join('\n');
++    return '\ufeff'+head.join(',')+'\n'+res.map(function(r){var m=r.emotion_relay||{};return [r.code,r.name,m.prior_date,m.prior_height,m.prior_exact,m.height,m.height_exact,m.mode,m.sealed,(m.roles||[]).join(' / '),(m.events||[]).join(' / '),(m.risks||[]).join(' / '),m.feedback_pct,m.limit_price,m.turnover_pct,typeof m.amount_wan==='number'?m.amount_wan/1e4:null,typeof m.volume_yi==='number'?m.volume_yi*1e4:null,typeof (m.cap_strength||{}).seal_amount_yuan==='number'?m.cap_strength.seal_amount_yuan/1e8:null,m.quote_at,m.valid_until,JSON.stringify(m.continuation||[]),JSON.stringify(m.relations||[]),JSON.stringify(m.cycle||{}),m.suspended_current,m.last_trade_date,JSON.stringify(m.companions||[]),JSON.stringify(m.regulation||{}),JSON.stringify(m.cap_strength||{}),JSON.stringify(m.break_watch||{}),DATA.emotion_relay.version,DATA.emotion_relay.implementation_hash,DATA.ui_generation,JSON.stringify(m)].map(quote).join(',');}).join('\n');
+   }
+   function candidate(m){return m.recovery_current&&m.recovery_candidate&&m.recovery_candidate.active?m.recovery_candidate:{};}
+   if(contexts.view==='ranking' && DATA.stock_board_ranking){
+@@ -82,8 +82,8 @@
+   res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.consolidation_elapsed_days,c.consolidation_elapsed_asof,c.consolidation_day_number,c.rebound_line?'MA'+c.rebound_line:'',c.rebound_touch_at,c.rebound_confirmed_at,c.rebound_evidence,c.rebound_active===true?'是':c.rebound_confirmed?'否':''].map(cell).join(',');});
+   lines[0]+=','+['跟踪MA20边界','MA20连续失守次数','MA20连续收复次数','收盘MA20（日线口径）','MA10降级','支撑位置提示','提示截至','提示价格口径','平台底部（提示口径）','旧规则MA10退出留档'].map(cell).join(',');
+   res.forEach(function(s,i){var c=s.trend_consolidation||{};lines[i+1]+=','+[c.tracking_ma20,c.ma20_below_samples,c.ma20_recovery_samples,c.close_review_ma20,c.ma10_downgraded===true?'是':'否',(c.support_alerts||[]).map(function(a){return a.label+' ¥'+a.price+' 距'+a.distance_atr+'ATR';}).join('；'),c.support_alert_at,c.reference_only&&c.close_review_day&&c.support_alert_at===c.close_review_day+' 15:00:00'?'同源正式日线':'已核验报价',c.support_platform_low,c.legacy_ma10_exit_at].map(cell).join(',');});
+-  lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
+-  res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,w.volume0,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
++  lines[0]+=','+['量价结构版本','固定周期编号','完成日结构','结构证据截至','原平台上沿','原平台下沿','固定ATR20','量能参考(万股)','结构价格口径','盘中平台上沿','盘中突破门槛','盘中结构观察','盘中结构截至','当前结构限制','失败事件数'].map(cell).join(',');
++  res.forEach(function(s,i){var w=s.wyckoff_structure||{};lines[i+1]+=','+[w.version,w.cycle_id,w.label,w.evidence_asof,w.platform_high,w.platform_low,w.atr0,typeof w.volume0==='number'?w.volume0/1e4:null,w.price_basis,w.live_platform_high,w.live_breakout_threshold,w.live_label,w.live_at,(w.restrictions||[]).join('；'),(w.events||[]).filter(function(e){return e.kind==='breakout_failed'||e.kind==='structure_closed';}).length].map(cell).join(',');});
+   lines[0]+=','+['衔接模型','昨收基准日','昨收主榜','昨日日线档位','当日综合判断','衔接报价截至','当前价格进攻分','价格距昨收ATR','衔接风险','ATR算法','前日变化来源','前五日变化来源','威科夫特征'].map(cell).join(',');
+   res.forEach(function(s,i){var c=s.session_context||{},w=s.wyckoff_structure||{};lines[i+1]+=','+[c.version,c.previous_close_asof,c.previous_close_board?'是':'否',c.prior_daily_tier,c.label,c.quote_at,c.price_attack_score,c.gap_atr,(c.risks||[]).join('；'),c.atr_method,s.strength_delta1_source,s.strength_delta5_source,(w.wyckoff_evidence||{}).label].map(cell).join(',');});
+   lines[0]+=','+['最新价格判断','当前平台状态','报价判断模式','整理条件状态','整理条件依据','本地日线数','历史窗口核验','当前原平台突破门槛','已完成整理日数'].map(cell).join(',');
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -1266,12 +1266,11 @@
+    永远走不到亿元分支 —— 9.58 亿的成交额被显示成「9.6万」，
+    相当于所有成交额少标了 4 个数量级。 */
+ function yi(wan){
+-  var w=n(wan), y=w/1e4;                 // 万元 → 亿元
+-  if(y>=100)return y.toFixed(0)+'亿';
+-  if(y>=1)return y.toFixed(2)+'亿';
+-  if(w>=1)return w.toFixed(0)+'万';
+-  return '—';
+-}
++  if(wan==null||!isFinite(Number(wan)))return '—';
++  return unitYi(Number(wan)*10000,'元');
++}
++function unitYi(value,unit){if(value==null||!isFinite(Number(value)))return '—';var y=Number(value)/1e8;return y.toFixed(Math.abs(y)>0&&Math.abs(y)<.01?4:2)+'亿'+(unit||'');}
++function volumeWan(shares){if(shares==null||!isFinite(Number(shares)))return '—';return (Number(shares)/1e4).toFixed(2)+'万股';}
+ 
+ function scoreColor(v){v=Math.max(0,Math.min(100,n(v)));
+   if(v>=80)return '#e8271a'; if(v>=68)return '#f08c00';
+@@ -1707,6 +1706,11 @@
+ function renderFresh(){
+   var mins=freshness();
+   var el=document.getElementById('fresh-txt'), dot=document.getElementById('fresh-dot');
++  if(sessionNow()==='盘前'||DATA.reference_view&&DATA.reference_view.kind==='preopen'){
++    var reference=DATA.reference_view||{},completed=(DATA.market_strength||{}).close_verification||{};
++    el.textContent=(sessionNow()==='盘前'?'盘前':'上一完成日参考')+' · 沿用 '+(reference.asof||(DATA.strength_model||{}).asof||completed.date)+' 收盘结果 · 实际源时间 '+(reference.source_quote_at||completed.source_at||'—');
++    dot.style.background='#8e8e93';dot.style.boxShadow='none';return;
++  }
+   var im=(DATA&&DATA.intraday_model)||{}, auctionOnly=DATA&&['集合竞价','竞价结束'].indexOf(DATA.session)>=0;
+   var stamp=(auctionOnly?im.auction_latest_quote_at:im.latest_valid_quote_at)||'';
+   var closed=(DATA&&DATA.market_strength||{}).close_verification||{},closeDay=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+@@ -1734,6 +1738,7 @@
+   if(sess==='集合竞价'||sess==='竞价结束'){
+     el.textContent=finalReady?'竞价结束 · 9:25参考 '+n(auctionFinal.count)+' 只 · 等待9:30开盘':
+       (sess==='竞价结束'?'竞价结束 · 末价待确认':'集合竞价')+' · 报价 '+n(im.auction_quote_count)+' 只 · 源时间 '+(im.auction_latest_quote_at||'待更新');
++    if(typeof msReferenceDay==='function'&&msReferenceDay())el.textContent+=' · 趋势/接力沿用 '+msReferenceDay()+' 收盘';
+     dot.style.background=finalReady||mins!=null&&mins<=10?'#12a45c':'#f08c00';dot.style.boxShadow='none';return;
+   }
+   if(sess==='早盘'&&!liveOpen){
+--- before/datafeed.py
++++ after/datafeed.py
+@@ -490,6 +490,38 @@
+     else:
+         _source_mark("realtime_quotes", "ok", coverage=f"{len(out)}/{len(expected)}",
+                      detail="腾讯覆盖充足，未调用备用源")
++    return retry_isolated_quotes(codes,out)
++
++
++def retry_isolated_quotes(codes,quotes,now=None):
++    """Retry each missing issuer once, only when peers prove today's feed works."""
++    import observed_history as O
++    import intraday
++    now=now or datetime.now();day=now.date().isoformat();out=dict(quotes)
++    def current(q):
++        at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'))
++        if not O.quote_traded(q,day) or not at:return False
++        age=(now-at).total_seconds()
++        if age < -config.INTRADAY['max_quote_future_seconds']:return False
++        if now.hour*60+now.minute>=905:return at.hour>=15
++        return at.hour*60+at.minute>=570 and age<=config.INTRADAY['max_quote_age_seconds']
++    expected=set(map(str,codes));healthy={c for c in expected if current(out.get(c) or {})}
++    if now.weekday()>=5 or now.hour*60+now.minute<570 or len(healthy)<max(1,len(expected)*.5):return out
++    missing=sorted(expected-healthy)
++    def retry(code):
++        try:return (tencent_quotes([code]) or {}).get(code) or {}
++        except Exception:return {}
++    with ThreadPoolExecutor(max_workers=6) as executor:
++        responses=dict(zip(missing,executor.map(retry,missing)))
++    checked=now.isoformat(sep=' ',timespec='seconds')
++    for c in missing:
++        q=responses[c]
++        if current(q):
++            out[c]=dict(q,data_availability=dict(kind='retry_recovered',checked_at=checked,attempts=1,peer_success_count=len(healthy)))
++        else:
++            out[c]=dict(out.get(c) or {},data_availability=dict(kind='inferred_suspension',label='停牌（按缺失规则推定）',
++                day=day,checked_at=checked,attempts=1,peer_success_count=len(healthy),inferred=True,
++                basis='同批其他股票有当日有效成交；本股单独重试仍未取得当日成交，按用户指定的缺失规则处理'))
+     return out
+ 
+ 
+--- before/emotion_relay.py
++++ after/emotion_relay.py
+@@ -4,9 +4,9 @@
+ from datetime import datetime,timedelta
+ from pathlib import Path
+ from statistics import median,mean
+-import config,intraday,market_strength as M,relay_data as D,relay_history as H,relay_regulation as R,relay_cycles as C,relay_pools as W,closing_price
++import config,intraday,market_strength as M,relay_data as D,relay_history as H,relay_regulation as R,relay_cycles as C,relay_pools as W,closing_price,relay_relations
+ P=config.EMOTION_RELAY;VERSION=P['version']
+-IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(D.__file__).read_bytes()+Path(H.__file__).read_bytes()+Path(R.__file__).read_bytes()+Path(C.__file__).read_bytes()+Path(W.__file__).read_bytes()+Path(closing_price.__file__).read_bytes()+json.dumps(P,sort_keys=True).encode()).hexdigest()
++IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(D.__file__).read_bytes()+Path(H.__file__).read_bytes()+Path(R.__file__).read_bytes()+Path(C.__file__).read_bytes()+Path(W.__file__).read_bytes()+Path(closing_price.__file__).read_bytes()+Path(relay_relations.__file__).read_bytes()+Path(intraday.__file__).read_bytes()+json.dumps(P,sort_keys=True).encode()).hexdigest()
+ 
+ def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+ def pct(n,d):return round(100*n/d,2) if d else None
+@@ -71,6 +71,7 @@
+         broken_from_height=previous.get('height') if prior.get('sealed') is False else None,
+         feedback_pct=q.get('change_pct') if valid and number(q.get('change_pct')) else None,
+         turnover_pct=q.get('turnover_pct') if valid else None,amount_wan=q.get('amount_wan') if valid else None,
++        volume_yi=q['volume_shou']/1e6 if valid and number(q.get('volume_shou')) else None,
+         price=q.get('price') if valid else None,limit_price=None,relations=[],continuation=[],observations=[])
+     if not valid:return out
+     if daily_proof:out['completed_daily_proof']=daily_proof;out['events'].append('收盘日线已核验')
+@@ -154,6 +155,8 @@
+         completed_dates=dates+([day] if session=='已收盘' and (proofs or any((r.get('market_strength') or {}).get('mode')=='正式收盘' for r in rows.values())) else [])
+         reg=R.load(selected,completed_dates,now,fetch=fetch and bool(selected)) if selected else dict(notices=[],indices={},scope_codes=[],covered_codes=[])
+     evidence['verified_halts']=reg.get('suspension_intervals',evidence.get('verified_halts',[]))
++    evidence['inferred_halts']={c:q['data_availability'] for c,q in effective.items()
++        if (q.get('data_availability') or {}).get('kind')=='inferred_suspension'}
+     paths={c:chain(c,replay_days,dates,histories.get(c) or [],evidence) for c in rows}
+     times=[intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'),now) for q in effective.values()]
+     times=sorted(t for t in times if t and t.date()==now.date() and abs((now-t).total_seconds())<=config.INTRADAY['max_quote_age_seconds'])
+--- before/emotion_ui.js
++++ after/emotion_ui.js
+@@ -7,15 +7,16 @@
+  '空间高标':'已核验主板样本中，完成连板或当前在板晋级高度居前的候选。完成高度与盘中待收盘高度分别标明；不等于已经确认唯一市场龙头。',
+  '题材领先候选':'同花顺确认题材中，已核验连板高度居前且同行覆盖达标的候选；题材领先是可观测相对地位。',
+  '同身位竞争':'昨日具有相同完成连板身位的候选相互比较；盘中谁在板、谁未封分别展示，不提前宣布竞争结果。',
+- '断板补涨候选':'已建立至少5板且当时为最高标的核心，实际断板当日的同题材首板批次；跟踪后续强度，不提前确认补涨龙。',
+- '监管接续候选':'最高标首次严重异动公告公开后的首个可交易日，本股同日首板且共享确认题材；保留原批次后续晋级，不等同断板。',
+- '停牌接续候选':'最高标停牌核查可知节点当日的同题材首板批次；停牌不视为断板。',
++ '断板补涨候选':'已建立至少5板且当时为最高标的核心，实际断板当日的共同主营行业或业务主线的首板批次；跟踪后续强度，不提前确认补涨龙。',
++ '监管接续候选':'最高标首次严重异动公告公开后的首个可交易日，本股同日首板且有共同主营行业或明确业务主线依据；保留原批次后续晋级，不等同断板。',
++ '停牌接续候选':'最高标停牌核查可知节点当日的共同主营行业或业务主线的首板批次；停牌不视为断板。',
+  '周期最高标':'近5个交易日仍有封板的至少5板周期核心中，已完成高度最高；已核验停牌保留高度但不增长。',
+  '周期核心观察':'最近5个交易日仍有封板记录，且本轮至少完成5板的周期锚点；与当日在交易高标分开。',
+- '停牌核心观察':'有日期有效的全天停牌公告证据，保留停牌前真实成交日与已完成高度，不计入当日在板或晋级分母。',
+- '伴生关系观察':'共享确认题材，首次连板启动与核心相距不超过2个交易日，至少2个完成日同步封板；仅为关系观察，不自动代表当前仍强。',
++ '停牌核心观察':'保留停牌前真实成交日与已完成高度，不计入当日在板或晋级分母。公告核验与单股重试失败后的规则推定分别标注。',
++ '停牌（按缺失规则推定）':'同批其他股票已取得当日成交，本股单独重试仍无当日成交。按用户指定规则作为停牌保留，属于规则推定，不代表已取得停牌公告。',
++ '伴生关系观察':'有共同主营行业或明确业务主线依据，首次连板启动与核心相距不超过2个交易日，至少2个完成日同步封板；仅为关系观察，不自动代表当前仍强。',
+  '停牌记录与有效成交报价冲突':'停牌区间与当日已核验真实成交报价冲突，暂停停牌身份，保留冲突核验提示。',
+- '同题材前轮高标':'与当前周期核心共享确认题材，较早一轮已完成至少5板且已经断板；不归为同轮伴生或自动视为当前龙头。',
++ '同题材前轮高标':'与当前周期核心有共同主营行业或明确业务主线依据，较早一轮已完成至少5板且已经断板；不归为同轮伴生或自动视为当前龙头。',
+  '已披露严重异动':'焦点股票近期公开公告已披露严重异常波动；逐条列出时间和链接，不等于当前必然停牌。',
+  '断板反馈':'前一完成日结束了至少2板的已核验连板链，观察最新行情的正负反馈。',
+  '首板启动':'完成历史确认前一日未封板，当前价格在真实涨停价；盘中仍需等收盘确认。',
+@@ -59,20 +60,20 @@
+ });
+ function erModel(){return DATA.emotion_relay||null;}
+ function erLive(){return (DATA.stocks||[]).concat(DATA.coverage_catalog||[]).some(function(r){return r.emotion_relay&&r.emotion_relay.valid&&!r.emotion_relay.suspended_current&&erFresh(r.emotion_relay);});}
+-function erFresh(m){if(!m)return false;if(m.suspended_current)return (erModel().at||'').slice(0,10)===new Date(Date.now()+8*3600000).toISOString().slice(0,10);if(!m.valid)return false;return mtSnapshotFresh({mode:m.mode==='盘中暂态'?'连续竞价':m.mode,valid_until:m.valid_until});}
++function erFresh(m){if(!m)return false;var ref=msReferenceDay();if(ref&&m.suspended_current)return String((erModel()||{}).at||'').slice(0,10)===ref;if(ref&&m.valid&&m.mode==='正式收盘'&&String(m.quote_at||'').slice(0,10)===ref)return true;if(m.suspended_current)return (erModel().at||'').slice(0,10)===new Date(Date.now()+8*3600000).toISOString().slice(0,10);if(!m.valid)return false;return mtSnapshotFresh({mode:m.mode==='盘中暂态'?'连续竞价':m.mode,valid_until:m.valid_until});}
+ function erRows(){var meta=erModel(),v=MS_VIEW.emotion,by={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){by[r.code]=r;});return ((meta.lists||{})[v.scope]||[]).map(function(c){return by[c];}).filter(function(r){return r&&(!v.q||String(r.code+' '+r.name).indexOf(v.q)>=0)&&(v.scope==='pending'||erFresh(r.emotion_relay));});}
+ function erHeight(m){if(m.suspended_current)return m.height+'板 · 停牌保留';if(m.height==null)return '板位待核验';var h=(m.height_exact?'':'至少')+m.height+'板';return m.sealed?h+(m.mode==='正式收盘'?' · 收盘确认':' · 在板待收盘'):(m.prior_height||0)+'板 · 前日完成';}
+ function erRankCell(row,item,ranking){var m=row.emotion_relay;if(!m)return '<span class="ms-muted">接力数据待核验</span>';return '<b class="er-position">'+esc(!erFresh(m)?'报价待更新':item.emotion_rank==null?'暂无接力事件':erHeight(m))+'</b><span class="cd">'+(item.emotion_rank==null?'完整成员保留':'接力观察第 '+item.emotion_rank+' / '+ranking.emotion_valid)+'</span>';}
+ function erTags(m){return (m.roles||[]).concat(m.events||[],m.risks||[]).map(function(t){return msTag(t,'源行情 '+(m.quote_at||'待更新'),(m.risks||[]).indexOf(t)>=0?'risk':'er-tag');}).join('');}
+-function erTable(rows){return '<div class="tw"><table class="market-strength-table er-table"><thead><tr><th class="l">个股 / 确认方向</th><th>身位 / 当前状态</th><th class="l">地位与事件</th><th class="l">关系依据</th><th>今日涨幅 / 换手</th><th>实际源时间</th></tr></thead><tbody>'+rows.map(function(r){var m=r.emotion_relay||{},links=(m.continuation||[]).map(function(n){return '<p class="er-connection">'+esc(n.label)+' · '+esc(n.leader_name)+'<span class="cd">节点 / 本股首板 '+esc(n.first_board_date)+' · '+esc(n.board)+'</span></p>';}).join('')+(m.companions||[]).map(function(n){return '<p class="er-connection">伴生参照 '+esc(n.leader_name)+'<span class="cd">本股启动 '+esc(n.start)+' · 同步封板 '+n.overlap_days.length+'日</span></p>';}).join('');return '<tr data-relay-code="'+esc(r.code)+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+r.code+'</span>'+msAffiliation(r,'emotion')+'</td><td><b class="er-position">'+esc(erHeight(m))+'</b><span class="cd">'+(m.suspended_current?'最后成交 '+esc(m.last_trade_date)+' · '+fmt(m.price,2)+'元':'前一完成日 '+esc(m.prior_date||'—')+' · '+(m.prior_height==null?'待核验':m.prior_height+'板'))+'</span></td><td class="l"><div class="ms-tag-list">'+erTags(m)+'</div>'+(m.reason?'<span class="cd">'+esc(m.reason)+'</span>':'')+'</td><td class="l">'+(links||(m.relations||[]).slice(0,2).map(function(b){return '<p>'+esc(b.name)+' '+msTag(b.state,'排除本股有效同行 '+b.valid+'/'+b.expected+'；在板 '+b.limit_count+'只')+'<span class="cd">在板 '+b.limit_count+' · 覆盖 '+fmt(b.coverage_pct,1)+'%</span></p>';}).join(''))+'</td><td>'+(m.suspended_current?'<span class="ms-muted">全天停牌</span>':pctHtml(m.feedback_pct,2)+'<span class="cd">换手 '+fmt(m.turnover_pct,2)+'%</span>')+'</td><td><span class="cd">'+esc(m.suspended_current?m.last_trade_date+'（最后成交）':m.quote_at||'待更新')+'</span>'+esc(m.suspended_current?'停牌公告已核验':m.mode||'')+'</td></tr>';}).join('')+'</tbody></table></div>';}
++function erTable(rows){return '<div class="tw"><table class="market-strength-table er-table"><thead><tr><th class="l">个股 / 确认方向</th><th>身位 / 当前状态</th><th class="l">地位与事件</th><th class="l">关系依据</th><th>今日涨幅 / 换手</th><th>实际源时间</th></tr></thead><tbody>'+rows.map(function(r){var m=r.emotion_relay||{},links=(m.continuation||[]).map(function(n){return '<p class="er-connection">'+esc(n.label)+' · '+esc(n.leader_name)+'<span class="cd">节点 / 本股首板 '+esc(n.first_board_date)+' · '+msTag(n.board,(n.boards||[]).map(function(b){return b.basis||b.name;}).join('；'))+'</span></p>';}).join('')+(m.companions||[]).map(function(n){return '<p class="er-connection">伴生参照 '+esc(n.leader_name)+'<span class="cd">本股启动 '+esc(n.start)+' · 同步封板 '+n.overlap_days.length+'日 · '+esc((n.boards||[]).map(function(b){return b.name;}).join(' / '))+'</span></p>';}).join('');return '<tr data-relay-code="'+esc(r.code)+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+r.code+'</span>'+msAffiliation(r,'emotion')+'</td><td><b class="er-position">'+esc(erHeight(m))+'</b><span class="cd">'+(m.suspended_current?'最后成交 '+esc(m.last_trade_date)+' · '+fmt(m.price,2)+'元':'前一完成日 '+esc(m.prior_date||'—')+' · '+(m.prior_height==null?'待核验':m.prior_height+'板'))+'</span></td><td class="l"><div class="ms-tag-list">'+erTags(m)+'</div>'+(m.reason?'<span class="cd">'+esc(m.reason)+'</span>':'')+'</td><td class="l">'+(links||(m.relations||[]).slice(0,2).map(function(b){return '<p>'+esc(b.name)+' '+msTag(b.state,'排除本股有效同行 '+b.valid+'/'+b.expected+'；在板 '+b.limit_count+'只')+'<span class="cd">在板 '+b.limit_count+' · 覆盖 '+fmt(b.coverage_pct,1)+'%</span></p>';}).join(''))+'</td><td>'+(m.suspended_current?'<span class="ms-muted">全天停牌</span>':pctHtml(m.feedback_pct,2)+'<span class="cd">换手 '+fmt(m.turnover_pct,2)+'%</span>')+'</td><td><span class="cd">'+esc(m.suspended_current?m.last_trade_date+'（最后成交）':m.quote_at||'待更新')+'</span>'+esc(m.suspended_current?((m.suspension||{}).inferred?'停牌 · 按缺失规则推定':'停牌公告已核验'):m.mode||'')+'</td></tr>';}).join('')+'</tbody></table></div>';}
+ function erMetric(title,value,sub){return '<article class="er-metric"><span>'+title+'</span><b>'+value+'</b><small>'+sub+'</small></article>';}
+ function erLadder(values){return Object.keys(values||{}).sort(function(a,b){return Number(b)-Number(a);}).map(function(h){return '<div class="er-ladder-row"><b>'+h+'板</b><span class="er-ladder-track"><i style="width:'+Math.min(100,values[h]*7)+'%"></i></span><span>'+values[h]+'只</span></div>';}).join('')||'<p class="ms-muted">暂无已核验梯队</p>';}
+ function renderEmotion(){var host=document.getElementById('emotion-host'),meta=erModel();if(!host)return;if(!meta){host.innerHTML='<section class="card">正在等待接力数据。</section>';return;}var focus=document.activeElement;if(focus&&host.contains(focus)&&(focus._msComposing||focus._msEnding))return;var v=MS_VIEW.emotion,rows=erRows(),fb=meta.yesterday_feedback||{},c=meta.coverage||{},cy=meta.cycles||{},dc=cy.disclosure_coverage||{},formal=meta.mode==='正式收盘',live=erLive();document.getElementById('emotion-sub').textContent=meta.scope+' · '+meta.mode+' · 行情截至 '+(meta.source_at||'待更新');
+- var h='<div class="er-context"><div><span class="er-eyebrow">周期 · 高度 · 接续</span><h2>'+esc(meta.state)+'</h2><p>周期核心保留停牌前高度，当前在板和节点首板批次分别观察。</p></div><button class="btn" onclick="goPane(\'boards\')">板块／题材</button></div><div class="er-metrics">'+erMetric('近期周期最高标',(cy.cycle_highest||0)+'板','完成高度 · 含已核验停牌核心')+erMetric(formal?'当日收盘最高':live?'当前在板最高':'上次在板最高（待更新）',meta.highest_live+'板',formal?'正式收盘确认':'盘中晋级，待收盘')+erMetric('前一完成日在交易高标',meta.highest_previous+'板','不含当日停牌；实际截至 '+esc(meta.prior_history_asof||meta.history_asof))+erMetric('昨日封板股晋级',fmt(fb.promotion_pct,1)+'%',fb.sealed+'/'+fb.valid+'有效 · 队列 '+fb.expected)+'</div>';
++ var h=(msReferenceDay()?'<p class="ms-muted">上一完成日参考 · '+esc(msReferenceDay())+'；趋势和接力按该日收盘结果展示，竞价报价单独记录，正式开盘后重新核算。</p>':'')+'<div class="er-context"><div><span class="er-eyebrow">周期 · 高度 · 接续</span><h2>'+esc(meta.state)+'</h2><p>周期核心保留停牌前高度，当前在板和节点首板批次分别观察。</p></div><button class="btn" onclick="goPane(\'boards\')">板块／题材</button></div><div class="er-metrics">'+erMetric('近期周期最高标',(cy.cycle_highest||0)+'板','完成高度 · 含已核验停牌核心')+erMetric(formal?'当日收盘最高':live?'当前在板最高':'上次在板最高（待更新）',meta.highest_live+'板',formal?'正式收盘确认':'盘中晋级，待收盘')+erMetric('前一完成日在交易高标',meta.highest_previous+'板','不含当日停牌；实际截至 '+esc(meta.prior_history_asof||meta.history_asof))+erMetric('昨日封板股晋级',fmt(fb.promotion_pct,1)+'%',fb.sealed+'/'+fb.valid+'有效 · 队列 '+fb.expected)+'</div>';
+  h+='<section class="card er-cycle"><div class="er-section-heading"><h3>近期周期核心</h3><span>已完成至少5板 · 最近5个交易日仍有封板记录</span></div><div class="er-core-grid">'+(cy.cores||[]).map(function(x){return '<button class="er-core" onclick="showStock(\''+jsq(x.code)+'\')"><span>'+esc(x.name)+' <small>'+x.code+'</small></span><b>'+x.height+'板'+(x.suspended?' · 停牌保留':'')+'</b><small>本轮 '+esc(x.start)+' — '+esc(x.last)+'<br>最后封板后'+(x.end?'于 '+esc(x.end)+' 断板':'尚未确认断板')+'</small></button>';}).join('')+'</div><p class="ms-muted">停牌不按断板处理、不增加板数，也不计入当日在板和晋级分母。以上为近期周期定位，不宣称唯一市场龙头。</p></section>';
+  h+='<div class="er-dual"><section class="card"><div class="er-section-heading"><h3>前一完成日封板梯队</h3><span>'+esc(meta.prior_history_asof||meta.history_asof)+'</span></div>'+erLadder(meta.daily_ladder)+'</section><section class="card"><div class="er-section-heading"><h3>'+(formal?'收盘梯队':'当前在板梯队')+'</h3><span>'+esc(meta.mode)+'</span></div>'+erLadder(meta.live_ladder)+'</section></div>';
+  h+=erPromotionSection(meta);h+=erCapSection(meta);h+=erBreakSection(meta);
+- h+='<section class="card er-candidates"><div class="er-section-heading"><h3>龙头与接续观察</h3><span>节点、首板日期和后续强度一起看</span></div>'+'<div class="ms-toolbar">'+msSelect('scope',[['all','全部接力事件'],['leaders','高标 / 同身位'],['continuation','节点接续候选'],['companions','伴生关系观察'],['suspended','停牌核心'],['pending','数据待核验']],'emotion','接力观察范围')+'<input aria-label="情绪股票搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="emotion" data-ms-search-field="q" oninput="msSearchInput(event,this,\'emotion\',\'q\')"><button class="btn" onclick="erCSV()">导出当前观察</button></div><p class="ms-muted">当前 '+rows.length+'只。断板补涨取最高标断板当日首板；监管与停牌各建节点，共享确认题材后跟踪原批次，谁最终走强由后续决定。催化与因果单独待核验。</p>'+erTable(rows.slice(0,v.limit))+(rows.length>v.limit?'<button class="btn" onclick="MS_VIEW.emotion.limit+=100;renderEmotion()">加载更多</button>':'')+'</section>';
++ h+='<section class="card er-candidates"><div class="er-section-heading"><h3>龙头与接续观察</h3><span>节点、首板日期和后续强度一起看</span></div>'+'<div class="ms-toolbar">'+msSelect('scope',[['all','全部接力事件'],['leaders','高标 / 同身位'],['continuation','节点接续候选'],['companions','伴生关系观察'],['suspended','停牌核心'],['pending','数据待核验']],'emotion','接力观察范围')+'<input aria-label="情绪股票搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="emotion" data-ms-search-field="q" oninput="msSearchInput(event,this,\'emotion\',\'q\')"><button class="btn" onclick="erCSV()">导出当前观察</button></div><p class="ms-muted">当前 '+rows.length+'只。断板补涨取最高标断板当日首板；监管与停牌各建节点，有共同主营行业或明确业务主线依据后跟踪原批次，谁最终走强由后续决定。催化与因果单独待核验。</p>'+erTable(rows.slice(0,v.limit))+(rows.length>v.limit?'<button class="btn" onclick="MS_VIEW.emotion.limit+=100;renderEmotion()">加载更多</button>':'')+'</section>';
+  h+='<details class="card er-data"><summary>最近'+meta.history_days+'个交易日完整复核</summary><p>'+esc(meta.history_from)+' — '+esc(meta.history_asof)+' · <button class="btn" onclick="erTimelineCSV()">导出逐日概况</button></p><div class="tw"><table class="market-strength-table"><thead><tr><th>交易日</th><th>已核验 / 应覆盖</th><th>收盘封板</th><th>交易高标</th><th>含停牌保留高度</th><th>全天停牌</th><th>待核验</th></tr></thead><tbody>'+(meta.timeline||[]).map(function(t){return '<tr><td>'+t.date+'</td><td>'+t.valid+'/'+t.expected+'</td><td>'+t.limit_count+'</td><td>'+(t.highest||0)+'板</td><td>'+(t.retained_highest||0)+'板</td><td>'+t.suspended+'</td><td>'+t.unknown+'</td></tr>';}).join('')+'</tbody></table></div><p>普通10%制度主板池 '+c.pool+'只 · 有效报价 '+c.valid_quotes+' · 最近完成日可核验 '+c.valid_history+'。原价OHLC、每日涨跌额反推的参考前收交叉核验；有公告证据的全天停牌保留链，未知不填成未涨停。</p><p>公告焦点股票覆盖 '+dc.covered+'/'+dc.expected+'；非全市场公告扫描。指数偏离仅展示未处理公告重置的滚动参考，正式异动以公司与交易所披露为准，不推断自动停牌或躲异动动机。</p><p>'+meta.limitations.map(esc).join('；')+'。</p><p>规则 '+esc(meta.version)+' · UI '+esc(DATA.ui_generation||'')+'</p></details>';
+  erPut(host,h,focus,['情绪股票搜索','涨停池股票搜索','断板池股票搜索']);erRefreshPromotion();}
+ function erTimelineCSV(){var fields=['date','valid','expected','limit_count','highest','retained_highest','suspended','unknown'],headers=['交易日','已核验','应覆盖','收盘封板','交易高标','含停牌保留高度','全天停牌','待核验','UI版本'];downloadMSCSV('\ufeff'+headers.join(',')+'\n'+(erModel().timeline||[]).map(function(t){return fields.map(function(k){return t[k];}).concat(DATA.ui_generation).join(',');}).join('\n'),'情绪20日概况_'+DATA.ui_generation+'.csv');}
+@@ -85,7 +86,7 @@
+ function erOverview(){var m=erModel(),f=m.yesterday_feedback;return '<section class="card ms-overview-section er-overview"><div class="er-section-heading"><h3>主板龙头接力</h3><button class="btn" onclick="goPane(\'emotion\')">进入情绪页 →</button></div><div class="er-metrics">'+erMetric('接力环境',esc((erLive()?'':'待更新 · 上次')+m.state),'源行情 '+esc(m.source_at||'待更新'))+erMetric('周期核心 / 当前在板',(m.cycles||{}).cycle_highest+' / '+m.highest_live+'板','两种口径独立展示')+erMetric('昨日封板股晋级',fmt(f.promotion_pct,1)+'%',f.sealed+'/'+f.valid+'个有效样本')+'</div></section>';}
+ var ER_SOURCE_FRESH=typeof renderFresh==='function'?renderFresh:null;
+ if(ER_SOURCE_FRESH){
+- renderFresh=function(){var result=ER_SOURCE_FRESH(),m=erModel();if(STATE.pane==='emotion'&&m&&m.mode==='正式收盘'&&erLive()){document.getElementById('fresh-txt').textContent='情绪 · 正式收盘已核验 · 实际源时间 '+m.source_at+(location.protocol==='file:'?' · 静态快照':'');var dot=document.getElementById('fresh-dot');dot.style.background='#8e8e93';dot.style.boxShadow='none';}return result;};
++ renderFresh=function(){var result=ER_SOURCE_FRESH(),m=erModel();if(STATE.pane==='emotion'&&m&&m.mode==='正式收盘'&&erLive()&&!msReferenceDay()){document.getElementById('fresh-txt').textContent='情绪 · 正式收盘已核验 · 实际源时间 '+m.source_at+(location.protocol==='file:'?' · 静态快照':'');var dot=document.getElementById('fresh-dot');dot.style.background='#8e8e93';dot.style.boxShadow='none';}return result;};
+  var ER_SOURCE_PANE=goPane;goPane=function(p){var result=ER_SOURCE_PANE(p);renderFresh();return result;};
+ }
+ var ER_OLD_RENDER=msRender;msRender=function(key){if(['emotion','emotionCaps','emotionBreaks'].indexOf(key)>=0)return renderEmotion();if(key==='directions')return erRenderBoards();return ER_OLD_RENDER(key);};
+@@ -114,13 +115,13 @@
+ function erCapTable(rows){
+  var h='<div class="tw"><table class="market-strength-table er-cap-table"><thead><tr><th class="l">个股 / 板位</th><th>同板位强度序</th><th class="l">封板状态</th><th>封单 / 成交额</th><th>首次 / 最后封板</th><th>炸板次数</th><th>今日涨幅 / 换手</th></tr></thead><tbody>';
+  rows.forEach(function(r){var m=r.emotion_relay,s=m.cap_strength||{},ok=s.verified,tags=ok?(s.labels||[]):['封板明细待核验'];
+-  h+='<tr data-cap-code="'+r.code+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+r.code+'</span><b class="er-position">'+esc(erHeight(m))+'</b></td><td>'+(ok?'<b class="er-pool-rank">'+(m.height_exact?s.height_rank:'—')+'</b><span class="cd">'+(m.height_exact?m.height+'板内比较':'连板链待核验')+'</span>':'<span class="ms-muted">明细待补齐</span>')+'</td><td class="l"><div class="ms-tag-list">'+tags.concat((m.risks||[]).filter(function(x){return x.indexOf('一字')>=0;})).map(function(t){return msTag(t,s.reason||'涨停池统计源时间 '+s.source_at,'er-tag');}).join('')+'</div><span class="cd">'+esc(s.source_at||s.reason||'')+'</span></td><td>'+(ok?'<b>'+fmt(s.seal_to_amount_pct,2)+'%</b><span class="cd">封单 '+fmt(s.seal_amount_yuan/10000,0)+'万<br>成交 '+fmt(s.amount_yuan/10000,0)+'万</span>':'—')+'</td><td>'+(ok?esc(s.first_seal)+'<span class="cd">最后 '+esc(s.last_seal)+'</span>':'—')+'</td><td>'+(ok?s.reopen_count+'次':'—')+'</td><td>'+pctHtml(m.feedback_pct,2)+'<span class="cd">换手 '+fmt(m.turnover_pct,2)+'%</span></td></tr>';
++  h+='<tr data-cap-code="'+r.code+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+r.code+'</span><b class="er-position">'+esc(erHeight(m))+'</b></td><td>'+(ok?'<b class="er-pool-rank">'+(m.height_exact?s.height_rank:'—')+'</b><span class="cd">'+(m.height_exact?m.height+'板内比较':'连板链待核验')+'</span>':'<span class="ms-muted">明细待补齐</span>')+'</td><td class="l"><div class="ms-tag-list">'+tags.concat((m.risks||[]).filter(function(x){return x.indexOf('一字')>=0;})).map(function(t){return msTag(t,s.reason||'涨停池统计源时间 '+s.source_at,'er-tag');}).join('')+'</div><span class="cd">'+esc(s.source_at||s.reason||'')+'</span></td><td>'+(ok?'<b>'+fmt(s.seal_to_amount_pct,2)+'%</b><span class="cd">封单 '+unitYi(s.seal_amount_yuan,'元')+'<br>成交 '+unitYi(s.amount_yuan,'元')+'</span>':'—')+'</td><td>'+(ok?esc(s.first_seal)+'<span class="cd">最后 '+esc(s.last_seal)+'</span>':'—')+'</td><td>'+(ok?s.reopen_count+'次':'—')+'</td><td>'+pctHtml(m.feedback_pct,2)+'<span class="cd">换手 '+fmt(m.turnover_pct,2)+'%</span></td></tr>';
+  });return h+'</tbody></table></div>';
+ }
+ function erCapSection(meta){
+  var p=meta.pools||{},v=MS_VIEW.emotionCaps;if(v.height!=='all'&&!(p.groups||{})[v.height])v.height='all';var rows=erCapRows(),opts=[['all','全部板数 · '+meta.lists.sealed.length+'只']];
+  Object.keys(p.groups||{}).forEach(function(k){opts.push([k,(k==='unknown'?'连板链待核验':k+'板')+' · '+p.groups[k].length+'只']);});
+- return '<section class="card er-pool" id="er-cap-pool"><div class="er-section-heading"><div><span class="er-eyebrow">LIMIT UP · '+esc(meta.mode)+'</span><h3>当日涨停池 <small>'+meta.lists.sealed.length+'只</small></h3></div><span>板数优先，同板数比较封板强度</span></div><div class="ms-toolbar">'+msSelect('height',opts,'emotionCaps','涨停池板数')+erPoolSearch('emotionCaps','涨停池股票搜索')+'<button class="btn" onclick="erPoolCSV(\'sealed\')">导出涨停池</button></div><p class="ms-muted">'+esc(p.strength_basis||'')+' 强度明细 '+(p.strength_coverage||0)+'/'+(p.strength_expected||0)+'只；统计源 '+esc(p.source_at||'待更新')+'。'+(meta.mode==='正式收盘'?'仅含当日核验收盘封板股。':'仅含最新有效报价仍在板的股票，待收盘确认。')+'一字板另标成交受限。</p>'+erCapTable(rows.slice(0,v.limit))+msMore(rows,rows.slice(0,v.limit),'emotionCaps')+'</section>';
++ return '<section class="card er-pool" id="er-cap-pool"><div class="er-section-heading"><div><span class="er-eyebrow">LIMIT UP · '+esc(meta.mode)+'</span><h3>'+(msReferenceDay()?'上一完成日涨停池':'当日涨停池')+' <small>'+meta.lists.sealed.length+'只</small></h3></div><span>板数优先，同板数比较封板强度</span></div><div class="ms-toolbar">'+msSelect('height',opts,'emotionCaps','涨停池板数')+erPoolSearch('emotionCaps','涨停池股票搜索')+'<button class="btn" onclick="erPoolCSV(\'sealed\')">导出涨停池</button></div><p class="ms-muted">'+esc(p.strength_basis||'')+' 强度明细 '+(p.strength_coverage||0)+'/'+(p.strength_expected||0)+'只；统计源 '+esc(p.source_at||'待更新')+'。'+(meta.mode==='正式收盘'?'仅含当日核验收盘封板股。':'仅含最新有效报价仍在板的股票，待收盘确认。')+'一字板另标成交受限。</p>'+erCapTable(rows.slice(0,v.limit))+msMore(rows,rows.slice(0,v.limit),'emotionCaps')+'</section>';
+ }
+ function erBreakTable(rows){
+  var h='<div class="tw"><table class="market-strength-table er-break-table"><thead><tr><th class="l">个股 / 原高度</th><th class="l">断板事件</th><th class="l">最新反馈</th><th>今日涨幅</th><th>断板后累计 / 距末板</th><th>断板日低 / 高</th></tr></thead><tbody>';
+--- before/intraday.py
++++ after/intraday.py
+@@ -18,7 +18,7 @@
+ 
+ 
+ VERSION = "盘中观察初版7"
+-PRICE_BASIS_VERSION = "统一盘中价格口径2"
++PRICE_BASIS_VERSION = "统一盘中价格口径3-有效交易日"
+ HISTORY_DIR = config.CACHE_DIR / "intraday_history"
+ REFERENCE_DIR = config.CACHE_DIR / "intraday_reference"
+ REPORT_PATH = config.ROOT / "research" / "intraday_validation_report.md"
+@@ -105,7 +105,7 @@
+     return low <= min(opening, close) <= max(opening, close) <= high
+ 
+ 
+-def align_price_basis(quote, history_bars, calendar, observation_day=None, quote_at=None):
++def align_price_basis(quote, history_bars, calendar, observation_day=None, quote_at=None, allow_partial=False):
+     """统一核验逐股报价和完成日K线，并把历史价格换到报价尺度。
+ 
+     只有显式来源、逐股日期、交易日窗口、昨收字段语义和价格有效性均通过后，
+@@ -149,24 +149,31 @@
+                        and str(day) < quote_day))
+     if not dates:
+         return fail("缺少报价日前交易日历")
+-    expected = dates[-1]
+-    result["expected_history_date"] = expected
+-    source_bars = [bar for bar in (history_bars or [])
++    market_expected = dates[-1]
++    result["expected_history_date"] = market_expected
++    import observed_history
++    source_bars = [bar for bar in observed_history.traded_bars(history_bars or [])
+                    if str(bar.get("date") or "") < quote_day]
+     source_bars.sort(key=lambda bar: str(bar.get("date") or ""))
+     last_date = str(source_bars[-1].get("date") or "") if source_bars else None
+     result["last_history_date"] = last_date
+-    if last_date != expected:
+-        return fail(f"历史最后完成日{last_date or '缺失'}不是报价日前一交易日{expected}")
++    if not source_bars:return fail('尚无有效历史成交日')
++    try:
++        if any(datetime.fromisoformat(str(b.get('date') or '')).date().isoformat()!=b['date'] for b in source_bars):
++            return fail('历史日期格式无效')
++    except (ValueError,TypeError):return fail('历史日期格式无效')
++    result['history_observation']=observed_history.annotation(source_bars,dates,market_expected)
++    # A stock's previous trading day may precede the market's previous session.
++    # Last-close scale checks below still compare the actual observed last bar.
++    result['expected_history_date']=last_date
++    dates=[b['date'] for b in source_bars]
+     expected_window = dates[-20:]
+-    if len(expected_window) < 20:
+-        return fail("报价日前20个应有交易日不足，MA20历史窗口不完整")
+     by_date = {str(bar.get("date") or ""): bar for bar in source_bars}
+     if len(by_date) != len(source_bars):
+         return fail("历史K线日期重复，窗口无法核验")
+-    if [str(bar.get("date") or "") for bar in source_bars[-20:]] != expected_window:
+-        return fail("报价日前最近20个应有交易日存在历史窗口缺口")
+     aligned_input = [by_date[day] for day in expected_window]
++    if len(aligned_input)<20 and not allow_partial:
++        return fail('按'+str(len(aligned_input))+'个有效成交日展示；完整MA20周期尚未形成')
+     if not all(_valid_historical_price_bar(bar) for bar in aligned_input):
+         return fail("报价日前历史窗口含缺失、零值或异常OHLC价格")
+ 
+@@ -219,11 +226,11 @@
+         copied["aligned_price_basis"] = "quote_scale"
+         aligned.append(copied)
+     closes = [bar["close"] for bar in aligned]
+-    fixed = {period: _average(closes[-period:]) for period in (5, 10, 20)}
+-    thresholds = {period: _average(closes[-(period - 1):]) for period in (5, 10, 20)}
++    fixed = {period: _average(closes[-period:]) if len(closes)>=period else None for period in (5, 10, 20)}
++    thresholds = {period: _average(closes[-(period - 1):]) if len(closes)>=period-1 else None for period in (5, 10, 20)}
+     price = q.get("price")
+     provisional = ({period: ((sum(closes[-(period - 1):]) + price) / period
+-                             if _positive(price) else None)
++                             if _positive(price) and len(closes)>=period-1 else None)
+                     for period in (5, 10, 20)})
+     atr = None
+     atr_status = "待核验"
+--- before/intraday_path.py
++++ after/intraday_path.py
+@@ -37,6 +37,7 @@
+                 attack=at(36) is True and not funded, fund=None)
+ 
+ def load(directory, day):
++    import intraday
+     path = Path(directory) / (day + '.jsonl')
+     key = str(path.resolve())
+     try: stat = path.stat()
+@@ -67,7 +68,7 @@
+                 if record.get('rule_version') != config.INTRADAY_RULE_VERSION:
+                     p.update(score=None, attack_score=None, attack_tier=None, attack=False,
+                              state='旧规则报价参考，进攻资格不复用')
+-                if record.get('price_basis_version') != '统一盘中价格口径2':
++                if record.get('price_basis_version') != intraday.PRICE_BASIS_VERSION:
+                     p.update(ma10=None,ma5=None,ma5_boundary=None,ma20=None,atr20=None,
+                              score=None,attack_score=None,attack_tier=None,attack=False,
+                              state='旧价格口径报价参考，均线及进攻资格待核验')
+@@ -75,7 +76,7 @@
+                 if old and p['at'] and effective(old) and p['at'] < effective(old):
+                     p.update(valid=False, state='迟到报价，不覆盖较新判断')
+                 result['points'].setdefault(r[0], []).append(p)
+-                if p['valid'] and record.get('price_basis_version') == '统一盘中价格口径2':
++                if p['valid'] and record.get('price_basis_version') == intraday.PRICE_BASIS_VERSION:
+                     result['latest_rows'][r[0]] = r
+     result.update(size=offset, file_size=stat.st_size, mtime=stat.st_mtime_ns)
+     _CACHE[key] = result
+@@ -85,7 +86,7 @@
+     """全池原始输入另留压缩记录，扫描后续失败也不会丢失已获取的行情。"""
+     keys = ('price','open','high','low','last_close','change_pct','amount_wan','volume_shou',
+             'quote_at','price_basis','price_basis_source','last_close_semantics',
+-            'last_close_precision_digits','limit_up','limit_down','limit_pct','board_type','ts')
++            'last_close_precision_digits','limit_up','limit_down','limit_pct','board_type','ts','data_availability')
+     folder = Path(directory) / 'acquisitions'
+     folder.mkdir(parents=True, exist_ok=True)
+     day = captured_at.strftime('%Y-%m-%d')
+--- before/ma_trend.py
++++ after/ma_trend.py
+@@ -10,10 +10,11 @@
+ import config
+ import intraday
+ import closing_price
++import observed_history
+ 
+ P = config.MA_TREND
+ VERSION = P['version']
+-IMPLEMENTATION_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('board_stock_rank.py').read_bytes() + Path(closing_price.__file__).read_bytes() + json.dumps(P,sort_keys=True).encode()).hexdigest()
++IMPLEMENTATION_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('board_stock_rank.py').read_bytes() + Path(closing_price.__file__).read_bytes() + Path(intraday.__file__).read_bytes() + Path(observed_history.__file__).read_bytes() + json.dumps(P,sort_keys=True).encode()).hexdigest()
+ LABELS = {5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'}
+ _DAILY_CACHE = {}
+ 
+@@ -224,14 +225,18 @@
+ 
+ def daily(bars,calendar,limit_pct=None):
+     """Replay completed closes to retain origins and stage exits without future data."""
+-    if len(bars)<22:return dict(stage=None,reason='至少22个完成交易日不足',pending=True)
++    bars=observed_history.traded_bars(bars)
++    if not bars:return dict(stage=None,reason='暂无有效成交日',pending=False,sample_only=True)
+     dates=[b['date'] for b in bars]
+-    expected=[d for d in calendar if d<=dates[-1]][-len(bars):]
+-    if dates!=expected or len(set(dates))!=len(dates):return dict(stage=None,reason='完成日历史窗口不连续',pending=True)
++    if dates!=sorted(dates) or len(set(dates))!=len(dates):
++        return dict(stage=None,reason='完成日历史日期重复或逆序',pending=True)
+     modes={(b.get('price_basis'),b.get('price_basis_source')) for b in bars}
+     allowed={('qfq',s) for s in intraday._QFQ_HISTORY_SOURCES}|{('raw',s) for s in intraday._RAW_HISTORY_SOURCES}
+     if len(modes)!=1 or not modes.issubset(allowed) or not all(intraday._valid_historical_price_bar(b) for b in bars):
+         return dict(stage=None,reason='完成日价格口径或OHLC待核验',pending=True)
++    if len(bars)<22:return dict(stage=None,reason='按'+str(len(bars))+'个有效成交日展示；强势入口所需完整周期尚未形成',
++        pending=False,sample_only=True,asof=dates[-1],history_days=len(bars),history_from=dates[0],
++        ma={str(n):r(average(bars,len(bars)-1,n)) for n in LABELS})
+     key=(limit_pct,tuple((b['date'],b['open'],b['high'],b['low'],b['close'],b.get('volume'),b.get('price_basis'),b.get('price_basis_source')) for b in bars))
+     if key in _DAILY_CACHE:return copy.deepcopy(_DAILY_CACHE[key])
+     features={'ma':{n:[average(bars,i,n) for i in range(len(bars))] for n in LABELS},
+@@ -443,17 +448,26 @@
+             m=copy.deepcopy(old);m.update(mode='参考行情 · 原时点 '+str(old.get('quote_at')),reference_only=True,eligible=False)
+         else:m.update(pending=True,reason='等待正常交易时段报价',status='待核验')
+         return m,None
+-    native=[b for b in bars if b['date']<day or formal and b['date']==day]
++    native=[b for b in observed_history.traded_bars(bars) if b['date']<day or formal and b['date']==day]
+     completed=[d for d in calendar if d<day or formal and d==day]
+-    if not completed or not native or native[-1]['date']!=completed[-1]:
+-        m.update(pending=True,status='日线待更新',reason='最新完成交易日历史未覆盖',data_reasons=['最新完成交易日历史未覆盖'])
++    if not native:
++        m.update(status='暂无成交数据',reason='暂无有效成交日，等待取得首根真实日线')
+         return m,None
++    m['history_observation']=observed_history.annotation(native,completed,completed[-1] if completed else None)
+     # A historical limit signal requires a known main-board limit regime. Unknown
+     # or special-treatment regimes do not get inferred from a 10% price change.
+     limit_pct=q.get('limit_pct') if q.get('limit_pct')==10 and not str(row.get('name','')).upper().startswith(('ST','*ST')) else None
+     setup=daily(native,calendar,limit_pct=limit_pct)
+     m.update(asof=setup.get('asof'),reason=setup['reason'],pending=setup['pending'])
+     if setup['pending']:m['data_reasons']=[setup['reason']];m['status']='待核验';return m,None
++    if observed_history.inferred_quote_halt(q):
++        m.update(status='停牌观察',reference_only=True,reason='单股重试仍未取得当日成交，按停牌规则保留最后有效阶段',
++            stage=setup.get('stage'),stage_label=LABELS.get(setup.get('stage'),'暂无合格阶段'),origin=setup.get('origin'),
++            suspension=q['data_availability'],history_days=len(native),ma=setup.get('ma'))
++        return m,None
++    if setup.get('sample_only'):
++        m.update(status='有效样本观察',history_days=len(native),ma=setup.get('ma'))
++        return m,None
+     at=intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'),now)
+     valid,at,error=M.quote_valid(q,now,session,center,formal,daily_proof)
+     if not valid:
+--- before/ma_trend_ui.js
++++ after/ma_trend_ui.js
+@@ -1,8 +1,10 @@
+ /* MA judgments, stage membership and order are read from the backend. */
+ function mtModel(){return DATA.ma_trend||null;}
+ function mtHistorical(m){return m.status==='已退出';}
++function msReferenceDay(){var r=DATA.reference_view||{},p=typeof sessionNow==='function'?sessionNow():'';return ['preopen','completed_before_open'].indexOf(r.kind)>=0&&['早盘','午盘','尾盘'].indexOf(p)<0?r.asof:null;}
+ function mtSnapshotFresh(m){
+  if(typeof sessionNow!=='function')return true;
++ var ref=msReferenceDay();if(ref&&m.mode==='正式收盘'&&m.asof===ref&&!m.pending)return true;
+  var phase=sessionNow();if(m.reference_only||phase==='集合竞价'||phase==='竞价结束'||phase==='非交易日')return false;
+  if((phase==='午盘'||phase==='尾盘')&&m.mode==='午休参考')return false;
+  var until=/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(m.valid_until||'')?new Date(m.valid_until):typeof parseDT==='function'?parseDT(m.valid_until):new Date(m.valid_until);
+@@ -71,5 +73,5 @@
+ var MT_OLD_OVERVIEW=renderOverview,MT_OLD_STOCK=showStock,MT_OLD_DETAIL=msDetail;
+ renderOverview=function(){return mtModel()?mtOverview():MT_OLD_OVERVIEW();};
+ msDetail=function(m){var h=MT_OLD_DETAIL(m);return mtModel()?'<details class="card"><summary>历史收益力度与情绪分 · 独立参考</summary>'+h+'</details>':h;};
+-showStock=function(code,boardId){var result=MT_OLD_STOCK(code,boardId),row=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0],host=document.getElementById('dr-b');if(mtModel()&&row&&row.ma_trend&&host){host.insertAdjacentHTML('beforeend',mtDetail(row.ma_trend));var title=host.querySelector('h3');if(title)title.insertAdjacentHTML('afterend','<p class="ms-muted ma-detail-badge">'+(msRecoveryCandidate(row.ma_trend)?msRecoveryTag(row.ma_trend):msTag(msMAStageLabel(row.ma_trend),row.ma_trend.reason)+' '+msTag(mtSnapshotFresh(row.ma_trend)?row.ma_trend.status:'快照已过期',row.ma_trend.reason))+' · 源行情 '+esc(row.ma_trend.quote_at||'待核验')+'</p>');}return result;};
++showStock=function(code,boardId){var result=MT_OLD_STOCK(code,boardId),row=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0],host=document.getElementById('dr-b');if(mtModel()&&row&&row.ma_trend&&host){host.insertAdjacentHTML('beforeend',mtDetail(row.ma_trend));var title=host.querySelector('h3');if(title)title.insertAdjacentHTML('afterend','<p class="ms-muted ma-detail-badge">'+(msRecoveryCandidate(row.ma_trend)?msRecoveryTag(row.ma_trend):msTag(msMAStageLabel(row.ma_trend),row.ma_trend.reason)+' '+msTag(['停牌观察','有效样本观察'].indexOf(row.ma_trend.status)>=0?row.ma_trend.status:mtSnapshotFresh(row.ma_trend)?row.ma_trend.status:'快照已过期',row.ma_trend.reason))+(row.ma_trend.status==='停牌观察'?' · 最后成交 '+esc((row.emotion_relay||{}).last_trade_date||row.ma_trend.asof||row.last_completed_date||'暂无成交日'):row.ma_trend.status==='有效样本观察'?((row.market_strength||{}).quote_at?' · 源行情 '+esc(row.market_strength.quote_at):' · 样本截至 '+esc(row.ma_trend.asof||'—')):' · 源行情 '+esc(row.ma_trend.quote_at||'待核验'))+'</p>');}return result;};
+ if(typeof renderFresh==='function'){var MT_OLD_FRESH=renderFresh,MT_FRESH_KEY=null;renderFresh=function(){MT_OLD_FRESH();if(!mtModel())return;var key=(DATA.ui_generation||'')+':'+(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.ma_trend&&mtSnapshotFresh(r.ma_trend);}).length;if(MT_FRESH_KEY!==null&&key!==MT_FRESH_KEY){if(STATE.pane==='radar')mtRender();if(STATE.pane==='stocks')msRender('stocks');renderOverview();}MT_FRESH_KEY=key;};}
+--- before/make_dashboard.py
++++ after/make_dashboard.py
+@@ -43,6 +43,10 @@
+             except (ValueError,AttributeError):continue
+     except sqlite3.OperationalError as exc:
+         if 'no such table' not in str(exc):raise
++    try:counts=list(conn.execute('SELECT date,COUNT(*) FROM kline GROUP BY date ORDER BY date'))
++    except sqlite3.OperationalError:counts=[]
++    threshold=max((v for d,v in counts),default=0)*.5
++    calendar=[d for d,v in counts if v>=threshold and d<=day]
+     for s in visible:
+         s.pop('chart_data_state', None)
+         try:
+@@ -53,6 +57,25 @@
+         attach_completed_candles(s, ks, completed_asof or asof, day=day)
+         state = chart_acquisition_state(s, ks, fetch_states.get(s['code']) or {}, day, completed_asof or asof)
+         if state:s['chart_data_state'] = state
++        import observed_history
++        availability=(snap.get('data_availability') or {}).get(s['code']) or s.get('data_availability')
++        if availability:s['data_availability']=availability
++        if availability and availability.get('kind')=='inferred_suspension':
++            s['chart_data_state']=dict(availability,label='停牌（按缺失规则推定）')
++            suspension=(s.get('emotion_relay') or {}).get('suspension') or {}
++            if suspension and not suspension.get('inferred'):
++                s['chart_data_state']=dict(kind='verified_suspension',label='停牌（公告已核验）',
++                    checked_at=availability.get('checked_at'),basis=suspension.get('reason') or '已取得日期有效的停牌记录')
++        actual=s.get('chart_history') or s.get('strength_history') or []
++        if actual:
++            observation=observed_history.annotation(actual,calendar,day)
++            if observed_history.quote_traded(s,day):
++                observation['suspension_days']=[d for d in observation['suspension_days'] if d!=day]
++            suspension=(s.get('emotion_relay') or {}).get('suspension') or {}
++            if suspension and not suspension.get('inferred'):
++                observation['verified_suspension_days']=[d for d in observation['suspension_days']
++                    if str(suspension.get('start') or '')[:10]<=d and (not suspension.get('end') or d<str(suspension['end'])[:10])]
++            s['chart_observation']=observation
+         if asof:
+             ks = [k for k in ks if k["date"] <= asof]
+             # quick 快照收盘后使用腾讯收盘报价补齐当日完成K，数据库历史K可能仍到昨日。
+@@ -78,14 +101,18 @@
+ def attach_completed_candles(row, bars, asof, day=None):
+     """Supply display-only OHLC even when live scoring has no valid context."""
+     import intraday
++    import observed_history
+     relay = row.get('emotion_relay') or {}
+     day = day or str(relay.get('quote_at') or '')[:10] or asof
+     paused = relay.get('suspended_current') or (not relay.get('valid') and any(
+         b.get('halted') and b.get('date') == day for b in relay.get('history', [])))
+-    if (not asof or row.get('chart_history') or row.get('strength_history') or paused):
+-        return False
+-    completed = [b for b in bars if b.get('date') and b['date'] <= asof]
+-    if len(completed) < 5 or not all(intraday._valid_historical_price_bar(b) for b in completed):
++    if not asof:
++        return False
++    completed = [b for b in observed_history.traded_bars(bars) if b.get('date') and b['date'] <= asof and intraday._valid_historical_price_bar(b)]
++    if not completed:
++        return False
++    existing=row.get('chart_history') or row.get('strength_history') or []
++    if existing and existing[-1].get('date','')>=completed[-1]['date']:
+         return False
+     bases = {(b.get('price_basis'), b.get('price_basis_source')) for b in completed}
+     trusted = {('qfq', source) for source in intraday._QFQ_HISTORY_SOURCES}
+--- before/market_strength.py
++++ after/market_strength.py
+@@ -13,13 +13,14 @@
+ import config
+ import intraday
+ import closing_price
++import observed_history
+ 
+ P = config.MARKET_STRENGTH
+ VERSION = P['version']
+ 
+ 
+ def implementation_hash():
+-    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('direction_changes.py').read_bytes() + Path(closing_price.__file__).read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
++    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('direction_changes.py').read_bytes() + Path(closing_price.__file__).read_bytes() + Path(intraday.__file__).read_bytes() + Path(observed_history.__file__).read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
+ 
+ 
+ IMPLEMENTATION_HASH = implementation_hash()  # fixed at process import
+@@ -325,26 +326,30 @@
+         mode = '正式收盘' if formal_close else '午休参考' if session == '午间休市' else '连续竞价'
+         m = empty(str(at) if at else None, mode)
+         result[c] = m
++        if observed_history.inferred_quote_halt(q):
++            m.update(mode='停牌参考',data_reasons=[],suspension=copy.deepcopy(q['data_availability']),
++                reasons=['单股重试仍无当日成交，按停牌规则保留历史参考；复牌后继续计算'])
++            continue
+         if not valid:
+             m['data_reasons'].append(reason)
+             continue
+         if c in completed_proofs:m['completed_daily_proof']=copy.deepcopy(completed_proofs[c])
+-        bars = histories.get(c) or []
+-        dates = [d for d in calendar if d < now.date().isoformat()]
++        bars = observed_history.traded_bars(histories.get(c) or [])
+         native = [b for b in bars if b['date']<now.date().isoformat()]
++        dates = [b['date'] for b in native]
+         # Completed-day ratios are invariant to a constant price scale. They do
+         # not need the current quote/history conversion required by MA and ATR.
+         m['recent_emotion'] = recent_emotion(native,q.get('limit_pct',10),dates) if positive(q.get('limit_pct')) else None
+         # Always align formal history; never reuse a synthetic current-day bar as completed history.
+-        context = contexts.get(c) or intraday.align_price_basis(q, bars, calendar, observation_day=now.date().isoformat())
++        context = contexts.get(c) or intraday.align_price_basis(q, bars, calendar, observation_day=now.date().isoformat(),allow_partial=True)
+         if context.get('quote_day') != now.date().isoformat():
+-            context = intraday.align_price_basis(q, bars, calendar, observation_day=now.date().isoformat())
++            context = intraday.align_price_basis(q, bars, calendar, observation_day=now.date().isoformat(),allow_partial=True)
+         if context.get('valid'):
+             factor = context['scale_factor']
+             raw = [dict(b, **{k: b[k]*factor for k in ('open','high','low','close')})
+                    for b in bars if b['date'] < now.date().isoformat() and all(positive(b.get(k)) for k in ('open','high','low','close'))]
+             aligned[c] = raw
+-            dates = [d for d in calendar if d < now.date().isoformat()]
++            dates = [b['date'] for b in raw]
+             m['trend_parts_by_period'] = trend_raw(q['price'], raw, context.get('atr20'), context.get('last_history_date'), dates)
+             m['price_context'] = {k:v for k,v in context.items() if k != 'aligned_bars'}
+             m['background'] = price_background(q['price'], raw)
+@@ -400,8 +405,9 @@
+ def historical_scores(histories, calendar, day):
+     """Completed-day evaluation: P=day close; ATR/window strictly precede that day."""
+     result = {}
+-    prior = [d for d in calendar if d < day]
+     for c, bars in histories.items():
++        bars=observed_history.traded_bars(bars)
++        prior = [b['date'] for b in bars if b['date']<day]
+         by = {b['date']:b for b in bars}
+         m = empty(day+' 15:00:00', '完成日历史背景')
+         result[c] = m
+@@ -600,6 +606,8 @@
+             row.update(quotes.get(c) or {})
+             snap.setdefault('coverage_catalog',[]).append(row)
+             rows[c] = row
++        if (quotes.get(c) or {}).get('data_availability'):
++            rows[c]['data_availability']=copy.deepcopy(quotes[c]['data_availability'])
+     qs = {c:quotes[c] for c in pool if c in quotes}
+     reference = session in ('盘前','集合竞价','竞价结束','非交易日','收盘竞价') or 897 <= now.hour*60+now.minute < 900
+     verified_at = intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
+--- before/radar_ui.js
++++ after/radar_ui.js
+@@ -137,13 +137,14 @@
+  [5,10,20].forEach(function(n){var p=(m.trend_parts_by_period||{})[n]||{};h+='<tr><td>'+n+'日</td>'+['historical_R','R','historical_G','G','K','T'].map(function(k){return '<td>'+fmt(p[k],2)+'</td>';}).join('')+'</tr>';});
+  h+='</tbody></table></div><p>'+esc(m.version||'')+' · '+esc(m.mode||'')+' · 截至 '+esc(m.trend_at||m.emotion_at||'—')+' · UI '+esc(DATA.ui_generation||'')+'</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据来源与缺口</summary>'+esc((m.data_reasons||[]).join('；')||'当前计算数据完整')+'</details></section>';return h;
+ }
++function msHistoryGaps(s){var o=s.chart_observation||{},days=o.suspension_days||[];return days.length?'<details class="ms-history-gaps"><summary>停牌标注 · '+days.length+'日</summary><p>'+days.map(function(d){return esc(d)+((o.verified_suspension_days||[]).indexOf(d)>=0?'（已核验）':'（推定）');}).join(' / ')+'</p><p class="ms-muted">缺失交易日按停牌处理，仅绘制有效成交日；无公告证据的日期属于规则推定。</p></details>':'';}
+ function msChartAcquisitionNote(s){var state=s.chart_data_state;return state?msTag(state.label,state.basis+' 采集时间 '+state.checked_at,'risk')+' ':'';}
+ function showStock(code,boardId){var s=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0];if(!s)return;
+- var sources=[s.chart_history,s.strength_history],bars=sources.find(function(items){return Array.isArray(items)&&items.length>=5&&items.every(function(b){return b&&['open','high','low','close'].every(function(k){return typeof b[k]==='number'&&isFinite(b[k])&&b[k]>0;})&&b.low<=Math.min(b.open,b.close)&&b.high>=Math.max(b.open,b.close)&&b.low<=b.high;});})||[],hasOHLC=bars.length>=5,paused=!!(s.emotion_relay&&(s.emotion_relay.suspended_current||!s.emotion_relay.valid&&(s.emotion_relay.history||[]).some(function(b){return b.halted&&b.date===String(DATA.quote_capture_at||'').slice(0,10);})));MS_CHART=null;
+- var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(s.price,2)+' <small>'+pctHtml(s.change_pct,2)+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(paused?'停牌中 · 保留停牌前历史K线；复牌后继续绘制。':msChartAcquisitionNote(s)+(s.chart_source?(s.chart_source==='completed_daily_history'?(bars[0].price_basis==='qfq'?'前复权日K':'原价日K'):'日K')+' · MA5 / MA10 / MA20 · 成交量 · 截至 '+esc(s.chart_at||bars[bars.length-1].date):'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。'))+'</p>':'<p class="ms-muted">'+(paused?'停牌中 · 复牌后继续显示K线':msChartAcquisitionNote(s)+'日K线OHLC数据不足，待补齐')+'</p>')+'</section>'+msDetail(s.market_strength||{});
++ var sources=[s.chart_history,s.strength_history],bars=sources.find(function(items){return Array.isArray(items)&&items.length>=1&&items.every(function(b){return b&&['open','high','low','close'].every(function(k){return typeof b[k]==='number'&&isFinite(b[k])&&b[k]>0;})&&b.low<=Math.min(b.open,b.close)&&b.high>=Math.max(b.open,b.close)&&b.low<=b.high;});})||[],hasOHLC=bars.length>=1,paused=!!(s.emotion_relay&&(s.emotion_relay.suspended_current||!s.emotion_relay.valid&&(s.emotion_relay.history||[]).some(function(b){return b.halted&&b.date===String(DATA.quote_capture_at||'').slice(0,10);})));MS_CHART=null;
++ var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(paused?((s.emotion_relay||{}).price||s.last_completed_close||s.price):s.price,2)+' <small>'+(paused?'停牌参考':pctHtml(s.change_pct,2))+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(paused?msChartAcquisitionNote(s)+'停牌中 · 保留停牌前历史K线；复牌后继续绘制。':msChartAcquisitionNote(s)+(s.chart_source?(s.chart_source==='completed_daily_history'?(bars[0].price_basis==='qfq'?'前复权日K':'原价日K'):'日K')+' · MA5 / MA10 / MA20 · 成交量 · 截至 '+esc(s.chart_at||bars[bars.length-1].date):'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。'))+'</p>':'<p class="ms-muted">'+(paused?'停牌中 · 复牌后继续显示K线':msChartAcquisitionNote(s)+'日K线OHLC数据不足，待补齐')+'</p>')+msHistoryGaps(s)+'</section>'+msDetail(s.market_strength||{});
+  var themes=s.themes||s.concepts||[];if(!Array.isArray(themes))themes=[themes];h+='<section class="card"><h3>个股概念归属</h3><p>'+esc(themes.map(function(t){return typeof t==='string'?t:t.name||'';}).join(' / ')||s.industry||'—')+'</p></section>';
+  var confirmed=msBoardCatalog().filter(function(b){return (b.member_codes||[]).indexOf(code)>=0;});if(confirmed.length)h+='<section class="card"><h3>确认成员关系</h3><div class="ms-axis">'+confirmed.map(function(b){return '<button class="btn" onclick="pickBoardMembers(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></section>'; openDrawer(esc(s.name)+' '+esc(code),'个股研究 · 历史结构与实时进攻',h,true);
+- setTimeout(function(){var cv=document.getElementById('k-cv');if(cv){if(hasOHLC){var price=s.chart_source!=='completed_daily_history'&&(s.market_strength||{}).quote_at&&(s.market_strength||{}).price_context&&s.market_strength.price_context.valid?s.price:null;MS_CHART={bars:bars,price:price};var tools=document.createElement('div');tools.className='ms-chart-tools';tools.innerHTML='<label>显示区间 <select aria-label="K线显示区间" onchange="msChartRange(Number(this.value))"><option value="60">60日</option><option value="40">40日</option><option value="20">20日</option></select></label><span id="k-readout">移到K线上查看日期、OHLC与成交量</span>';cv.parentNode.insertBefore(tools,cv);msDrawCandles(cv,bars,price,60);}}},30);
++ setTimeout(function(){var cv=document.getElementById('k-cv');if(cv){if(hasOHLC){var price=s.chart_source!=='completed_daily_history'&&(s.market_strength||{}).quote_at&&(s.market_strength||{}).price_context&&s.market_strength.price_context.valid?s.price:null;var gaps=(s.chart_observation||{}).suspension_days||[];bars=bars.map(function(b,i){return Object.assign({},b,{suspension_before:gaps.filter(function(d){return i>0&&d>bars[i-1].date&&d<b.date;})});});MS_CHART={bars:bars,price:price};var tools=document.createElement('div');tools.className='ms-chart-tools';tools.innerHTML='<label>显示区间 <select aria-label="K线显示区间" onchange="msChartRange(Number(this.value))"><option value="60">60日</option><option value="40">40日</option><option value="20">20日</option></select></label><span id="k-readout">移到K线上查看日期、OHLC与成交量</span>';cv.parentNode.insertBefore(tools,cv);msDrawCandles(cv,bars,price,60);}}},30);
+ }
+ var MS_CHART=null;
+ function msChartRange(n){var cv=document.getElementById('k-cv');if(cv&&MS_CHART)msDrawCandles(cv,MS_CHART.bars,MS_CHART.price,n);}
+@@ -156,8 +157,8 @@
+  bars.forEach(function(b,i){var color=b.close>=b.open?'#dc403e':'#15966c',xx=x(i),body=Math.max(1,step*.58);g.strokeStyle=color;g.beginPath();g.moveTo(xx,y(b.high));g.lineTo(xx,y(b.low));g.stroke();g.fillStyle=color;g.fillRect(xx-body/2,Math.min(y(b.open),y(b.close)),body,Math.max(1,Math.abs(y(b.open)-y(b.close))));var vh=(b.volume||0)/maxVol*(h-volTop-20);g.fillRect(xx-body/2,h-20-vh,body,vh);});
+  ['#e19a2d','#8a6bb1','#367ad6'].forEach(function(color,i){g.strokeStyle=color;g.lineWidth=1.2;g.beginPath();var started=false;mas[i].forEach(function(v,j){if(v==null)return;if(!started){g.moveTo(x(j),y(v));started=true;}else g.lineTo(x(j),y(v));});g.stroke();g.fillStyle=color;g.fillText('MA'+[5,10,20][i],pad+i*65,12);});
+  if(price>0){g.setLineDash([4,4]);g.strokeStyle='#768294';g.beginPath();g.moveTo(pad,y(price));g.lineTo(w-15,y(price));g.stroke();g.setLineDash([]);g.fillStyle='#768294';g.fillText('现价 '+fmt(price,2),w-105,12);}
+- g.fillStyle='#8b929d';g.fillText(bars[0].date,pad,h-3);g.fillText(bars[bars.length-1].date,w-85,h-3);g.fillText('成交量',pad,volTop-3);
+- cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+fmt(b.volume,0);};
++ g.fillStyle='#8b929d';g.fillText(bars[0].date,pad,h-3);g.fillText(bars[bars.length-1].date,w-85,h-3);g.fillText('成交量（万股）',pad,volTop-3);g.fillText(volumeWan(maxVol),pad,volTop+10);bars.forEach(function(b,i){if((b.suspension_before||[]).length){g.fillStyle='#687f9d';g.fillText('停',x(i)-4,top+9);}});
++ cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+volumeWan(b.volume)+((b.suspension_before||[]).length?' · 前段停牌（推定） '+b.suspension_before.join(' / '):'');};
+ }
+ function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],idx=(b.market_strength||{}).index_reference||{};var html=msDetail(b.market_strength||{})+'<section class="card"><h3>官方指数参照</h3><p>'+esc(idx.source||'同花顺指数')+' · '+pctHtml(idx.change_pct==null?idx.ret1:idx.change_pct,2)+' · '+esc(idx.quote_at||idx.asof||'—')+'</p><p class="ms-muted">成员共振与官方指数分别计算。</p></section><section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members,'members')+'</section>';openDrawer(esc(b.name),'板块研究 · 成员共振与指数参照',html,true);}
+ function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';STATE.boardFilterId=null;MS_VIEW.stocks=msStockDefaults();}
+--- before/relay_cycles.py
++++ after/relay_cycles.py
+@@ -1,6 +1,6 @@
+ """Replay dated cycle anchors and event-day first-board cohorts without hindsight."""
+ from collections import defaultdict
+-import config,relay_history as H,relay_regulation as R
++import config,relay_history as H,relay_regulation as R,relay_relations
+ 
+ 
+ def runs(path):
+@@ -51,12 +51,8 @@
+         if m['valid']:
+             lookup[c][day]=dict(date=day,sealed=m['sealed'],height=m['height'] if m['sealed'] else 0,exact=m['height_exact'],halted=False,pending=m['mode']!='正式收盘')
+     recent=(all_dates if formal else dates)[-P['cycle_core_recent_days']:]
+-    themes=[b for b in boards if b['type']=='theme' and len(b.get('member_codes',[]))<=P['relation_max_members']]
+-    membership=defaultdict(list)
+-    for b in themes:
+-        for c in set(b.get('member_codes',[])):membership[c].append(b)
+     def shared(a,b):
+-        return [dict(id=t['id'],name=t['name']) for t in membership[a] if b in t.get('member_codes',[])]
++        return relay_relations.shared(a,b,rows)
+     def top_before(c,d):
+         ix=position.get(d,0)-1
+         if ix<0:return False,None
+@@ -119,7 +115,7 @@
+             if not links:continue
+             cohort=dict(node,boards=links,board=links[0]['name'],board_id=links[0]['id'],first_board_date=node['date'],own_height=m.get('height'),
+                 active=bool(m['valid'] and m.get('height_exact') and m.get('prior_sealed') and m.get('sealed')),
+-                basis='节点当日首板且共享确认题材；持续跟踪该批次，催化与因果尚待核验')
++                basis='节点当日首板且有共同主营行业或业务主线依据；持续跟踪该批次，催化与因果尚待核验')
+             cohort.pop('members',None);m.setdefault('node_history',[]).append(cohort);node['members'].append(c)
+             # Show current continuing waves, never revive a broken old cohort.
+             tail=[v for v in paths[c] if v['date']>=node['date']]
+@@ -143,6 +139,15 @@
+                 m.setdefault('companions',[]).append(relation);m['roles'].append('伴生关系观察')
+                 if m['valid']:m['eligible']=True
+     for c,m in models.items():
++        halt=H.halt_on(evidence,c,day)
++        if halt and not m['valid'] and not m['suspended_current']:
++            previous=paths[c][-1] if paths[c] else {}
++            last=next((p for p in reversed(paths[c]) if p.get('sealed') is not None),{})
++            m.update(suspended_current=True,suspension=halt,feedback_pct=None,sealed=None,
++                height=previous.get('height'),height_exact=previous.get('exact',False),
++                last_trade_date=last.get('date'),price=(evidence.get('_raw_index',{}).get(c,{}).get(last.get('date')) or {}).get('close'))
++            m['reason']='按缺失规则推定停牌，保留最后成交日与板位；复牌后续接' if halt.get('inferred') else '全天停牌，保留最后成交日与板位'
++        if m.get('suspension',{}).get('inferred'):m['events'].append('停牌（按缺失规则推定）')
+         m['history']=[dict(p,close=m.get('price') if p['date']==day and m['valid'] else (evidence.get('_raw_index',{}).get(c,{}).get(p['date']) or {}).get('close')) for p in paths[c][-P['history_days']:]]
+         notices=[n for n in reg.get('notices',[]) if c in n['codes']]
+         m['regulation']=dict(notices=[{k:v for k,v in n.items() if k!='text'} for n in notices],covered=c in reg.get('covered_codes',[]))
+--- before/relay_history.py
++++ after/relay_history.py
+@@ -45,6 +45,10 @@
+         start=str(r.get('SUSPEND_START_TIME') or '');end=str(r.get('SUSPEND_END_TIME') or '')
+         if start and start<=day+' 09:30:00' and (not end or end>=day+' 15:00:00'):
+             return dict(start=start,end=end or None,reason=r.get('SUSPEND_REASON'),source=record['source'],verified_day=day)
++    assumed=(evidence.get('inferred_halts') or {}).get(code)
++    if assumed and assumed.get('day')==day:
++        return dict(start=day,end=None,reason=assumed.get('basis'),source='missing_quote_retry_policy',
++            verified_day=day,inferred=True,known_at=assumed.get('checked_at'))
+     return None
+ 
+ 
+@@ -102,7 +106,12 @@
+     if halt:
+         if bar and bar.get('volume',0)>0:return None,'停牌表与实际成交日线冲突',False
+         return None,'全天停牌，已完成板位保留且不增长',True
+-    if not bar or not ref:return None,'原价日线或每日涨跌额参考未覆盖',False
++    if not bar or bar.get('volume')==0:
++        return None,'缺失交易日按停牌处理，保留上一有效成交日板位',True
++    if not ref:
++        prior=[b for d,b in raw.items() if d<day and intraday._valid_historical_price_bar(b) and b.get('volume',0)>0]
++        if not prior:return None,'尚无前一有效成交日参考价',False
++        ref=dict(bar,reference_close=max(prior,key=lambda b:b['date'])['close'])
+     if not intraday._valid_historical_price_bar(bar) or not bar.get('volume',0)>0 or not ref.get('volume',0)>0:return None,'无可核验成交日线',False
+     if any(D.tick(bar[k])!=D.tick(ref[k]) for k in ('open','high','low','close')):return None,'两来源原价OHLC不一致',False
+     if sum(b['date']<day and b.get('volume',0)>0 for b in raw.values())<5:return None,'上市初期涨跌幅制度待核验',False
+--- before/scoring.py
++++ after/scoring.py
+@@ -133,6 +133,9 @@
+         raise DataNotReady("本轮集合竞价报价时间明显落后；保留上一完成日结果")
+ 
+     snap = dict(previous_snapshot)
++    snap.pop('reference_view',None)
++    snap.pop('scan_performance',None)
++    snap.pop('kline_acquisition',None)
+     auction_phase = df.session_label(captured_at)
+     snap.update(session=auction_phase, mode="auction",
+                 scan_started_at=scan_started_at.isoformat(sep=" ", timespec="seconds"),
+@@ -273,9 +276,16 @@
+     price_only.sanitize(snap)
+     snap["close_refresh_version"] = CLOSE_REFRESH_VERSION
+     radar.build_opportunities(snap,quotes,pool,{},formal,calendar,previous_snapshot,persist=True)
+-    ma_trend.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch_minutes=False)
+     import emotion_relay
+-    emotion_relay.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch=False,persist=False)
++    import completed_reference
++    if completed_reference.usable(previous_snapshot):
++        snap['reference_view']=dict(kind='completed_before_open',asof=previous_snapshot['strength_model']['asof'],
++            checked_at=str(captured_at),source_quote_at=previous_snapshot['market_strength']['close_verification'].get('source_at'),
++            label='竞价报价独立展示；趋势及接力沿用上一完成日结果，正式开盘后重新核算')
++    else:
++        ma_trend.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch_minutes=False)
++        emotion_relay.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch=False,persist=False)
++    board_center.attach_auction(snap)
+     config.atomic_write_text(config.SNAPSHOT_JSON,
+                              json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     print(f"[RUN] 集合竞价有效报价 {len(observed)}/{len(codes)}；沿用完成日线与收盘名单")
+@@ -920,7 +930,10 @@
+     if snap["session"] in ("集合竞价", "竞价结束"):
+         return _auction_snapshot(previous_snapshot, mode, scan_started_at, boundary)
+     if snap["session"] == "盘前":
+-        raise DataNotReady("盘前尚无当日竞价报价；保留上一完成日结果")
++        import completed_reference
++        snap=completed_reference.build(previous_snapshot,scan_started_at,mode)
++        config.atomic_write_text(config.SNAPSHOT_JSON,json.dumps(snap,ensure_ascii=False,separators=(',',':')))
++        return snap
+ 
+     # 1. 股票池
+     pool = df.build_pool(force=rebuild_pool)
+@@ -946,6 +959,7 @@
+                           .isoformat(sep=" ", timespec="seconds")
+                           if intraday.parse_quote_timestamp(q.get("ts"), quote_capture_at) else None)
+     snap["quote_capture_at"] = quote_capture_at.isoformat(sep=" ", timespec="seconds")
++    snap['data_availability']={c:q['data_availability'] for c,q in quotes.items() if q.get('data_availability')}
+     intraday.intraday_path.save_acquisition(intraday.HISTORY_DIR, quotes, quote_capture_at, snap['session'], boundary)
+     print(f"[RUN] 行情 {len(quotes)} 只")
+     if boundary in ("midday", "close"):
+--- before/serve.py
++++ after/serve.py
+@@ -299,7 +299,10 @@
+         scan_seconds = time.monotonic()-started
+         scan_cache.PROGRESS.update(active=True, stage='页面发布')
+         publish_outputs(snapshot)
+-        source_at = intraday.parse_quote_timestamp((snapshot.get('intraday_model') or {}).get('latest_valid_quote_at'))
++        quote_model=snapshot.get('intraday_model') or {}
++        source_at = intraday.parse_quote_timestamp(quote_model.get('auction_latest_quote_at')
++            if snapshot.get('session') in ('集合竞价','竞价结束') else
++            (snapshot.get('reference_view') or {}).get('source_quote_at') or quote_model.get('latest_valid_quote_at'))
+         INIT['last_pipeline_performance'] = dict(version=scan_cache.VERSION,
+             seconds=round(time.monotonic()-started, 3), scan_seconds=round(scan_seconds, 3),
+             publish_seconds=round(time.monotonic()-started-scan_seconds, 3),
+@@ -520,7 +523,7 @@
+             now = datetime.now()
+             close_pending = (now.weekday() < 5 and now.hour*60+now.minute >= 15*60+5
+                              and not close_review_done(now, snapshot if matches else {}))
+-            if not matches or close_pending:
++            if not matches or close_pending or scoring.df.session_label(now)=='盘前':
+                 print("[INIT] 本地快照与已加载模型不一致，先完成一次新版扫描 ...")
+                 scan_and_publish(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")
+             else:
+@@ -531,6 +534,20 @@
+         INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+         INIT["last_scan_error"] = None
+         print(f"[INIT] 就绪（耗时 {time.time() - t0:.0f} 秒）")
++    except scoring.DataNotReady as e:
++        # An expected data boundary must not turn a usable prior page into an error.
++        if snapshot.get('stocks') or snapshot.get('coverage_catalog'):
++            try:
++                publish_outputs(snapshot)
++                INIT.update(phase='ready',error=None,last_scan_ok=None,last_scan_error=None,
++                            last_scan_note=str(e),last_scan=datetime.now().isoformat(timespec='seconds'))
++            except Exception as publish_error:
++                INIT.update(phase='error',error=f'{type(publish_error).__name__}: {publish_error}',
++                    last_scan_ok=False,last_scan_error=f'{type(publish_error).__name__}: {publish_error}')
++                traceback.print_exc()
++        else:
++            INIT.update(phase='waiting_data',error=None,last_scan_ok=None,last_scan_error=None,last_scan_note=str(e))
++        print(f"[INIT] 等待当日数据，保留已完成结果：{e}")
+     except Exception as e:
+         INIT["phase"] = "error"
+         INIT["error"] = f"{type(e).__name__}: {e}"
+@@ -798,7 +815,8 @@
+ 
+     def _send_init_page(self):
+         phase = INIT["phase"]
+-        err = f"错误：{INIT['error']}" if phase == "error" else "首次全量扫描约 3-5 分钟"
++        err = (f"错误：{INIT['error']}" if phase == "error" else
++               "暂无上一完成日结果，等待当日竞价数据" if phase=='waiting_data' else "首次全量扫描约 3-5 分钟")
+         html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+ <meta http-equiv="refresh" content="5">
+ <title>股票监测 · 初始化中</title>
+--- before/session_context.py
++++ after/session_context.py
+@@ -10,7 +10,7 @@
+ import stock_strength
+ import history_reference
+ 
+-VERSION='收盘衔接与竞价观察3'
++VERSION='收盘衔接与竞价观察4-有效样本'
+ ATR_METHOD='ATR20-SMA：20个含跳空的真实波幅简单平均'
+ 
+ def close_baseline(day):
+@@ -97,7 +97,7 @@
+         code=row['code'];q=dict(quotes.get(code) or {})
+         at,issue=live_quote(q,now,session)
+         basis=contexts.get(code) or intraday.align_price_basis(q,series.get(code,[]),calendar,
+-                    observation_day=now.date().isoformat(),quote_at=at)
++                    observation_day=now.date().isoformat(),quote_at=at,allow_partial=True)
+         prior=baseline.get(code)
+         item=dict(version=VERSION,code=code,name=row.get('name',code),stage=session,
+                   previous_close_asof=previous_day,previous_close_board=bool(prior),background_asof=day,
+@@ -133,6 +133,11 @@
+                     gap_pct=(price/close-1)*100,gap_atr=(price-close)/a if intraday._positive(a) else None,
+                     ma10=basis['daily_ma'][10],ma20=basis['daily_ma'][20])
+         ma=basis['provisional_ma']
++        if len(bars)<20 or not all(intraday._positive(ma.get(n)) for n in (5,10,20)) or not intraday._positive(basis['daily_ma'].get(20)):
++            item.update(partial_history=True,available_ma={str(n):ma.get(n) for n in (5,10,20)},
++                label=('竞价' if auction else '当日')+'价格观察 · '+str(len(bars))+'根有效日线',
++                current_label='有效样本观察',reason='按已有有效成交日展示；尚未形成的均线周期不参与比较')
++            continue
+         trend=bool(ma[5]>ma[10]>ma[20] and ma[20]>basis['daily_ma'][20] and price>=ma[10])
+         item['provisional_trend']=trend
+         returns[code]={n:(price/bars[-n]['close']-1)*100 for n in (5,10,20)}
+@@ -185,7 +190,7 @@
+     auction_rows.sort(key=lambda i:(not i['monitor_candidate'],bool(i['risks']),-(i['price_attack_score'] or 0),i['code']))
+     model=dict(version=VERSION,day=now.date().isoformat(),previous_close_asof=previous_day,background_asof=day,
+                observed_at=observed_at,stage=session,price_judged_count=sum(i['quote_valid'] for i in items),
+-               structure_judged_count=sum(i['quote_valid'] and i['price_basis_valid'] for i in items),
++               structure_judged_count=sum(i['quote_valid'] and i['price_basis_valid'] and not i.get('partial_history') for i in items),
+                states=dict(Counter(i['label'] for i in items)),auction_rows=auction_rows,
+                auction_candidate_count=sum(i['monitor_candidate'] for i in auction_rows),
+                note='前一完成日及真实收盘留档衔接当日报价；竞价价格判断自9:15开始，量价确认使用正式成交证据')
+--- before/stock_rank_ui.js
++++ after/stock_rank_ui.js
+@@ -1,5 +1,7 @@
+ /* Complete member ranks and shared explanations. Numeric ranks come from backend. */
+ var MS_EXPLANATIONS={
++ '有效样本观察':'展示全部真实日线，能形成完整周期的均线正常计算；尚未凑足周期的指标留空，不补造历史或价格。',
++ '停牌观察':'同批其他股票有当日成交，本股单独重试后仍未获取到当日成交，按缺失规则推定停牌，保留最后有效阶段，复牌后继续。',
+  'MA10跟踪':'涨停收复候选以MA10为防守位继续观察，尚未确认正式均线趋势。连续15个交易分钟未收回、正式收盘失守或明显破位时失效；午休不计时。',
+  '涨停收复':'旧波段已经结束，完成日收盘封住涨停，重新站上MA5及MA10且两线向上，前一日曾低于至少一条线。独立的新启动候选事件，不要求突破前20日高点，量比单独展示，不直接算作合格趋势。仅展示最新一轮、含当前交易日在内最近5个交易日仍有效的候选；MA10失守、正式确认、过期及数据待核验时隐藏标签。',
+  '涨停收复·新启动候选':'完成日涨停收复已成立，继续跟踪候选MA10；尚未通过现有强势入口，不计入三阶段有效观察。候选日期与历史波段起点分别记录。',
+@@ -24,7 +26,7 @@
+  'MA10失守·MA20平台观察':'MA10已有效失守，但失守前已有合格高位横盘平台；使用锁定平台底部防守。',
+  '底部反弹·再启动观察':'当前出现符合0.3 ATR门槛的底部反弹，进入再启动观察；平台上沿突破另行标注。',
+  '支撑过程待核验':'价格触及或失守防守位，但连续分钟没有完整覆盖，暂不能证明15分钟修复或失效。',
+- '日线待更新':'最新完成交易日尚未被历史日线覆盖，暂停相关均线判断。',
++ '日线待更新':'历史缺失交易日按停牌处理，使用实际取得的有效成交日继续判断；仅真实价格口径冲突暂停计算。',
+  '报价待核验':'报价时间、批次、有效价格或最新性尚未通过核验。',
+  '价格口径待核验':'现价与历史日线的复权、日期或来源口径尚未确认，暂停均线比较。',
+  '平台观察到期':'横盘超过固定20个交易日窗口，原平台不再作为当前再启动观察。',
+--- before/test_chart_latest.py
++++ after/test_chart_latest.py
+@@ -1,6 +1,8 @@
+ """Latest displayed candles cannot change scores, leak closing data or mix price scales."""
+ import copy
+ import gc
++import gzip
++import json
+ import sqlite3
+ import unittest
+ from contextlib import closing
+@@ -10,6 +12,7 @@
+ 
+ import config
+ import ui_payload
++import intraday
+ 
+ 
+ def fixture():
+@@ -41,6 +44,37 @@
+     def project(self, data):
+         with patch.object(config, 'KLINE_DB', self.db):
+             return ui_payload.chart_projection(data)['stocks'][0]
++
++    def test_short_history_draws_latest_quote_without_claiming_ma20_is_available(self):
++        data=fixture();row=data['stocks'][0];row['market_strength']['price_context']={'valid':False}
++        row.update(last_close=101.,last_close_semantics='previous_trade_day_raw_close',
++                   price_basis='raw',price_basis_source='tencent_realtime_quote')
++        for b in row['strength_history']:b.update(price_basis='qfq',price_basis_source='tencent_qfqday')
++        original=copy.deepcopy(data);shown=self.project(data)
++        self.assertEqual(shown['chart_history'][-1]['date'],'2026-10-13')
++        self.assertEqual(shown['chart_history'][-1]['close'],108.)
++        self.assertEqual(len(shown['chart_history']),4);self.assertEqual(data,original)
++        self.assertFalse(shown['market_strength']['price_context']['valid'])
++
++    def test_coverage_chart_recovers_only_exact_batch_quote_metadata(self):
++        data=fixture();row=data['stocks'][0]
++        row['market_strength']['price_context']={'valid':False}
++        row.update(last_close=101.)
++        for b in row['strength_history']:b.update(price_basis='qfq',price_basis_source='tencent_qfqday')
++        raw=dict(row,quote_at=row['market_strength']['quote_at'],last_close_semantics='previous_trade_day_raw_close',
++                 price_basis='raw',price_basis_source='tencent_realtime_quote')
++        row.pop('volume_shou')
++        folder=Path(self.tmp.name)/'acquisitions';folder.mkdir()
++        with gzip.open(folder/'2026-10-13.jsonl.gz','wt',encoding='utf-8') as stream:
++            stream.write(json.dumps(dict(captured_at=data['quote_capture_at'],fields=list(raw),rows=[list(raw.values())]))+'\n')
++        original=copy.deepcopy(data)
++        with patch.object(intraday,'HISTORY_DIR',Path(self.tmp.name)):
++            shown=self.project(data)
++            self.assertEqual(shown['chart_history'][-1]['date'],'2026-10-13')
++            self.assertEqual(shown['chart_history'][-1]['volume'],12300.)
++            self.assertEqual(data,original)
++            data['quote_capture_at']='2026-10-13 10:00:31'
++            self.assertNotIn('chart_history',self.project(data))
+ 
+     def test_intraday_uses_actual_quote_not_later_database_close_and_leaves_scores_untouched(self):
+         data = fixture(); frozen = copy.deepcopy(data)
+--- before/test_ma_trend.py
++++ after/test_ma_trend.py
+@@ -140,9 +140,10 @@
+         self.assertEqual(after['platform']['low'],before['platform']['low'])
+         self.assertEqual(after['platform']['formed_at'],before['platform']['formed_at'])
+ 
+-    def test_latest_completed_history_is_required(self):
++    def test_missing_last_session_still_checks_real_last_close_comparability(self):
+         f=sample();f[3][next(iter(f[3]))].pop();m=run(f)
+-        self.assertFalse(m['eligible']);self.assertEqual(m['status'],'日线待更新')
++        self.assertFalse(m['eligible']);self.assertEqual(m['status'],'价格口径待核验')
++        self.assertTrue(m['history_observation']['suspension_days'])
+ 
+     def test_stale_quote_cannot_enter_current_observation(self):
+         f=sample();f[1][next(iter(f[1]))]['quote_at']=str(f[5]-timedelta(minutes=11))
+@@ -213,8 +214,9 @@
+         line=ctx['thresholds'][5];f[1][code].update(price=line-.1*ctx['atr20'],low=line-.2*ctx['atr20'],high=106.)
+         m=run(f);self.assertFalse(m['eligible']);self.assertTrue(m['pending']);self.assertIsNone(m['exit_at'])
+ 
+-    def test_history_gap_is_unknown_not_weak(self):
+-        f=sample();f[3][next(iter(f[3]))].pop(-8);m=run(f);self.assertTrue(m['pending']);self.assertFalse(m['eligible'])
++    def test_history_gap_is_suspension_and_actual_bars_continue(self):
++        f=sample();f[3][next(iter(f[3]))].pop(-8);m=run(f);self.assertFalse(m['pending'])
++        self.assertEqual(len(m['history_observation']['suspension_days']),1)
+ 
+     def test_auction_does_not_make_new_origin(self):
+         f=sample();f[0]['session']='集合竞价';m=run(f);self.assertFalse(m['eligible']);self.assertIsNone(m['origin'])
+--- before/test_price_basis.py
++++ after/test_price_basis.py
+@@ -134,7 +134,7 @@
+ 
+         calendar = [bar["date"] for bar in source]
+         cases = []
+-        cases.append(("21根日期缺口", source[1:], "ATR所需21根历史K线存在应有交易日缺口"))
++        cases.append(("有效成交日不足21根", source[1:], "ATR所需21个应有交易日不足"))
+ 
+         unknown_source = [dict(bar) for bar in source]
+         unknown_source[0]["price_basis_source"] = "unknown_history"
+@@ -278,13 +278,13 @@
+         too_far = dict(q, last_close=94.0)
+         self.assertIn("超过5.0%异常限制", self.context(too_far)["reason"])
+ 
+-    def test_last_history_bar_must_be_previous_trade_day_not_calendar_yesterday(self):
++    def test_last_observed_trade_can_precede_market_previous_session(self):
+         bars = history()
+         calendar = [bar["date"] for bar in bars] + ["2026-09-28"]
+         q = quote(at="2026-09-29 10:00:00")
+         result = self.context(q, bars, day="2026-09-29", calendar=calendar)
+-        self.assertFalse(result["valid"])
+-        self.assertIn("不是报价日前一交易日2026-09-28", result["reason"])
++        self.assertTrue(result['valid'],result['reason'])
++        self.assertEqual(result['history_observation']['suspension_days'],['2026-09-28'])
+ 
+     def test_quote_day_bar_is_excluded_even_if_daily_close_was_written(self):
+         bars = history()
+@@ -300,12 +300,12 @@
+         self.assertTrue(all(bar["date"] < "2026-09-28" for bar in result["aligned_bars"]))
+         self.assertAlmostEqual(99.0, result["aligned_bars"][-1]["close"], places=12)
+ 
+-    def test_window_hole_and_duplicate_date_wait(self):
++    def test_window_hole_is_suspension_but_duplicate_still_fails(self):
+         bars = history()
+         missing = bars[:10] + bars[11:]
+         full_calendar = [bar["date"] for bar in bars]
+-        self.assertIn("历史窗口缺口",
+-                      self.context(quote(), missing, calendar=full_calendar)["reason"])
++        result=self.context(quote(),missing,calendar=full_calendar)
++        self.assertTrue(result['valid']);self.assertEqual(result['history_observation']['suspension_days'],[full_calendar[10]])
+         duplicate = bars + [dict(bars[-1])]
+         self.assertIn("历史K线日期重复", self.context(quote(), duplicate)["reason"])
+ 
+--- before/test_relay_cycles.py
++++ after/test_relay_cycles.py
+@@ -6,7 +6,7 @@
+ 
+ def fixture():
+     days=['2026-09-%02d'%d for d in range(1,16)]
+-    codes=['600001','000002','600003'];rows={c:dict(name=c) for c in codes};paths={}
++    codes=['600001','000002','600003'];rows={c:dict(name=c,industry=['共同主营行业']) for c in codes};paths={}
+     for c in codes:
+         paths[c]=[dict(date=d,sealed=False,height=0,exact=True,halted=False,reason=None) for d in days]
+     for i in range(3,13):paths[codes[0]][i].update(sealed=True,height=i-2)
+@@ -59,7 +59,9 @@
+         self.assertEqual(len([n for n in C.attach(*f)['nodes'] if n['kind']=='regulation']),1)
+ 
+     def test_generic_huge_theme_does_not_authorize_relationship(self):
+-        f=fixture();f[3][0]['member_codes'] +=['X'+str(i) for i in range(310)];C.attach(*f)
++        f=fixture()
++        for c,r in f[0].items():r['industry']=[c+'不同主营行业']
++        f[3][0]['member_codes'] +=['X'+str(i) for i in range(310)];C.attach(*f)
+         self.assertFalse(f[1]['000002']['continuation'])
+ 
+     def test_companion_needs_start_proximity_and_repeated_overlap(self):
+@@ -124,11 +126,12 @@
+             self.assertIsNone(H.close_proof(s,quote,bars,cal,now),change)
+         missing=cal[-10];bars=[b for b in h[c] if b['date']!=missing]
+         with patch.object(R,'load',return_value=dict(suspension_intervals=[])):
+-            self.assertIsNone(H.close_proof(s,q[c],bars,cal,now,code=c))
++            proof=H.close_proof(s,q[c],bars,cal,now,code=c)
++            self.assertIsNotNone(proof);self.assertEqual(proof['inferred_suspension_days'],[missing])
+         halt=dict(code=c,start=missing,resume=cal[cal.index(missing)+1],reason='公司停牌公告',source='https://issuer.test/halt')
+         with patch.object(R,'load',return_value=dict(suspension_intervals=[halt])):
+             proof=H.close_proof(s,q[c],bars,cal,now,code=c)
+-        self.assertIsNotNone(proof);self.assertEqual(proof['verified_suspension_days'],[missing])
++        self.assertIsNotNone(proof);self.assertEqual(proof['inferred_suspension_days'],[missing])
+ 
+     def test_full_formal_close_keeps_paused_core_and_updates_its_market_window(self):
+         from test_emotion_relay import sample,run
+--- before/test_session_context.py
++++ after/test_session_context.py
+@@ -26,6 +26,14 @@
+         self.assertEqual(c['label'],'强股竞价承接');self.assertTrue(c['previous_close_board'])
+         self.assertIsNotNone(c['gap_atr']);self.assertIsNotNone(c['price_attack_score'])
+         self.assertIn('不能确认量价突破',c['reason']);self.assertEqual(m['structure_judged_count'],1)
++
++    def test_short_history_keeps_price_and_available_mas_without_empty_comparison(self):
++        for n in (1,7,15):
++            c,m=self.build(bars=history([80+i for i in range(21)])[-n:])
++            self.assertTrue(c['quote_valid']);self.assertTrue(c['partial_history'])
++            self.assertIsNone(c['provisional_trend']);self.assertIsNone(c['available_ma']['20'])
++            self.assertIn('有效日线',c['label']);self.assertIsNone(c['price_attack_score'])
++            self.assertEqual(m['structure_judged_count'],0)
+ 
+     def test_below_yesterday_ma20_is_weakened_even_if_yesterday_strong(self):
+         c,_=self.build(80)
+--- before/ui_payload.py
++++ after/ui_payload.py
+@@ -214,6 +214,32 @@
+     if not captured:
+         return full
+     day = captured.date().isoformat()
++    archived_quotes = None
++
++    def display_quote(row, at):
++        """Recover omitted display fields from this generation's exact raw batch."""
++        nonlocal archived_quotes
++        if row.get('last_close_semantics') and row.get('price_basis_source'):
++            return row
++        if archived_quotes is None:
++            archived_quotes = {}
++            path = intraday.HISTORY_DIR / 'acquisitions' / (day + '.jsonl.gz')
++            if path.is_file():
++                try:
++                    with gzip.open(path, 'rt', encoding='utf-8') as stream:
++                        for line in stream:
++                            record = json.loads(line)
++                            if record.get('captured_at') == full.get('quote_capture_at'):
++                                archived_quotes = {values[0]: dict(zip(record['fields'], values))
++                                                   for values in record['rows']}
++                                break
++                except (OSError, EOFError, ValueError, KeyError):
++                    archived_quotes = {}
++        quote = archived_quotes.get(row.get('code')) or {}
++        if (intraday.parse_quote_timestamp(quote.get('quote_at')) != at
++                or any(quote.get(k) != row.get(k) for k in ('price','open','high','low','last_close'))):
++            return row
++        return dict(row, **quote)
+     # A later database update must not turn an intraday generation into a closing chart.
+     formal = (full.get('session') == '已收盘' and captured.hour >= 15 and verified is not None
+               and verified.date() == captured.date() and verified.hour >= 15 and verified <= captured)
+@@ -236,6 +262,17 @@
+             at = intraday.parse_quote_timestamp(model.get('quote_at'))
+             bars = row.get('strength_history') or []
+             prior = [b for b in bars if b.get('date') and b['date'] < day]
++            quote = row
++            # Display scaling does not require a full MA20 window. A valid
++            # current quote plus trusted observed bars can draw a short chart.
++            if not context.get('valid') and at and prior:
++                quote = display_quote(row, at)
++                display=intraday.align_price_basis(dict(quote,quote_at=str(at)),prior,
++                    [b['date'] for b in prior],observation_day=day,quote_at=str(at),allow_partial=True)
++                if display.get('valid'):
++                    factor=display['scale_factor'];context=display
++                    prior=[dict(b,**{k:b[k]*factor for k in ('open','high','low','close')}) for b in prior if valid(b)]
++                    bars=prior
+             if (not context.get('valid') or not at or at.date() != captured.date()
+                     or at > captured or context.get('quote_day') != day or not bars
+                     or not prior or context.get('last_history_date') != prior[-1].get('date')):
+@@ -250,7 +287,7 @@
+                 bar = dict(bar, **{k: bar[k] * factor for k in ('open', 'high', 'low', 'close')})
+                 source = 'formal_daily'
+             else:
+-                volume = row.get('volume_shou')
++                volume = quote.get('volume_shou')
+                 bar = dict(date=day, open=row.get('open'), high=row.get('high'), low=row.get('low'),
+                            close=row.get('price'), volume=volume * 100 if number(volume) and volume >= 0 else None)
+             if not valid(bar):
+@@ -261,6 +298,9 @@
+             by_date[day] = dict(bar, aligned_price_basis='quote_scale')
+             item = dict(row, chart_history=[by_date[d] for d in sorted(by_date)][-61:],
+                         chart_source=source, chart_at=at.isoformat(sep=' ', timespec='seconds'))
++            if row.get('chart_observation'):
++                item['chart_observation']=dict(row['chart_observation'],suspension_days=[
++                    d for d in row['chart_observation'].get('suspension_days',[]) if d!=day])
+             projected.append(item)
+         if group in full:
+             result[group] = projected
+--- /dev/null
++++ after/observed_history.py
+@@ -0,0 +1,34 @@
++"""Observed trading sessions. Calendar gaps are suspension assumptions, never candles."""
++import math
++
++VERSION='observed-sessions-2026-10-15.1'
++
++def positive(v):
++    return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and v>0
++
++def valid_bar(b):
++    return (all(positive(b.get(k)) for k in ('open','high','low','close'))
++        and b['low']<=min(b['open'],b['close'])<=max(b['open'],b['close'])<=b['high'])
++
++def traded_bars(bars):
++    """A zero-volume placeholder is a nontrading session, not an observed candle."""
++    return [b for b in bars if b.get('volume')!=0]
++
++def gaps(bars,calendar,through=None):
++    dates=sorted({b['date'] for b in bars if b.get('date') and valid_bar(b)})
++    if not dates:return []
++    end=through or dates[-1];known=set(dates)
++    return [d for d in calendar if dates[0]<=d<=end and d not in known]
++
++def annotation(bars,calendar,through=None):
++    missing=gaps(bars,calendar,through)
++    return dict(version=VERSION,observed_days=len(bars),suspension_days=missing,
++        inferred=True,basis='缺失交易日按停牌处理；均线及波段仅使用有效成交日，不补造OHLC')
++
++def quote_traded(q,day):
++    stamp=str(q.get('quote_at') or q.get('ts') or '').replace('-','').replace(' ','').replace(':','')
++    return (stamp.startswith(day.replace('-','')) and all(positive(q.get(k)) for k in ('price','open','high','low'))
++        and (positive(q.get('volume_shou')) or positive(q.get('amount_wan'))))
++
++def inferred_quote_halt(q):
++    return (q.get('data_availability') or {}).get('kind')=='inferred_suspension'
+--- /dev/null
++++ after/relay_relations.py
+@@ -0,0 +1,22 @@
++"""Main business directions only; incidental common concept membership is insufficient."""
++def industries(row):
++    values=row.get('industry') or []
++    if isinstance(values,str):values=[values]
++    return {v for v in values+[row.get('primary_industry')] if v and v not in ('其他','综合','未知')}
++
++def shared(a,b,rows):
++    left=rows.get(a) or {};right=rows.get(b) or {}
++    common=sorted(industries(left)&industries(right))
++    result=[dict(id='main_industry:'+name,name=name,kind='main_industry',
++        basis='双方同花顺F10主营行业共同归属：'+name,source='同花顺个股F10') for name in common]
++    # Cross-industry concepts require dated business evidence on BOTH issuers.
++    # The catalogue itself does not provide concept primacy, and ordering is not evidence.
++    def primary(row):
++        return {v['name']:v for v in row.get('mainline_concept_evidence',[])
++            if isinstance(v,dict) and v.get('name') and v.get('source') and v.get('business_basis') and v.get('verified') is True}
++    l=primary(left);r=primary(right)
++    for name in sorted(set(l)&set(r)):
++        result.append(dict(id='main_concept:'+name,name=name,kind='main_concept',
++            basis='双方主营业务对应共同主线；'+l[name]['business_basis']+'；'+r[name]['business_basis'],
++            sources=[l[name]['source'],r[name]['source']]))
++    return result
+--- /dev/null
++++ after/completed_reference.py
+@@ -0,0 +1,68 @@
++"""Preopen view: replay completed local evidence, preserving the source clocks."""
++import copy,gzip,json
++from contextlib import closing
++from datetime import datetime
++import config
++
++def usable(previous):
++    import market_strength as M,ma_trend as T,emotion_relay as E
++    day=(previous.get('strength_model') or {}).get('asof')
++    return bool(day and (previous.get('market_strength') or {}).get('close_verification',{}).get('date')==day
++        and (previous.get('emotion_relay') or {}).get('mode')=='正式收盘'
++        and all((previous.get(name) or {}).get('implementation_hash')==mod.IMPLEMENTATION_HASH
++            for name,mod in [('market_strength',M),('ma_trend',T),('emotion_relay',E)]))
++
++
++def latest_acquisition(day,before):
++    path=config.CACHE_DIR/'intraday_history'/'acquisitions'/(day+'.jsonl.gz')
++    selected=None
++    try:
++        with gzip.open(path,'rt',encoding='utf-8') as stream:
++            for line in stream:
++                try:
++                    r=json.loads(line);at=datetime.fromisoformat(r['captured_at'])
++                    if at.date().isoformat()!=day or at>before or r.get('session')!='已收盘':continue
++                    if selected is None or r['captured_at']>selected['captured_at']:selected=r
++                except (ValueError,KeyError,TypeError):continue
++    except FileNotFoundError:pass
++    return selected
++
++
++def build(previous,now,mode='quick'):
++    import datafeed as df,strength,intraday,market_strength as M,ma_trend as T,emotion_relay as E,relay_history as H
++    if not previous.get('stocks') and not previous.get('coverage_catalog'):
++        from scoring import DataNotReady
++        raise DataNotReady('盘前暂无上一完成日结果，等待交易数据')
++    snap=copy.deepcopy(previous)
++    day=(snap.get('strength_model') or {}).get('asof') or str(snap.get('quote_capture_at') or '')[:10]
++    migration=any((snap.get(name) or {}).get('implementation_hash')!=mod.IMPLEMENTATION_HASH
++        for name,mod in [('market_strength',M),('ma_trend',T),('emotion_relay',E)])
++    if migration:
++        rows=snap.get('stocks',[])+snap.get('coverage_catalog',[]);pool={r['code']:r for r in rows}
++        record=latest_acquisition(day,now)
++        capture=record['captured_at'] if record else snap.get('quote_capture_at')
++        at=datetime.fromisoformat(capture)
++        if record:
++            q={v[0]:dict(zip(record['fields'][1:],v[1:])) for v in record['rows'] if v[0] in pool}
++        else:q=copy.deepcopy((snap.get('market_strength_close_input') or {}).get('quotes') or {})
++        if not q:
++            from scoring import DataNotReady
++            raise DataNotReady('盘前模型更新所需的上一完成日原始记录未覆盖；保留历史页面')
++        with closing(df.db()) as con:h={c:df.load_kline(con,'kline','code',c,limit=160) for c in pool}
++        calendar=strength.trading_calendar(h)
++        snap.update(session='已收盘',quote_capture_at=capture)
++        snap['data_availability']={c:v['data_availability'] for c,v in q.items() if v.get('data_availability')}
++        for r in rows:r.update(copy.deepcopy(q.get(r['code']) or {}))
++        print('[PREOPEN] 用'+day+'完成日及原始收市记录更新模型，保留原报价时刻',flush=True)
++        M.attach(snap,q,pool,h,calendar,now=at);M.validate(snap)
++        T.attach(snap,q,pool,h,calendar,now=at,fetch_minutes=False,minute_data={});T.validate(snap)
++        dates=[d for d in calendar if d<day];replay=dates[-(config.EMOTION_RELAY['history_days']+config.EMOTION_RELAY['warmup_days']):]
++        evidence=H.load(pool,replay,dates,day,fetch=False)
++        E.attach(snap,q,pool,h,calendar,now=at,evidence=evidence,fetch=False,persist=False);E.validate(snap)
++    snap.update(session='盘前',mode='preopen_reference',scan_started_at=str(now),scan_completed_at=str(now),generated_at=str(now))
++    snap.pop('scan_performance',None)
++    snap.pop('kline_acquisition',None)
++    snap['reference_view']=dict(kind='preopen',asof=day,checked_at=str(now),model_replayed=migration,
++        source_quote_at=(snap.get('market_strength') or {}).get('close_verification',{}).get('source_at') or snap.get('quote_capture_at'),
++        label='盘前 · 沿用上一完成日结果；9:15后接入当日竞价')
++    return snap
+--- /dev/null
++++ after/test_observed_history.py
+@@ -0,0 +1,101 @@
++import copy,unittest
++from datetime import datetime
++from unittest.mock import patch
++import datafeed,intraday,ma_trend,make_dashboard,relay_relations,relay_history as H,emotion_relay as E
++from test_price_basis import history,quote
++
++class ObservedHistory(unittest.TestCase):
++    def test_gap_uses_actual_last_twenty_bars_without_synthetic_prices(self):
++        bars=history();full=[b['date'] for b in bars];missing=full[10];bars.pop(10)
++        original=copy.deepcopy(bars)
++        ctx=intraday.align_price_basis(quote(),bars,full,'2026-09-28')
++        self.assertTrue(ctx['valid'],ctx['reason']);self.assertEqual(len(ctx['aligned_bars']),20)
++        self.assertEqual(ctx['history_observation']['suspension_days'],[missing])
++        self.assertEqual(bars,original)
++        self.assertAlmostEqual(ctx['daily_ma'][10],99)
++
++    def test_short_history_exposes_real_ma_periods_only(self):
++        bars=history()[-7:];ctx=intraday.align_price_basis(quote(),bars,[b['date'] for b in bars],'2026-09-28',allow_partial=True)
++        self.assertTrue(ctx['valid']);self.assertIsNotNone(ctx['daily_ma'][5]);self.assertIsNone(ctx['daily_ma'][10])
++        self.assertIsNone(ctx['atr20']);m=ma_trend.daily(bars,[b['date'] for b in bars])
++        self.assertFalse(m['pending']);self.assertTrue(m['sample_only'])
++        legacy=intraday.align_price_basis(quote(),bars,[b['date'] for b in bars],'2026-09-28')
++        self.assertFalse(legacy['valid']);self.assertIn('有效成交日',legacy['reason'])
++
++    def test_halted_and_short_stock_keeps_actual_candles(self):
++        bar=history()[-1];row=dict(emotion_relay=dict(suspended_current=True))
++        self.assertTrue(make_dashboard.attach_completed_candles(row,[bar],bar['date']))
++        self.assertEqual(row['chart_history'],[bar])
++
++    def test_zero_volume_placeholder_never_becomes_a_candle(self):
++        bars=history();bars[-2]['volume']=0;row={}
++        self.assertTrue(make_dashboard.attach_completed_candles(row,bars,bars[-1]['date']))
++        self.assertNotIn(bars[-2]['date'],[b['date'] for b in row['chart_history']])
++
++    def test_source_and_ohlc_conflicts_still_reject_despite_gaps(self):
++        for key,value in [('price_basis_source','unknown'),('close',0)]:
++            bars=history();cal=[b['date'] for b in bars];bars.pop(8);bars[-1][key]=value
++            self.assertFalse(intraday.align_price_basis(quote(),bars,cal,'2026-09-28')['valid'])
++
++class MainBusinessRelations(unittest.TestCase):
++    def test_incidental_concepts_do_not_link_ice_machine_to_media_or_feed(self):
++        rows={'a':dict(industry=['通用设备','机械设备']),'b':dict(industry=['出版','传媒']),
++              'c':dict(industry=['饲料','农林牧渔'])}
++        self.assertEqual(relay_relations.shared('a','b',rows),[])
++        self.assertEqual(relay_relations.shared('a','c',rows),[])
++
++    def test_same_main_industry_accepts_media_across_subindustries(self):
++        rows={'a':dict(industry=['出版','传媒']),'b':dict(industry=['影视院线','传媒'])}
++        self.assertEqual([b['name'] for b in relay_relations.shared('a','b',rows)],['传媒'])
++
++    def test_cross_industry_concept_requires_business_evidence_on_both(self):
++        fact=dict(name='实际主线',source='issuer-announcement',business_basis='已披露主营产品',verified=True)
++        rows={'a':dict(mainline_concept_evidence=[fact]),'b':{}}
++        self.assertEqual(relay_relations.shared('a','b',rows),[])
++        rows['b']['mainline_concept_evidence']=[dict(fact)]
++        self.assertEqual(relay_relations.shared('a','b',rows)[0]['kind'],'main_concept')
++
++class QuoteRetry(unittest.TestCase):
++    NOW=datetime(2026,10,15,16)
++    def healthy(self):return dict(price=10,open=10,high=11,low=9,volume_shou=10,ts='20261015150000')
++    def test_isolated_failure_retries_only_that_stock_and_infers_halt(self):
++        with patch.object(datafeed,'tencent_quotes',return_value={}) as fetch:
++            out=datafeed.retry_isolated_quotes(['a','b'],{'a':self.healthy()},self.NOW)
++        fetch.assert_called_once_with(['b']);state=out['b']['data_availability']
++        self.assertEqual(state['kind'],'inferred_suspension');self.assertEqual(state['attempts'],1)
++        self.assertNotIn('price',out['b'])
++
++    def test_retry_recovery_and_later_resume_remove_suspension(self):
++        with patch.object(datafeed,'tencent_quotes',return_value={'b':self.healthy()}):
++            out=datafeed.retry_isolated_quotes(['a','b'],{'a':self.healthy()},self.NOW)
++        self.assertEqual(out['b']['data_availability']['kind'],'retry_recovered')
++        resumed=datafeed.retry_isolated_quotes(['a','b'],{'a':self.healthy(),'b':self.healthy()},self.NOW)
++        self.assertNotIn('data_availability',resumed['b'])
++
++    def test_same_day_old_quote_is_retried_and_auction_is_not_a_live_control(self):
++        now=self.NOW.replace(hour=10,minute=5)
++        live=dict(self.healthy(),ts='20261016100500')
++        # Use the fixture's same date, while varying the actual source clock.
++        live['ts']='20261015100500';old=dict(live,ts='20261015093000')
++        with patch.object(datafeed,'tencent_quotes',return_value={}) as fetch:
++            out=datafeed.retry_isolated_quotes(['a','b'],{'a':live,'b':old},now)
++        fetch.assert_called_once_with(['b']);self.assertEqual(out['b']['data_availability']['kind'],'inferred_suspension')
++        with patch.object(datafeed,'tencent_quotes') as fetch:
++            datafeed.retry_isolated_quotes(['a','b'],{'a':dict(live,ts='20261015092500')},now.replace(hour=9,minute=31))
++        fetch.assert_not_called()
++
++    def test_market_feed_outage_and_preopen_do_not_mark_all_stocks_halted(self):
++        with patch.object(datafeed,'tencent_quotes') as fetch:
++            self.assertEqual(datafeed.retry_isolated_quotes(['a','b'],{},self.NOW),{})
++            out=datafeed.retry_isolated_quotes(['a','b'],{'a':self.healthy()},self.NOW.replace(hour=9,minute=20))
++        fetch.assert_not_called();self.assertNotIn('b',out)
++
++    def test_historical_gap_preserves_board_height_until_actual_break(self):
++        from test_emotion_relay import sample
++        s,q,p,h,cal,now,e=sample();c=next(iter(q));e['reference']={}
++        # Raw/ref numerical cross-check remains required; test the explicit gap alone.
++        e['_raw_index']={c:{}};e['_ref_index']={c:{}}
++        sealed,reason,halted=H.classify(c,cal[-1],cal,e)
++        self.assertTrue(halted);self.assertIsNone(sealed)
++
++if __name__=='__main__':unittest.main()
+--- /dev/null
++++ after/test_preopen_reference.py
+@@ -0,0 +1,50 @@
++import copy,json,tempfile,unittest
++from datetime import datetime
++from pathlib import Path
++from unittest.mock import patch
++import completed_reference as C,config,scoring,serve,market_strength as M,ma_trend as T,emotion_relay as E
++
++def prior():
++    s=dict(session='已收盘',quote_capture_at='2026-10-15 17:27:24',generated_at='2026-10-15 17:33:27',
++        stocks=[dict(code='000530',price=10,change_pct=10)],strength_model=dict(asof='2026-10-15'))
++    for name,mod in [('market_strength',M),('ma_trend',T),('emotion_relay',E)]:s[name]=dict(implementation_hash=mod.IMPLEMENTATION_HASH)
++    return s
++
++class Preopen(unittest.TestCase):
++    def test_nine_ten_reuses_completed_prices_without_fetching_today(self):
++        old=prior();original=copy.deepcopy(old)
++        with patch('datafeed.realtime_quotes') as quote:
++            s=C.build(old,datetime(2026,10,16,9,10))
++        quote.assert_not_called();self.assertEqual(old,original)
++        self.assertEqual(s['stocks'],old['stocks']);self.assertEqual(s['quote_capture_at'],old['quote_capture_at'])
++        self.assertEqual(s['session'],'盘前');self.assertEqual(s['reference_view']['asof'],'2026-10-15')
++        self.assertFalse(s['reference_view']['model_replayed'])
++
++    def test_scoring_preopen_publishes_reference_instead_of_data_not_ready(self):
++        with tempfile.TemporaryDirectory() as d:
++            p=Path(d)/'snapshot.json';p.write_text(json.dumps(prior()),encoding='utf-8')
++            with patch.object(config,'SNAPSHOT_JSON',p),patch.object(scoring.df,'session_label',return_value='盘前'),patch.object(scoring,'datetime') as clock,patch.object(scoring.df,'build_pool') as pool:
++                clock.now.return_value=datetime(2026,10,16,9,10)
++                s=scoring.run(progress=False)
++            pool.assert_not_called();self.assertEqual(s['reference_view']['kind'],'preopen')
++            self.assertEqual(json.loads(p.read_text(encoding='utf-8'))['session'],'盘前')
++
++    def test_initial_not_ready_keeps_usable_page_without_error_status(self):
++        with tempfile.TemporaryDirectory() as d:
++            p=Path(d)/'snapshot.json';p.write_text(json.dumps(prior()),encoding='utf-8')
++            state={}
++            with patch.object(config,'SNAPSHOT_JSON',p),patch.object(serve,'INIT',state),patch.object(serve,'scan_and_publish',side_effect=scoring.DataNotReady('竞价报价尚未发布')),patch.object(serve,'publish_outputs') as publish:
++                serve.init_worker()
++            publish.assert_called_once();self.assertEqual(state['phase'],'ready');self.assertIsNone(state['error'])
++            self.assertIsNone(state['last_scan_error']);self.assertIn('尚未发布',state['last_scan_note'])
++
++    def test_no_history_is_waiting_not_made_up_prices(self):
++        with self.assertRaises(scoring.DataNotReady):C.build({},datetime(2026,10,16,9,10))
++
++    def test_only_verified_same_version_completed_models_can_be_kept_for_auction(self):
++        s=prior();s['market_strength']['close_verification']={'date':'2026-10-15'}
++        s['emotion_relay']['mode']='正式收盘'
++        self.assertTrue(C.usable(s));s['emotion_relay']['implementation_hash']='old'
++        self.assertFalse(C.usable(s))
++
++if __name__=='__main__':unittest.main()

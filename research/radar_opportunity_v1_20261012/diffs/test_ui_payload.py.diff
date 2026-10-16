@@ -1,0 +1,31 @@
+--- before/test_ui_payload.py
++++ test_ui_payload.py
+@@ -84,8 +84,27 @@
+                 result = ui_payload.export_csv(token, ['603867', '600241'], {}).decode('utf-8-sig').splitlines()
+                 self.assertTrue(result[1].startswith('"603867","新华股份"'))
+                 self.assertTrue(result[2].startswith('"600241","时代万恒"'))
+-                self.assertEqual(len(result[0].split(',')), 228)
++                # Existing 228 columns retain their meaning; V1 only appends 11 radar columns.
++                import csv
++                parsed=list(csv.reader(result))
++                self.assertEqual(len(parsed[0]),239)
++                self.assertEqual(parsed[0][228:230],['雷达规则版本','雷达数据版本'])
++                self.assertEqual(parsed[1][229],token)
++                empty=list(csv.reader(ui_payload.export_csv(token,[],{}).decode('utf-8-sig').splitlines()))
++                self.assertEqual(len(empty),1)
++                self.assertEqual(empty[0],parsed[0])
+ 
++
++    def test_current_category_does_not_include_expired_or_unconfirmed_labels(self):
++        import subprocess
++        script="""const fs=require('fs'),vm=require('vm');
++        const ctx={DATA:{radar_opportunity:{lists:{current:['600001','600002']},by_code:{
++          '600001':{code:'600001',current:true,labels:['持续进攻'],opportunity_kinds:['突破启动','持续进攻']},
++          '600002':{code:'600002',current:true,labels:['突破启动'],opportunity_kinds:['突破启动']}}}}};
++        vm.createContext(ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);
++        ctx.RADAR_KIND='突破启动';console.log(JSON.stringify(ctx.radarOpportunityRows('current').map(r=>r.code)));"""
++        actual=subprocess.run(['node','-e',script],cwd=config.ROOT,capture_output=True,text=True,check=True)
++        self.assertEqual(json.loads(actual.stdout),['600002'])
+ 
+ if __name__ == '__main__':
+     unittest.main()

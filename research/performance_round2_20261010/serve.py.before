@@ -1,0 +1,808 @@
+# -*- coding: utf-8 -*-
+"""本地服务 —— 看板 + 盘中自动刷新（加固版）
+
+针对「自动启动后浏览器显示拒绝连接」的四个根因逐一处理：
+  1. 旧版先做 3-5 分钟全量扫描、最后才监听端口 → 改为**先监听、后台初始化**，
+     初始化期间访问看板会返回一个自动刷新的等待页
+  2. Windows 的 SO_REUSEADDR 允许两个进程绑同一端口，旧版单实例判据失效
+     → 关闭 allow_reuse_address，绑不上就先探测是否已有实例（/__ping），
+       是自己的实例就只打开浏览器退出；否则自动换下一个端口
+  3. pythonw 静默启动下没有任何输出，出问题无从排查 → 日志双写 logs/serve.log
+  4. 无处确认服务活没活 → 提供 /__ping（探活）与 /__status（状态 JSON，含 pid）
+
+用法： python serve.py              # 默认端口 8848，自动刷新，打开浏览器
+       python serve.py --no-browser # 静默启动（给自启动/计划任务用）
+       python serve.py --no-loop    # 只起服务，不自动刷新
+"""
+import json
+import gzip
+import html as html_module
+import os
+import sys
+import threading
+import time
+import traceback
+import urllib.request
+from urllib.parse import urlsplit, parse_qs
+import webbrowser
+from datetime import datetime
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+import config
+import close_monitor
+import make_dashboard
+import report
+import scoring
+import strength
+import stock_strength
+import intraday
+import attack_model
+import trend_consolidation
+import wyckoff_structure
+import session_context
+import board_trend
+import board_center
+import board_quote
+import weekly_members
+import price_only
+import ui_payload
+
+LOG_DIR = config.ROOT / "logs"
+LOG_FILE = LOG_DIR / "serve.log"
+
+# 服务运行状态（/__status 的数据源）
+INIT = {
+    "phase": "booting",            # booting -> init/ready/error
+    "started": None,
+    "last_scan": None,
+    "last_scan_ok": None,
+    "error": None,
+    "needs_model_refresh": True,
+    "scan_active": False,
+    "scan_started_at": None,
+    "scan_mode": None,
+    "last_scan_error": None,
+    "last_publish_at": None,
+    "last_publish_ok": None,
+    "last_publish_error": None,
+}
+SNAPSHOT_META = {
+    "snapshot_generated_at": None, "snapshot_scan_completed_at": None,
+    "snapshot_quote_capture_at": None, "snapshot_daily_asof": None,
+    "snapshot_latest_valid_quote_at": None,
+    "snapshot_latest_intraday_judgment_at": None, "snapshot_intraday_observation_quotes": None,
+    "snapshot_intraday_valid_quotes": None, "snapshot_auction_quote_count": None,
+    "snapshot_auction_latest_quote_at": None,
+    "snapshot_auction_final_count": None, "snapshot_auction_final_captured_at": None,
+    "snapshot_trend_ma5_count": None, "snapshot_trend_ma5_reclaim_count": None,
+    "snapshot_trend_ma10_count": None, "snapshot_trend_ma10_reclaim_count": None,
+    "snapshot_trend_ma20_count": None, "snapshot_trend_ma20_reclaim_count": None,
+    "snapshot_midday_price_count": None, "snapshot_midday_captured_at": None,
+    "snapshot_close_price_count": None, "snapshot_close_captured_at": None,
+    "snapshot_intraday_model_version": None,
+    "snapshot_intraday_rule_version": None,
+}
+STATE = {"port": None, "pid": os.getpid(), "code_model_version": strength.VERSION,
+         "code_board_trend_version": board_trend.VERSION,
+         "code_board_catalog_version": board_center.VERSION,
+         "code_strength_version": stock_strength.VERSION,
+         "code_intraday_model_version": intraday.VERSION,
+         "code_attack_model_version": attack_model.LIVE_VERSION,
+         "code_consolidation_version": trend_consolidation.VERSION,
+         "code_structure_version": wyckoff_structure.VERSION,
+         "code_session_context_version": session_context.VERSION,
+         "code_intraday_rule_version": config.INTRADAY_RULE_VERSION,
+         "code_close_refresh_version": scoring.CLOSE_REFRESH_VERSION,
+         "code_fund_reference_version": price_only.VERSION}
+
+# 看板「刷新数据」按钮触发的主动刷新状态
+# cooldown 是必须的：连点会连续打东财/腾讯接口，触发风控后整段被封 20 分钟以上
+REFRESH = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "ok": None,
+    "error": None,
+    "reason": None,          # not_ready（行情未就绪，属正常跳过）/ error（真失败）
+    "mode": None,
+    "count": 0,
+    "cooldown": 60,
+}
+
+# init_worker 与 refresh_loop 可能同时触发全量扫描，用锁串行化
+_SCAN_LOCK = threading.Lock()
+
+
+@config.single_writer
+def publish_outputs():
+    """后台每次完成扫描后同步发布看板和文字日报。"""
+    snapshot = None
+    try:
+        page = make_dashboard.build()
+        if page is None or not page.exists():
+            raise RuntimeError("看板页面未生成")
+        config.atomic_write_text(config.ROOT / "snapshot_report.md", report.build())
+        try:
+            snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+            SNAPSHOT_META.update({
+                "snapshot_generated_at": snapshot.get("generated_at"),
+                "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
+                "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
+                "snapshot_daily_asof": (snapshot.get("strength_model") or {}).get("asof"),
+                "snapshot_close_board_asof": (snapshot.get('close_strong_board') or {}).get('asof'),
+                "snapshot_close_refresh_version": snapshot.get('close_refresh_version'),
+                "snapshot_close_daily_verified_at": snapshot.get('close_daily_verified_at'),
+                "snapshot_board_trend_version": (snapshot.get("board_trend_model") or {}).get("version"),
+                "snapshot_board_catalog_version": snapshot.get('board_catalog_version'),
+                "snapshot_board_index_ready": (snapshot.get("board_trend_model") or {}).get("ready"),
+                "snapshot_consolidation_version": (snapshot.get('trend_consolidation') or {}).get('version'),
+                "snapshot_consolidation_count": (snapshot.get('trend_consolidation') or {}).get('count'),
+                "snapshot_structure_version": (snapshot.get('wyckoff_structure') or {}).get('version'),
+                "snapshot_structure_count": (snapshot.get('wyckoff_structure') or {}).get('count'),
+                "snapshot_session_context_version": (snapshot.get('session_context') or {}).get('version'),
+                "snapshot_context_price_count": (snapshot.get('session_context') or {}).get('price_judged_count'),
+                "snapshot_context_structure_count": (snapshot.get('session_context') or {}).get('structure_judged_count'),
+                "snapshot_latest_valid_quote_at": (snapshot.get("intraday_model") or {}).get("latest_valid_quote_at"),
+                "snapshot_intraday_valid_quotes": (snapshot.get("intraday_model") or {}).get("valid_quote_count"),
+                "snapshot_latest_intraday_judgment_at": (snapshot.get("intraday_model") or {}).get("latest_judgment_at"),
+                "snapshot_intraday_observation_quotes": (snapshot.get("intraday_model") or {}).get("observation_valid_count"),
+                "snapshot_auction_quote_count": (snapshot.get("intraday_model") or {}).get("auction_quote_count"),
+                "snapshot_auction_latest_quote_at": (snapshot.get("intraday_model") or {}).get("auction_latest_quote_at"),
+                "snapshot_auction_final_count": ((snapshot.get("boundary_prices") or {}).get("auction_final") or {}).get("count"),
+                "snapshot_auction_final_captured_at": ((snapshot.get("boundary_prices") or {}).get("auction_final") or {}).get("captured_at"),
+                "snapshot_trend_ma5_count": len((snapshot.get("trend_ma5_observation") or {}).get("main_rows") or []),
+                "snapshot_trend_ma5_reclaim_count": len((snapshot.get("trend_ma5_observation") or {}).get("reclaim_rows") or []),
+                "snapshot_trend_ma10_count": len((snapshot.get("trend_ma10_observation") or {}).get("main_rows") or []),
+                "snapshot_trend_ma10_reclaim_count": len((snapshot.get("trend_ma10_observation") or {}).get("reclaim_rows") or []),
+                "snapshot_trend_ma20_count": len((snapshot.get("trend_ma20_observation") or {}).get("main_rows") or []),
+                "snapshot_trend_ma20_reclaim_count": len((snapshot.get("trend_ma20_observation") or {}).get("reclaim_rows") or []),
+                "snapshot_midday_price_count": ((snapshot.get("boundary_prices") or {}).get("midday") or {}).get("count"),
+                "snapshot_midday_captured_at": ((snapshot.get("boundary_prices") or {}).get("midday") or {}).get("captured_at"),
+                "snapshot_close_price_count": ((snapshot.get("boundary_prices") or {}).get("close") or {}).get("count"),
+                "snapshot_close_captured_at": ((snapshot.get("boundary_prices") or {}).get("close") or {}).get("captured_at"),
+                "snapshot_intraday_model_version": (snapshot.get("intraday_model") or {}).get("version"),
+                "snapshot_intraday_rule_version": (snapshot.get("intraday_model") or {}).get("rule_version"),
+            })
+        except (OSError, ValueError):
+            pass
+        INIT["last_publish_at"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_publish_ok"] = True
+        INIT["last_publish_error"] = None
+    except Exception as e:
+        INIT["last_publish_at"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_publish_ok"] = False
+        INIT["last_publish_error"] = f"{type(e).__name__}: {e}"
+        raise
+
+
+# ---------------------------------------------------------------- 日志双写
+class _Discard:
+    def write(self, s):
+        pass
+
+    def flush(self):
+        pass
+
+
+class Tee:
+    """stdout/stderr 同时写控制台（若有）与日志文件"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
+def setup_logging():
+    LOG_DIR.mkdir(exist_ok=True)
+    f = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+    # pythonw 下 sys.__stdout__/__stderr__ 是 None，用丢弃流兜底
+    sys.stdout = Tee(sys.__stdout__ or _Discard(), f)
+    sys.stderr = Tee(sys.__stderr__ or _Discard(), f)
+
+
+# ---------------------------------------------------------------- 刷新循环
+def is_trading_time(now=None):
+    """9:15开始竞价观察，连续交易及刚收盘窗口自动扫描。"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return (9 * 60 + 15 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60 + 5)
+
+
+def close_review_done(now, snapshot=None):
+    day = now.date().isoformat()
+    meta = SNAPSHOT_META if snapshot is None else dict(
+        snapshot_daily_asof=(snapshot.get('strength_model') or {}).get('asof'),
+        snapshot_close_board_asof=(snapshot.get('close_strong_board') or {}).get('asof'),
+        snapshot_close_daily_verified_at=snapshot.get('close_daily_verified_at'),
+        snapshot_close_refresh_version=snapshot.get('close_refresh_version'))
+    return (meta.get('snapshot_daily_asof') == day
+            and meta.get('snapshot_close_board_asof') == day
+            and str(meta.get('snapshot_close_daily_verified_at') or '').startswith(day)
+            and meta.get('snapshot_close_refresh_version') == scoring.CLOSE_REFRESH_VERSION)
+
+
+def pick_mode(now=None, snapshot=None):
+    """收盘正式榜未完成时更新一次；完成后不重复拉全量历史。"""
+    now = now or datetime.now()
+    hm = now.hour * 60 + now.minute
+    if now.weekday() < 5 and hm >= 15 * 60 + 5 and not close_review_done(now, snapshot):
+        return "close"
+    return "quick"
+
+
+@config.single_writer
+def scan_and_publish(mode, **kwargs):
+    """扫描至页面/日报发布始终持有跨进程锁，避免读到其他轮次的快照。"""
+    scoring.run(mode=mode, **kwargs)
+    publish_outputs()
+
+
+def boundary_capture_done(now, boundary):
+    """各阶段报价按逐股源时间判断；定点参考价只保存一次。"""
+    if boundary == 'close_review':
+        return close_review_done(now)
+    if boundary in ("auction_start", "auction_mid"):
+        latest = str(SNAPSHOT_META.get("snapshot_auction_latest_quote_at") or "")
+        cutoff = "09:15" if boundary == "auction_start" else "09:20"
+        try:
+            at=datetime.fromisoformat(latest)
+            return at.date()==now.date() and latest[11:16]>=cutoff and 0<=(now-at).total_seconds()<60
+        except ValueError:return False
+    if boundary == "auction_final":
+        return str(SNAPSHOT_META.get("snapshot_auction_final_captured_at") or "").startswith(now.strftime("%Y-%m-%d"))
+    if boundary in ("morning_open", "afternoon_open"):
+        latest = str(SNAPSHOT_META.get("snapshot_latest_valid_quote_at") or "")
+        cutoff = "09:30" if boundary == "morning_open" else "13:00"
+        return latest.startswith(now.strftime("%Y-%m-%d")) and latest[11:16] >= cutoff
+    key = "snapshot_midday_captured_at" if boundary == "midday" else "snapshot_close_captured_at"
+    return str(SNAPSHOT_META.get(key) or "").startswith(now.strftime("%Y-%m-%d"))
+
+
+def boundary_trading_evidence(now):
+    """只在今天确有盘中报价时运行定点任务，避免节假日反复请求行情源。"""
+    latest = SNAPSHOT_META.get("snapshot_latest_valid_quote_at") or ""
+    return latest.startswith(now.strftime("%Y-%m-%d"))
+
+
+def boundary_capture_loop():
+    """交易日竞价、开盘、午间与收盘抓阶段报价；源未就绪时短时重试。"""
+    last_attempt = {}
+    attempts = {}
+    while True:
+        now = datetime.now()
+        minute = now.hour * 60 + now.minute
+        boundary = ("auction_start" if 9 * 60 + 15 <= minute < 9 * 60 + 20 else
+                    "auction_mid" if 9 * 60 + 20 <= minute < 9 * 60 + 25 else
+                    "auction_final" if 9 * 60 + 25 <= minute < 9 * 60 + 30 else
+                    "morning_open" if 9 * 60 + 30 <= minute < 9 * 60 + 40 else
+                    "midday" if 11 * 60 + 30 <= minute < 13 * 60 else
+                    "afternoon_open" if 13 * 60 <= minute < 13 * 60 + 10 else
+                    "close" if 15 * 60 <= minute < 15 * 60 + 5 else
+                    "close_review" if 15 * 60 + 5 <= minute < 16 * 60 else None)
+        morning = boundary in ("auction_start", "auction_mid", "auction_final", "morning_open")
+        if (now.weekday() < 5 and boundary and (morning or boundary_trading_evidence(now))
+                and not boundary_capture_done(now, boundary)):
+            key = (now.date().isoformat(), boundary)
+            retry_seconds = 15 if boundary in ('morning_open', 'afternoon_open') else 60
+            max_attempts = 40 if boundary in ('morning_open', 'afternoon_open') else (5 if morning else 100)
+            if (attempts.get(key, 0) < max_attempts
+                    and time.monotonic() - last_attempt.get(key, 0) >= retry_seconds):
+                last_attempt[key] = time.monotonic()
+                if _SCAN_LOCK.acquire(blocking=False):
+                    attempts[key] = attempts.get(key, 0) + 1
+                    mode = 'close' if boundary == 'close_review' else 'quick'
+                    INIT.update(scan_active=True,
+                                scan_started_at=datetime.now().isoformat(timespec="seconds"),
+                                scan_mode=mode)
+                    try:
+                        label = {"auction_start": "09:15 集合竞价", "auction_mid": "09:20 集合竞价",
+                                 "auction_final": "09:25 竞价结束", "morning_open": "09:30 正式开盘",
+                                 "midday": "11:30 午间", "afternoon_open": "13:00 午后开盘",
+                                 "close": "15:00 收盘", "close_review": "15:05 正式收盘复盘"}[boundary]
+                        print(f"[BOUNDARY] {datetime.now():%H:%M:%S} 获取 {label}价格 ...")
+                        scan_and_publish(mode, boundary='close' if boundary == 'close_review' else boundary)
+                        INIT["phase"] = "ready"
+                        INIT["needs_model_refresh"] = False
+                        INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+                        INIT["last_scan_ok"] = True
+                        INIT["last_scan_error"] = None
+                        print(f"[BOUNDARY] {datetime.now():%H:%M:%S} 阶段报价已发布")
+                    except scoring.DataNotReady as e:
+                        INIT['last_scan_ok'] = False
+                        INIT['last_scan'] = datetime.now().isoformat(timespec='seconds')
+                        INIT["last_scan_error"] = str(e)
+                        print(f"[BOUNDARY] 报价未就绪，稍后重试：{e}")
+                    except Exception as e:
+                        INIT['last_scan_ok'] = False
+                        INIT['last_scan'] = datetime.now().isoformat(timespec='seconds')
+                        INIT["last_scan_error"] = f"{type(e).__name__}: {e}"
+                        print(f"[BOUNDARY] 获取失败，稍后重试：{e}")
+                        traceback.print_exc()
+                    finally:
+                        INIT.update(scan_active=False, scan_started_at=None, scan_mode=None)
+                        _SCAN_LOCK.release()
+        time.sleep(5)
+
+
+def refresh_loop(interval, always=False):
+    """后台刷新循环。
+
+    用单调时钟固定下一次启动点，避免把本轮耗时叠加到刷新间隔里。
+    扫描超过一个周期时，跳过已经错过的 tick，不把扫描排成队。
+    """
+    next_run = time.monotonic() + interval
+    while True:
+        time.sleep(max(0.0, next_run - time.monotonic()))
+        next_run += interval
+        try:
+            now = datetime.now()
+            trading = is_trading_time(now)
+            mode = pick_mode()
+            if not always and (now.hour, now.minute) in ((9, 15), (9, 20), (9, 25), (9, 30), (11, 30), (13, 0), (15, 0)):
+                continue  # 收市节点交给定点任务，避免与常规刷新重叠
+            if not trading and not always and (mode == "quick" or now.hour >= 16):
+                print(f"[LOOP] {datetime.now():%H:%M:%S} 非交易时段，跳过")
+                continue
+
+            # 非阻塞抢锁：手动刷新/上一轮还在跑就跳过这一轮。
+            # 用阻塞等待会让几轮扫描首尾相接连着跑，等于自己制造数据源风控
+            if not _SCAN_LOCK.acquire(blocking=False):
+                print(f"[LOOP] {datetime.now():%H:%M:%S} 已有扫描在进行（手动刷新或上一轮），跳过本轮")
+                continue
+            INIT.update(scan_active=True,
+                        scan_started_at=datetime.now().isoformat(timespec="seconds"),
+                        scan_mode=mode)
+            try:
+                print(f"[LOOP] {datetime.now():%H:%M:%S} 开始 {mode} 扫描 ...")
+                scan_and_publish(mode)
+                INIT["phase"] = "ready"
+                INIT["needs_model_refresh"] = False
+                INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+                INIT["last_scan_ok"] = True
+                INIT["last_scan_error"] = None
+                print(f"[LOOP] {datetime.now():%H:%M:%S} 完成")
+            except scoring.DataNotReady as e:
+                # 数据未就绪时保留上一份快照（竞价期全池无成交，或盘中源覆盖不足），
+                # 属于保护性跳过，不是服务崩溃，不要打堆栈吓人
+                INIT["last_scan_ok"] = False
+                INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+                INIT["last_scan_error"] = str(e)
+                print(f"[LOOP] {datetime.now():%H:%M:%S} 本轮跳过：{e}")
+            finally:
+                INIT.update(scan_active=False, scan_started_at=None, scan_mode=None)
+                _SCAN_LOCK.release()
+        except Exception as e:
+            INIT["last_scan_ok"] = False
+            INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+            INIT["last_scan_error"] = f"{type(e).__name__}: {e}"
+            print(f"[LOOP] 刷新失败：{type(e).__name__}: {e}")
+            traceback.print_exc()
+        finally:
+            # 如果本轮异常慢，跳过已经错过的时间点，保持下一轮落在
+            # 固定节奏上，同时避免 while 循环无间隔连续重扫。
+            now = time.monotonic()
+            if next_run <= now:
+                missed = int((now - next_run) // interval) + 1
+                next_run += missed * interval
+
+
+def init_worker():
+    """后台初始化：先监听再扫描，等待期由等待页兜住浏览器请求"""
+    t0 = time.time()
+    try:
+        with _SCAN_LOCK, config.pipeline_guard():
+            snapshot = {}
+            try:
+                snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+                close_confirmation = snapshot.get("intraday_close_confirmation")
+                close_confirmation_matches = (
+                    not close_confirmation
+                    or (close_confirmation.get("model_version") == intraday.VERSION
+                        and close_confirmation.get("rule_version") == config.INTRADAY_RULE_VERSION)
+                )
+                matches = (snapshot.get('fund_reference_version') == price_only.VERSION
+                           and snapshot.get('close_refresh_version') == scoring.CLOSE_REFRESH_VERSION
+                           and snapshot.get("factor_model_version") == strength.VERSION
+                           and (snapshot.get("board_trend_model") or {}).get("version") == board_trend.VERSION
+                           and snapshot.get('board_catalog_version') == board_center.VERSION
+                           and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+                           and (snapshot.get('wyckoff_structure') or {}).get('version') == wyckoff_structure.VERSION
+                           and (snapshot.get('session_context') or {}).get('version') == session_context.VERSION
+                           and (snapshot.get("attack_monitor") or {}).get("version") == attack_model.LIVE_VERSION
+                           and (snapshot.get("strength_model") or {}).get("strength_version") == stock_strength.VERSION
+                           and (snapshot.get("intraday_model") or {}).get("version") == intraday.VERSION
+                           and (snapshot.get("intraday_model") or {}).get("rule_version") == config.INTRADAY_RULE_VERSION
+                           and (snapshot.get("close_strong_board") or {}).get("version") == close_monitor.VERSION
+                           and all((snapshot.get(f"trend_ma{period}_observation") or {}).get("version") == close_monitor.TREND_VERSION
+                                   for period in close_monitor.LINES)
+                           and (snapshot.get("intraday_new_strength") or {}).get("version") == close_monitor.VERSION
+                           and close_confirmation_matches
+                           and all("stock_strength_parts" in row and "intraday_score" in row
+                                   and "intraday_quote_status" in row
+                                   for row in snapshot.get("stocks", [])))
+            except (OSError, ValueError):
+                matches = False
+            INIT["needs_model_refresh"] = not matches
+            now = datetime.now()
+            close_pending = (now.weekday() < 5 and now.hour*60+now.minute >= 15*60+5
+                             and not close_review_done(now, snapshot if matches else {}))
+            if not matches or close_pending:
+                print("[INIT] 本地快照与已加载模型不一致，先完成一次新版扫描 ...")
+                scoring.run(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")
+            publish_outputs()
+            INIT["needs_model_refresh"] = False
+        INIT["phase"] = "ready"
+        INIT["last_scan_ok"] = True
+        INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_scan_error"] = None
+        print(f"[INIT] 就绪（耗时 {time.time() - t0:.0f} 秒）")
+    except Exception as e:
+        INIT["phase"] = "error"
+        INIT["error"] = f"{type(e).__name__}: {e}"
+        INIT["last_scan_ok"] = False
+        INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_scan_error"] = INIT["error"]
+        print(f"[INIT] 初始化失败：{INIT['error']}")
+        traceback.print_exc()
+
+
+# ------------------------------------------------------ 看板上的「刷新数据」
+def _refresh_worker(mode):
+    """手动刷新的执行体。锁已在 start_refresh 里非阻塞拿到，这里负责归还。"""
+    try:
+        print(f"[MANUAL] {datetime.now():%H:%M:%S} 手动刷新开始（{mode}）...")
+        now = datetime.now()
+        close_missing = (now.weekday() < 5 and now.hour >= 15
+                         and not boundary_capture_done(now, 'close')
+                         and boundary_trading_evidence(now))
+        scan_and_publish(mode, **({'boundary': 'close'} if close_missing else {}))
+        INIT["phase"] = "ready"
+        INIT["needs_model_refresh"] = False
+        REFRESH["ok"] = True
+        REFRESH["error"] = None
+        REFRESH["reason"] = None
+        INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_scan_ok"] = True
+        INIT["last_scan_error"] = None
+        print(f"[MANUAL] {datetime.now():%H:%M:%S} 手动刷新完成")
+    except scoring.DataNotReady as e:
+        # 行情没就绪不是"失败"，而是"这轮不该写" —— 单独报，
+        # 前端按 reason 显示成提示而不是红色失败
+        REFRESH["ok"] = False
+        REFRESH["reason"] = "not_ready"
+        REFRESH["error"] = str(e)
+        INIT["last_scan_ok"] = False
+        INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_scan_error"] = str(e)
+        print(f"[MANUAL] 本轮跳过：{e}")
+    except Exception as e:
+        REFRESH["ok"] = False
+        REFRESH["reason"] = "error"
+        REFRESH["error"] = f"{type(e).__name__}: {e}"
+        INIT["last_scan_ok"] = False
+        INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+        INIT["last_scan_error"] = f"{type(e).__name__}: {e}"
+        print(f"[MANUAL] 手动刷新失败：{REFRESH['error']}")
+        traceback.print_exc()
+    finally:
+        INIT.update(scan_active=False, scan_started_at=None, scan_mode=None)
+        REFRESH["running"] = False
+        REFRESH["finished_at"] = time.time()
+        REFRESH["count"] += 1
+        _SCAN_LOCK.release()
+
+
+def start_refresh():
+    """看板点「刷新数据」时调用。返回给前端的 JSON 状态。"""
+    if REFRESH["running"]:
+        return {"status": "busy",
+                "running_seconds": round(time.time() - (REFRESH["started_at"] or 0), 1),
+                "reason": "manual_refresh", "scan_started_at": INIT.get("scan_started_at"),
+                "last_scan": INIT.get("last_scan")}
+
+    fin = REFRESH["finished_at"]
+    if fin:
+        left = REFRESH["cooldown"] - (time.time() - fin)
+        if left > 0:
+            return {"status": "cooldown", "wait": int(left) + 1}
+
+    # 非阻塞拿锁：自动刷新正在扫描时报 busy，而不是排队——排队会让用户连点几次
+    # 之后突然连跑好几轮扫描，等于自己制造风控
+    if not _SCAN_LOCK.acquire(blocking=False):
+        return {"status": "busy", "running_seconds": None,
+                "reason": "后台扫描正在运行", "scan_started_at": INIT.get("scan_started_at"),
+                "last_scan": INIT.get("last_scan")}
+
+    mode = pick_mode()
+    INIT.update(scan_active=True,
+                scan_started_at=datetime.now().isoformat(timespec="seconds"),
+                scan_mode=mode)
+    REFRESH.update(running=True, started_at=time.time(), ok=None, error=None, mode=mode)
+    threading.Thread(target=_refresh_worker, args=(mode,), daemon=True).start()
+    print(f"[MANUAL] 收到看板刷新请求，已启动 {mode} 扫描")
+    return {"status": "started", "mode": mode}
+
+
+def data_version():
+    """返回看板文件版本，供已打开页面发现后台生成的新版本。"""
+    p = config.ROOT / "dashboard.html"
+    try:
+        return p.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------- HTTP
+class Server(ThreadingHTTPServer):
+    # Windows 上 SO_REUSEADDR 允许双进程绑同一端口 → 单实例判据失效，
+    # 必须关掉：绑不上就是真被占用，走探测/换端口逻辑
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # 浏览器/curl 中途断开（看板 4MB，很常见）不该刷一段堆栈淹没日志
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, ConnectionError)):
+            print(f"[SERVE] 客户端断开（{type(exc).__name__}），忽略")
+            return
+        super().handle_error(request, client_address)
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def _local_request_allowed(self, mutation=False):
+        try:
+            host = urlsplit('//' + self.headers.get('Host', ''))
+            port = self.server.server_port
+            if host.hostname not in ('127.0.0.1', 'localhost') or host.port != port or host.username:
+                return False
+            origin = self.headers.get('Origin')
+            if mutation and origin:
+                source = urlsplit(origin)
+                if (source.scheme != 'http' or source.hostname not in ('127.0.0.1', 'localhost')
+                        or source.port != port or source.username):
+                    return False
+            return not mutation or self.headers.get('Sec-Fetch-Site') != 'cross-site'
+        except ValueError:
+            return False
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        # send_error 传入的第二个参数可能是 HTTPStatus，不一定是字符串；
+        # 日志过滤必须先转字符串，否则一个普通 404 会反过来触发 TypeError。
+        message = str(args[0]) if args else ""
+        if "snapshot.json" in message:
+            return
+        super().log_message(fmt, *args)
+
+    def _send_body(self, body, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if not self._local_request_allowed():
+            self.send_error(403, 'Local requests only')
+            return
+        path = self.path.split("?")[0]
+        if path == "/__ping":
+            self._send_body(b"pong", "text/plain; charset=utf-8")
+            return
+        if path == "/__status":
+            body = json.dumps(
+                {**STATE, **INIT, **SNAPSHOT_META,
+                 'member_refresh': weekly_members.status(),
+                 'code_board_quote_version': board_quote.VERSION,
+                 'code_ui_payload_version': ui_payload.VERSION,
+                 'ui_generation': ui_payload.active_generation(),
+                 "data_version": data_version(),
+                 "refresh": {**REFRESH,
+                             "running_seconds": round(time.time() - REFRESH["started_at"], 1)
+                             if REFRESH["running"] else None},
+                 "time": datetime.now().isoformat(timespec="seconds")},
+                ensure_ascii=False).encode("utf-8")
+            self._send_body(body, "application/json; charset=utf-8")
+            return
+        if path.startswith('/__ui/'):
+            self._ui_get(path)
+            return
+        # 初始化期间看板文件还不存在：返回自动刷新等待页，而不是 404/拒绝
+        if (path in ("/", "/dashboard.html", "/index.html")
+                and INIT["phase"] not in ("ready",)
+                and (INIT["needs_model_refresh"] or not (config.ROOT / "dashboard.html").exists())):
+            self._send_init_page()
+            return
+        if path in ('/', '/dashboard.html', '/index.html') and ui_payload.active_generation():
+            body = ui_payload.blob(ui_payload.active_generation(), 'page.gz')
+            compressed = 'gzip' in self.headers.get('Accept-Encoding', '')
+            if not compressed:
+                body = gzip.decompress(body)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Vary', 'Accept-Encoding')
+            if compressed:
+                self.send_header('Content-Encoding', 'gzip')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        if not self._local_request_allowed(mutation=True):
+            self.send_error(403, 'Local requests only')
+            return
+        if self.path.split('?')[0] == '/__ui/export':
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if not 0 < size <= 8 * 1024 * 1024:
+                    raise ValueError('Invalid body size')
+                request = json.loads(self.rfile.read(size))
+                body = ui_payload.export_csv(request.get('version'), request.get('codes'), request.get('contexts'))
+                self._send_body(body, 'text/csv; charset=utf-8')
+            except LookupError:
+                self.send_error(409, 'Generation expired')
+            except (ValueError, TypeError):
+                self.send_error(400, 'Invalid request')
+            except Exception:
+                traceback.print_exc()
+                self.send_error(500, 'Export failed')
+            return
+        # 看板「刷新数据」按钮：主动触发一次扫描并重建看板。
+        # 用 POST 而不是 GET：它有副作用（会去抓数据源），不能被浏览器预取/缓存命中
+        if self.path.split("?")[0] == "/__refresh":
+            res = start_refresh()
+            self._send_body(json.dumps(res, ensure_ascii=False).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
+        self.send_error(404, "Not Found")
+
+    def _ui_get(self, path):
+        query = parse_qs(urlsplit(self.path).query)
+        try:
+            version = query.get('version', [''])[0]
+            if path == '/__ui/detail':
+                item = ui_payload.detail(version, query.get('kind', [''])[0], query.get('id', [''])[0])
+                self._send_body(ui_payload.dumps({'version': version, 'item': item}).encode('utf-8'),
+                                'application/json; charset=utf-8')
+            elif path == '/__ui/summary':
+                compressed = 'gzip' in self.headers.get('Accept-Encoding', '')
+                body = ui_payload.blob(version, 'summary.gz' if compressed else 'summary')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Vary', 'Accept-Encoding')
+                if compressed:
+                    self.send_header('Content-Encoding', 'gzip')
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == '/__ui/offline':
+                body = ui_payload.offline_html(version)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Disposition', 'attachment; filename="dashboard-offline.html"')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404, 'Unknown UI endpoint')
+        except LookupError:
+            self.send_error(409, 'Generation expired')
+        except (ValueError, TypeError):
+            self.send_error(400, 'Invalid request')
+
+    def _send_init_page(self):
+        phase = INIT["phase"]
+        err = f"错误：{INIT['error']}" if phase == "error" else "首次全量扫描约 3-5 分钟"
+        html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>股票监测 · 初始化中</title>
+<style>body{{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
+background:#f5f5f7;color:#1d1d1f}}.box{{text-align:center}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#0071e3;
+margin-right:8px;vertical-align:middle}}</style></head>
+<body><div class="box"><h1><span class="dot"></span>系统初始化中 …</h1>
+<p>{html_module.escape(err)}</p><p style="color:#86868b">本页每 5 秒自动刷新，请勿关闭</p>
+</div></body></html>""".encode("utf-8")
+        self._send_body(html, "text/html; charset=utf-8")
+
+
+def probe_alive(port):
+    """探测该端口是否已是本系统的实例"""
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/__ping", timeout=1.5) as r:
+            return r.status == 200 and b"pong" in r.read()
+    except Exception:
+        return False
+
+
+def bind_server(preferred):
+    """尝试绑定首选端口，被占则换下一个；返回 (server, port)，server 为 None 表示已有实例"""
+    for p in (preferred, preferred + 1, preferred + 2, preferred + 3):
+        try:
+            srv = Server(("127.0.0.1", p), partial(Handler, directory=str(config.ROOT)))
+            return srv, p
+        except OSError:
+            if probe_alive(p):
+                return None, p  # 已有本系统实例
+    return None, None
+
+
+def open_url(url):
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def main():
+    setup_logging()
+    INIT["started"] = datetime.now().isoformat(timespec="seconds")
+    print(f"[SERVE] {datetime.now():%Y-%m-%d %H:%M:%S} serve.py 启动 (pid={os.getpid()})")
+
+    port = int(config.RUNTIME["server_port"])
+    interval = int(config.RUNTIME["refresh_seconds"])
+    no_loop = "--no-loop" in sys.argv
+    always = "--always" in sys.argv
+    no_browser = "--no-browser" in sys.argv
+
+    # 单实例：已有实例在跑就只打开浏览器，绝不起第二个进程
+    if probe_alive(port):
+        print(f"[SERVE] 端口 {port} 已有实例在运行，直接打开浏览器后退出")
+        if not no_browser:
+            open_url(f"http://127.0.0.1:{port}/dashboard.html")
+        return
+
+    httpd, port = bind_server(port)
+    if httpd is None:
+        print("[SERVE] 无可用端口且无运行实例，退出")
+        return
+    STATE["port"] = port
+    print(f"[SERVE] 已监听 http://127.0.0.1:{port}（先监听，初始化转后台）")
+
+    threading.Thread(target=init_worker, daemon=True).start()
+
+    if not no_loop:
+        threading.Thread(target=refresh_loop, args=(interval, always), daemon=True).start()
+        threading.Thread(target=boundary_capture_loop, daemon=True).start()
+        threading.Thread(target=weekly_members.loop, args=(_SCAN_LOCK,), daemon=True).start()
+        print(f"[SERVE] 自动刷新已开启：每 {interval // 60} 分钟，仅交易时段"
+              f"；交易日 11:30 / 13:00 / 15:00 定点获取阶段报价"
+              f"（加 --always 可强制全天刷新）")
+
+    url = f"http://127.0.0.1:{port}/dashboard.html"
+    if not no_browser:
+        open_url(url)
+    print("[SERVE] 按 Ctrl+C 停止")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[SERVE] 已停止")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,38 @@
+--- before/config.py
++++ config.py
+@@ -721,6 +721,35 @@
+ # ═══════════════════════════════════════════════════════
+ # 三·补、选股雷达：只展示趋势在线候选，按个股自身强度分位分档。
+ # ═══════════════════════════════════════════════════════
++RADAR_OPPORTUNITY = {
++    'version': '雷达机会V1-20261012.1',
++    'core_bars': 25,  # 根：应有完成日线，沿用核心历史要求
++    'platform_days': 5,  # 完成交易日：首次预警前H5窗口
++    'market_coverage_pct': 80.0,  # %：全主板有效报价覆盖
++    'buffer_yuan': 0.01,  # 元：突破最小缓冲
++    'buffer_atr': 0.1,  # ATR倍数：突破缓冲
++    'atr_min_yuan': 0.0,  # 元：ATR理论非负；已核验的0可用，不把缺失补0
++    'confirmation_samples': 2,  # 次：不同有效源报价
++    'confirmation_span_seconds': 300,  # 秒：首次至本次报价
++    'max_sample_gap_seconds': 600,  # 秒：相邻有效采样最大间隔
++    'event_window_days': 3,  # 交易日：首次正式触发当天及随后两日
++    'rebuild_close_days': 2,  # 完成交易日：旧事件结束后收盘回到旧平台
++    'continuous_am': ('09:30:00', '11:30:00'),
++    'continuous_pm': ('13:00:00', '14:57:00'),  # 右端不新增确认
++    'restart': {'r0_pct': 2.0, 'e0_pp': 1.0, 'ma_periods': (5, 10)},
++    'breakout': {'r0_pct': 3.0, 'e0_pp': 2.0, 'ma_periods': (10, 20)},
++    'sustained': {'r0_pct': 2.0, 'e0_pp': 1.0, 'ma_periods': (5, 10)},
++    'warning': {'r0_pct': 2.0, 'e0_pp': 1.0},  # %、百分点：突破提前预警
++    'maintenance_r0_pct': 0.0, 'maintenance_e0_pp': 0.0,  # 严格大于
++    'market_strong_r0_pct': 0.5, 'market_strong_up_pct': 55.0,
++    'market_weak_r0_pct': -1.0, 'market_weak_up_pct': 35.0,
++    'peer_count': 5, 'peer_coverage_pct': 80.0, 'peer_up_pct': 50.0,
++    'heat_atr': 3.5,  # ATR倍数：严格超过，独立提示，不改进攻分
++    'history_in_state': 24,  # 状态转换：轻量状态文件保留最近记录；完整事实在不可改写的逐轮日志
++    'units': {'r0_pct': '%', 'e0_pp': '百分点', 'ma_periods': '完成日+当前暂态价格',
++              'market_up_pct': '%', 'peer_up_pct': '%', 'coverage_pct': '%'},
++}
++
+ RADAR = {
+     # A/B/C 是趋势在线股的关注层级，不改动全体强度排名。
+     "tiers": [

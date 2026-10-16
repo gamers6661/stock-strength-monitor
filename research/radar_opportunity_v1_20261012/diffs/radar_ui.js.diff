@@ -1,0 +1,72 @@
+--- before/radar_ui.js
++++ radar_ui.js
+@@ -0,0 +1,69 @@
++var RADAR_VIEW='current',RADAR_KIND='',RADAR_REFERENCE='',RADAR_QUERY='';
++function radarEvidenceValue(value){if(value==null)return '未知';if(typeof value==='boolean')return value?'是':'否';if(typeof value==='object')return value.reason||JSON.stringify(value);return String(value);}
++function setRadarView(view){RADAR_VIEW=view;renderRadar();}
++function radarOpportunityRows(section){
++  var m=DATA.radar_opportunity||{},codes=(m.lists||{})[section]||[];
++  if(RADAR_QUERY)codes=Object.keys(m.by_code||{}).sort(function(a,b){return m.by_code[a].sort_rank-m.by_code[b].sort_rank;});
++  return codes.map(function(c){return (m.by_code||{})[c];}).filter(function(r){
++    if(!r)return false;
++    var kinds=RADAR_VIEW==='current'&&!RADAR_QUERY?(r.labels||[]):(r.opportunity_kinds||r.labels||[]);
++    if(RADAR_KIND&&kinds.indexOf(RADAR_KIND)<0)return false;
++    if(RADAR_REFERENCE==='peers'&&!(r.boards||[]).some(function(b){return b.peers_qualified===true;}))return false;
++    if(RADAR_REFERENCE==='hot'&&(r.risk||[]).indexOf('位置偏热')<0)return false;
++    if(RADAR_REFERENCE==='divergence'&&(r.risk||[]).indexOf('触板未封')<0)return false;
++    return !RADAR_QUERY||String(r.code+' '+r.name).indexOf(RADAR_QUERY)>=0;
++  });
++}
++function radarOpportunityTable(rows,title){
++  var h='<div class="detail-panel"><div class="detail-panel-title">'+esc(title)+' · '+rows.length+'只</div>';
++  if(!rows.length)return h+'<p class="empty">暂无符合条件的股票，空池为有效结果。</p></div>';
++  h+='<div class="tw"><table><thead><tr><th class="l">代码名称</th><th class="l">机会与状态</th><th>R0%</th><th>E0百分点</th><th>盘中进攻分</th><th class="l">日线背景</th><th class="l">板块参考</th><th class="l">风险/限制</th><th class="l">源报价/首次观察</th></tr></thead><tbody>';
++  rows.forEach(function(r){
++    var peers=(r.boards||[]).filter(function(b){return b.peers_qualified===true;}).map(function(b){return b.name;});
++    var selected=(r.boards||[]).filter(function(b){return b.selected===true;}).map(function(b){return b.name;});
++    h+='<tr class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l">'+esc(r.name)+'<span class="cd">'+esc(r.code)+'</span></td>'
++      +'<td class="l">'+esc((r.labels||[]).join(' / ')||r.display_label||r.main_label||'观察')+'<br>'+esc(r.status)+'</td><td>'+pct(r.R0)+'</td><td>'+fmt(r.E0,2)+'</td><td>'+fmt(r.live_attack_score,1)+'</td>'
++      +'<td class="l">'+esc(r.daily_tier||'趋势未在线')+'<br>'+esc(r.daily_asof||'待核验')+'</td><td class="l">'+(selected.length?'所属板块入选：'+esc(selected.join('、'))+'<br>':'')+(peers.length?'剔除本股后同行共同走强：'+esc(peers.join('、')):esc(r.board_relation_status||'板块待核验'))+'</td>'
++      +'<td class="l">'+esc((r.risk||[]).concat(r.trade_restriction?[r.trade_restriction]:[]).join('、')||'—')+'</td><td class="l">'+esc(r.source_at||'待核验')+'<br>'+esc(r.first_observed_at||'尚未触发')+'</td></tr>';
++  });return h+'</tbody></table></div></div>';
++}
++function exportRadarCSV(){
++  var sections=RADAR_VIEW==='current'?['current','limited']:['pending','warning','tracking'];
++  var codes=[];sections.forEach(function(s){radarOpportunityRows(s).forEach(function(r){if(codes.indexOf(r.code)<0)codes.push(r.code);});});
++  if(RADAR_VIEW==='daily')codes=radarItems().map(function(r){return r.code;});
++  var all=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]),map={};all.forEach(function(s){map[s.code]=s;});
++  return exportCSV(codes.map(function(c){return map[c];}).filter(Boolean),'选股雷达_'+RADAR_VIEW+'_'+DATA.ui_generation+'.csv');
++}
++function renderRadar(){
++  var m=DATA.radar_opportunity||{},host=document.getElementById('radar-opportunities');
++  document.getElementById('radar-views').innerHTML=[['current','当前机会'],['follow','预警与跟踪'],['daily','日线背景']].map(function(v){return '<button class="'+(RADAR_VIEW===v[0]?'on':'')+'" onclick="setRadarView(\''+v[0]+'\')">'+v[1]+'</button>';}).join('');
++  document.getElementById('rad-tiers').style.display=RADAR_VIEW==='daily'?'grid':'none';
++  document.getElementById('tb-radar').parentElement.style.display=RADAR_VIEW==='daily'?'block':'none';
++  document.getElementById('rad-more').style.display=RADAR_VIEW==='daily'?'block':'none';
++  host.style.display=RADAR_VIEW==='daily'?'none':'block';
++  document.getElementById('radar-tools').innerHTML='<button onclick="exportRadarCSV()">导出当前视图 CSV</button>'+(RADAR_VIEW==='daily'?'':' <select aria-label="雷达类别" onchange="RADAR_KIND=this.value;renderRadar()">'+[['','全部类别'],['强势再启动','强势再启动'],['突破启动','突破启动'],['持续进攻','持续进攻']].map(function(v){return '<option value="'+v[0]+'" '+(RADAR_KIND===v[0]?'selected':'')+'>'+v[1]+'</option>';}).join('')+'</select> <select aria-label="雷达参考" onchange="RADAR_REFERENCE=this.value;renderRadar()">'+[['','全部参考'],['peers','同行共同走强'],['hot','位置偏热'],['divergence','触板未封']].map(function(v){return '<option value="'+v[0]+'" '+(RADAR_REFERENCE===v[0]?'selected':'')+'>'+v[1]+'</option>';}).join('')+'</select> <input aria-label="查询雷达未入选原因" placeholder="查询任意代码/名称及未入选原因" value="'+esc(RADAR_QUERY)+'" onchange="RADAR_QUERY=this.value.trim();renderRadar()">');
++  if(RADAR_VIEW==='daily'){renderDailyRadar();return;}
++  var market=m.market||{},env=market.environment||{};
++  document.getElementById('rad-sub').innerHTML=esc(m.version||'本快照尚未计算V1')+' · '+esc(m.phase||'')+' · 判断截至 '+esc(m.judged_at||'—')+'<br>主板等权 M0 '+pct(market.M0)+' · 上涨 '+fmt(market.U0,1)+'% · 报价覆盖 '+(market.valid_count||0)+'/'+(market.expected_count||0)+'（'+fmt(market.coverage_pct,2)+'%） · 环境 '+esc(env.label||'未知')+'<br>两次源采样确认只代表采样时成立。缺盘口/同时间量能序列，尚未确认成交及放量。';
++  if(m.close_review)document.getElementById('rad-sub').innerHTML+='<br>收盘复核：'+esc(m.close_review.ready?'同日正式日线与基准已到库，逐事件结果见详情':'待收盘核验，正式日线或基准未齐备；保留原盘中记录')+' · '+esc(Object.keys(m.close_review.counts||{}).map(function(k){return k+' '+m.close_review.counts[k]+'项';}).join(' / '));
++  if(RADAR_QUERY){host.innerHTML=radarOpportunityTable(radarOpportunityRows('current'),'查询结果（含未入选）');return;}
++  if(RADAR_VIEW==='current')host.innerHTML=radarOpportunityTable(radarOpportunityRows('current'),'当前已确认')+'<details><summary>观察受限 · '+((m.lists||{}).limited||[]).length+'只（不承诺可成交）</summary>'+radarOpportunityTable(radarOpportunityRows('limited'),'观察受限')+'</details>';
++  else {
++    var pending=radarOpportunityRows('pending'),warning=radarOpportunityRows('warning'),used={};pending.concat(warning).forEach(function(r){used[r.code]=true;});
++    host.innerHTML=radarOpportunityTable(pending,'待采样确认')+radarOpportunityTable(warning.filter(function(r){return !pending.some(function(x){return x.code===r.code;});}),'预警')+radarOpportunityTable(radarOpportunityRows('tracking').filter(function(r){return !used[r.code];}),m.close_review?'盘中记录与跟踪（收盘复核结果见详情）':'跟踪与判断暂停');
++  }
++}
++function radarOpportunityDetail(s){
++  var r=s.radar_opportunity;if(!r)return '';
++  var h='<div class="detail-panel radar-opportunity-detail"><div class="detail-panel-title">雷达机会依据 · '+esc((DATA.radar_opportunity||{}).close_review?'盘中记录 '+r.status:r.status)+'</div><p>'+esc(r.version)+' · 源报价 '+esc(r.source_at||'待核验')+' · 数据版本 '+esc(DATA.ui_generation||DATA.generated_at)+'</p>';
++  Object.keys(r.categories||{}).forEach(function(kind){var c=r.categories[kind],e=c.event||{};
++    h+='<details><summary>'+esc(({restart:'强势再启动',breakout:'突破启动',sustained:'持续进攻'})[kind])+' · '+esc(c.close_review?c.close_review.status+'（盘中记录：'+(e.status||'未入选')+'）':e.status||'未入选')+'</summary><p>事件 '+esc(e.event_id||'尚未触发')+' · 平台 '+fmt(e.platform,4)+' · 冻结ATR '+fmt(e.atr,4)+' · 背景 '+esc(e.background_date||'—')+'<br>首次观察 '+esc(e.first_observed_at||'—')+' · 首次正式触发 '+esc(e.first_formal_at||'—')+' · 首次确认 '+esc(e.first_confirmed_at||'—')+'<br>本段确认 '+((e.sequence||{}).count||0)+'次 / '+((e.sequence||{}).span_seconds||0)+'秒<br>最后有效报价 ¥'+fmt(e.last_valid_price,2)+' · '+esc(e.last_valid_quote_at||'—')+'</p>';
++    h+='<table><thead><tr><th class="l">条件</th><th>实际值</th><th>门槛</th><th>结果/原因</th></tr></thead><tbody>';
++    (r.admission_checks||[]).concat(c.checks||[]).forEach(function(x){h+='<tr><td class="l">'+esc(x.key)+'</td><td>'+esc(radarEvidenceValue(x.actual))+'</td><td>'+esc(x.threshold)+'</td><td>'+esc(x.passed===true?'通过':x.passed===false?'未通过':'待核验')+' '+esc(x.reason||'')+'</td></tr>';});
++    h+='</tbody></table><p>未通过/待核验：'+esc(((r.reasons||{})[kind]||[]).join('；')||'正式条件全部通过，确认状态见上方')+'</p><p>'+esc(JSON.stringify(e.history||[]))+'</p>';
++    if(c.close_review){h+='<p>收盘复核：'+esc(c.close_review.status)+' '+esc(c.close_review.reason||'')+'</p><table class="radar-close-evidence"><thead><tr><th class="l">收盘条件</th><th>实际值</th><th>门槛</th><th>结果/原因</th></tr></thead><tbody>';(c.close_review.checks||[]).forEach(function(x){h+='<tr><td class="l">'+esc(x.key)+'</td><td>'+esc(radarEvidenceValue(x.actual))+'</td><td>'+esc(x.threshold)+'</td><td>'+esc(x.passed===true?'通过':x.passed===false?'未通过':'待核验')+' '+esc(x.reason||'')+'</td></tr>';});h+='</tbody></table>';}
++    h+='</details>';
++  });
++  h+='<details><summary>行业与题材全部参考</summary><p>'+esc(r.board_relation_status)+'</p>'+(r.boards||[]).map(function(b){return '<p>'+esc(b.type==='industry'?'行业':'题材')+' · '+esc(b.name)+' · 所属板块入选 '+esc(String(b.selected))+' · 剔除本股后同行共同走强 '+esc(String(b.peers_qualified))+'<br>'+esc(JSON.stringify(b.checks))+'</p>';}).join('')+'</details><p>'+esc((r.data_gaps||[]).join('；'))+'</p></div>';
++  return h;
++}

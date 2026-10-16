@@ -1,0 +1,36 @@
+--- before/serve.py
++++ after/serve.py
+@@ -52,6 +52,7 @@
+ import price_only
+ import ui_payload
+ import market_strength
++import ma_trend
+ 
+ LOG_DIR = config.ROOT / "logs"
+ LOG_FILE = LOG_DIR / "serve.log"
+@@ -93,6 +94,8 @@
+          "code_model_version": strength.VERSION,
+          "code_market_strength_version": market_strength.VERSION,
+          "code_market_strength_hash": market_strength.IMPLEMENTATION_HASH,
++         "code_ma_trend_version": ma_trend.VERSION,
++         "code_ma_trend_hash": ma_trend.IMPLEMENTATION_HASH,
+          "code_ui_payload_implementation_hash": ui_payload.IMPLEMENTATION_HASH,
+          "code_board_trend_version": board_trend.VERSION,
+          "code_board_catalog_version": board_center.VERSION,
+@@ -143,6 +146,8 @@
+             SNAPSHOT_META.update({
+                 "snapshot_market_strength_version": (snapshot.get('market_strength') or {}).get('version'),
+                 "snapshot_market_strength_hash": (snapshot.get('market_strength') or {}).get('implementation_hash'),
++                "snapshot_ma_trend_version": (snapshot.get('ma_trend') or {}).get('version'),
++                "snapshot_ma_trend_hash": (snapshot.get('ma_trend') or {}).get('implementation_hash'),
+                 "snapshot_generated_at": snapshot.get("generated_at"),
+                 "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
+                 "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
+@@ -487,6 +492,7 @@
+                            and snapshot.get('board_catalog_version') == board_center.VERSION
+                            and (snapshot.get('market_strength') or {}).get('version') == market_strength.VERSION
+                            and (snapshot.get('market_strength') or {}).get('implementation_hash') == market_strength.IMPLEMENTATION_HASH
++                           and (snapshot.get('ma_trend') or {}).get('implementation_hash') == ma_trend.IMPLEMENTATION_HASH
+                            and (snapshot.get('trend_consolidation') or {}).get('version') == trend_consolidation.VERSION
+                            and (snapshot.get('wyckoff_structure') or {}).get('version') == wyckoff_structure.VERSION
+                            and (snapshot.get('session_context') or {}).get('version') == session_context.VERSION

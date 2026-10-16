@@ -1,0 +1,21 @@
+--- before/test_attack_model.py
++++ test_attack_model.py
+@@ -1,5 +1,7 @@
+ """验证进攻与低波动分离、真实形态、价格口径和时段边界。"""
+ import copy
++import tempfile
++from pathlib import Path
+ from datetime import datetime
+ import unittest
+ from unittest.mock import patch
+@@ -192,7 +194,9 @@
+                                'attack_risk_clear':True}], 'coverage_catalog':[],
+                     'attack_monitor': {'version':attack.VERSION,'count':1,'rows':[{'code':'600001'}]}}
+         quotes = {'600001':{'price':10.5,'last_close':10,'ts':'20260930092000'}}
+-        with patch.object(scoring,'datetime') as clock, \
++        with tempfile.TemporaryDirectory() as test_cache, \
++             patch.object(scoring.config,'SNAPSHOT_JSON',Path(test_cache)/'snapshot.json'), \
++             patch.object(scoring,'datetime') as clock, \
+              patch.object(scoring.df,'build_pool',return_value={'600001':{}}), \
+              patch.object(scoring.df,'realtime_quotes',return_value=quotes), \
+              patch.object(intraday_path,'save_acquisition'), \

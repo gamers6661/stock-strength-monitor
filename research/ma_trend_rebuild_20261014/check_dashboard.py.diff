@@ -1,0 +1,14 @@
+--- before/check_dashboard.py
++++ after/check_dashboard.py
+@@ -34,6 +34,11 @@
+ assert [x['key'] for x in snap['strategies']] == ['trend']
+ import market_strength
+ market_strength.validate(snap)
++if snap.get('ma_trend'):
++    import ma_trend
++    ma_trend.validate(snap)
++    assert snap['ma_trend']==saved['ma_trend']
++    assert 'function mtRender' in html
+ assert snap['market_strength']==saved['market_strength']
+ assert 'market-strength-table' in html and '当前强势' in html
+ assert all(rows[i]['stock_strength_score'] >= rows[i+1]['stock_strength_score'] for i in range(len(rows)-1))

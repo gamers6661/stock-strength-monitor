@@ -1,0 +1,27 @@
+--- before/scoring.py
++++ after/scoring.py
+@@ -37,6 +37,7 @@
+ import radar
+ import scan_cache
+ import market_strength
++import ma_trend
+ 
+ CLOSE_REFRESH_VERSION = '收盘价格优先发布3'
+ 
+@@ -272,6 +273,7 @@
+     price_only.sanitize(snap)
+     snap["close_refresh_version"] = CLOSE_REFRESH_VERSION
+     radar.build_opportunities(snap,quotes,pool,{},formal,calendar,previous_snapshot,persist=True)
++    ma_trend.attach(snap,quotes,pool,formal,calendar,now=scan_started_at,previous=previous_snapshot,fetch_minutes=False)
+     config.atomic_write_text(config.SNAPSHOT_JSON,
+                              json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     print(f"[RUN] 集合竞价有效报价 {len(observed)}/{len(codes)}；沿用完成日线与收盘名单")
+@@ -1360,6 +1362,8 @@
+     session_context.attach(snap,quotes,formal,formal_calendar,contexts=price_contexts)
+     market_strength.attach(snap, quotes, opportunity_pool, formal, formal_calendar,
+                            contexts=price_contexts, now=quote_capture_at, previous=previous_snapshot)
++    ma_trend.attach(snap, quotes, opportunity_pool, formal, formal_calendar,
++                    now=quote_capture_at, previous=previous_snapshot)
+ 
+     timer.mark("盘中与结构", "观察留档与研究")
+     append_history(snap)

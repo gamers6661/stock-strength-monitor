@@ -1,0 +1,45 @@
+--- before/check_live_service.py
++++ after/check_live_service.py
+@@ -30,11 +30,10 @@
+ def run(base="http://127.0.0.1:8848"):
+     status = json.loads(get(base + "/__status"))
+     snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+-    assert status.get('code_radar_opportunity_version')==radar_opportunity.VERSION
+-    assert status.get('snapshot_radar_opportunity_version')==radar_opportunity.VERSION
+-    assert status.get('code_radar_opportunity_hash')==status.get('snapshot_radar_opportunity_hash')==radar_opportunity.IMPLEMENTATION_HASH
+-    assert status.get('code_radar_repair_version')==status.get('snapshot_radar_repair_version')==radar_opportunity.REPAIR_VERSION
+-    radar_opportunity.validate(snapshot)
++    import market_strength
++    assert status['code_market_strength_version']==status['snapshot_market_strength_version']==market_strength.VERSION
++    assert status['code_market_strength_hash']==status['snapshot_market_strength_hash']==market_strength.IMPLEMENTATION_HASH
++    market_strength.validate(snapshot)
+     html = get(base + "/dashboard.html").decode("utf-8")
+     text_report = (config.ROOT / "snapshot_report.md").read_text(encoding="utf-8")
+     marker = "var DATA = "
+@@ -70,7 +69,7 @@
+     assert status["code_board_trend_version"] == board_trend.VERSION
+     assert status['code_board_catalog_version'] == board_center.VERSION
+     assert status['snapshot_board_catalog_version'] == snapshot['board_catalog_version'] == served['board_catalog_version'] == board_center.VERSION
+-    assert status['code_board_opportunity_version'] == status['snapshot_board_opportunity_version'] == board_opportunity.VERSION
++    assert status['snapshot_board_opportunity_version'] == market_strength.VERSION
+     assert snapshot['board_opportunity_model'] == served['board_opportunity_model']
+     assert status['snapshot_board_opportunity_counts'] == served['board_opportunity_model']['counts']
+     board_opportunity.validate(served)
+@@ -85,12 +84,14 @@
+             compressed = ui_payload.unpack(json.loads(gzip.decompress(response.read())))
+         assert compressed['board_opportunity_model'] == served['board_opportunity_model']
+         assert compressed['radar_opportunity'].get('last_close_review')==served['radar_opportunity'].get('last_close_review')
+-        assert compressed['radar_opportunity']['presentation']==served['radar_opportunity']['presentation']
+-        assert all(b['opportunity'] == next(x['opportunity'] for x in served['board_catalog'] if x['id']==b['id']) for b in compressed['board_catalog'])
++        assert compressed['market_strength']==served['market_strength']
++        assert compressed['board_catalog']==ui_payload.summary(served,served['ui_generation'])['board_catalog']
+         example = served['board_catalog'][0]
+         response = json.loads(get(base+'/__ui/detail?'+urlencode({'version':served['ui_generation'],'kind':'board','id':example['id']})))
+         assert response['item']['opportunity'] == example['opportunity']
+-    assert '当前机会' in html and 'function boardOpportunityDetail(b)' in html and 'exportBoardOpportunities' in html
++    assert '当前强势' in html and 'market-strength-table' in html
++    assert served['market_strength']==snapshot['market_strength']
++    market_strength.validate(served)
+     if served['session'] in ('集合竞价', '竞价结束'):
+         import copy
+         expected_auction = copy.deepcopy(served)

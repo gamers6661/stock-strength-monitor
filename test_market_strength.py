@@ -1,0 +1,218 @@
+"""Frozen numerical contract and synthetic market acceptance cases."""
+import copy
+import unittest
+from datetime import datetime,timedelta
+import market_strength as M
+import intraday
+
+
+def fixture(count=10, days=65):
+    now=datetime(2026,10,13,10,0)
+    cal=[];d=now-timedelta(days=110)
+    while d<now:
+        if d.weekday()<5:cal.append(d.date().isoformat())
+        d+=timedelta(days=1)
+    cal=cal[-days:]
+    codes=['600%03d'%i for i in range(count)]
+    histories={c:[dict(date=d,open=100.,close=100.,high=100.5,low=99.5,volume=100.,price_basis='raw',price_basis_source=next(iter(intraday._RAW_HISTORY_SOURCES)),price_precision_digits=2) for d in cal] for c in codes}
+    quotes={c:dict(name=c,price=100.,open=100.,high=101.,low=99.,last_close=100.,change_pct=0.,limit_pct=10.,limit_up=110.,amount_wan=100.,volume_shou=100.,quote_at=str(now),price_basis='raw',price_basis_source=next(iter(intraday._RAW_QUOTE_SOURCES)),last_close_semantics='previous_trade_day_raw_close',last_close_precision_digits=2) for c in codes}
+    pool={c:dict(name=c,board_type='sh_main',limit_pct=10.) for c in codes}
+    snap=dict(stocks=[dict(q,code=c,intraday_risk_flags=['位置偏热'],watch_candidate=False,intraday_trend_ok=False,trend_tier='C') for c,q in quotes.items()],coverage_catalog=[],quote_capture_at=str(now),generated_at=str(now),session='早盘',board_catalog=[dict(id='theme:测试',name='测试',type='theme',member_codes=codes[:])])
+    return snap,quotes,pool,histories,cal,now
+
+
+def run(f):
+    s,q,p,h,c,n=f
+    M.attach(s,q,p,h,c,now=n)
+    return {r['code']:r['market_strength'] for r in s['stocks']+s['coverage_catalog']}
+
+
+class NumericalContract(unittest.TestCase):
+    def test_explicit_percentile_structure_examples(self):
+        # S and K below are explicit test inputs, not claimed market observations.
+        for r,s,k,full,expected in [(6,95,.85,8,70.55),(22,95,.85,20,75.88),(3,95,1,20,47.),(18,95,.5,20,43.67)]:
+            self.assertEqual(M.rounded(M.period_score(r,s,k,full)['T']),expected)
+        slow=[M.period_score(r,95,1,scale)['T'] for r,scale in [(.8,8),(1.5,12),(3,20)]]
+        self.assertEqual(max(slow),47.)
+        self.assertLess(max(slow),65.)
+    def test_structure_boundaries(self):
+        self.assertEqual(M.structure(100,100,100,1.5),1.)
+        self.assertEqual(M.structure(100,100,100,2.5),.85)
+        for x in [(99,100,100,0),(100,100,101,0),(100,100,100,3.5)]:self.assertEqual(M.structure(*x),.5)
+        self.assertAlmostEqual(M.structure(100,100,100,2.500001),.85,places=5)
+    def test_average_rank_and_missing(self):
+        self.assertEqual(M.percentiles({'a':1,'b':1,'c':3,'x':None}),{'a':25.,'b':25.,'c':100.})
+        self.assertEqual(M.percentiles({'a':3}),{'a':50.})
+    def test_round_levels_and_tie(self):
+        self.assertEqual(M.level(64.99),'一般');self.assertEqual(M.level(65),'强');self.assertEqual(M.level(80),'很强');self.assertIsNone(M.level(None))
+        self.assertEqual(M.rounded(64.995),65.)
+        self.assertEqual(M.choose({'5':{'T':80.},'10':{'T':80.},'20':{'T':80.-1e-10}}),(80.,20))
+    def test_nonpositive_emotion_upper_bound(self):
+        for r in (0.,-3.):
+            j=100*M.clamp(r/10);d=.6*j+.4*100
+            e=M.P['emotion_attack_weight']*d+M.P['emotion_hold_weight']*100+M.P['emotion_recent_weight']*100
+            self.assertLessEqual(e,64.)
+    def test_phase_priority_and_unknown(self):
+        self.assertEqual(M.phase(70,90,[70,70,70],True),( '回踩整理',3))
+        self.assertEqual(M.phase(70,20,[70,70,70],False),('推进',3))
+        self.assertEqual(M.phase(70,90,[70,70,30],False),('启动',2))
+        self.assertEqual(M.phase(70,None,[30,30,30],False),('启动',0))
+        self.assertEqual(M.phase(None,70,[30,30,30],None),(None,0))
+        self.assertEqual(M.phase(60,70,[30,30,70],None),('转弱',1))
+        self.assertEqual(M.phase(None,70,[70,30,30],None),(None,1))
+        self.assertEqual(M.phase(70,70,[None,30,30],False),(None,None))
+        self.assertEqual(M.phase(70,70,[30,30,30],None),(None,0))
+
+
+class FullSyntheticPipeline(unittest.TestCase):
+    def test_short_start_without_ma20_or_old_gate(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q))
+        # 5-day improvement; 20-day old high is broken, full MA alignment fails.
+        for offset,close in [(20,120.),(5,101.),(4,102.),(3,103.),(2,104.),(1,105.)]:
+            h[code][-offset].update(open=close,close=close,high=close+.5,low=close-.5)
+        q[code].update(price=106.,last_close=105.,open=105.,high=106.,low=104.,change_pct=100*(106/105-1))
+        r=run(f)[code]
+        self.assertTrue(r['trend_strong']);self.assertEqual(r['dominant_period'],5);self.assertTrue(r['focus'])
+        self.assertIn('短期走强，中期未恢复',r['reasons']);self.assertIn('位置偏热',r['risks'])
+        self.assertEqual(r['background']['label'],'中期未恢复')
+        before=copy.deepcopy(r)
+        s['stocks'][0].update(watch_candidate=True,intraday_trend_ok=True,trend_tier='A',confirmation_samples=999)
+        self.assertEqual(run(f)[code],before)
+    def test_7055_case_through_raw_quotes_bars_and_actual_percentile(self):
+        f=fixture(21);s,q,p,h,c,n=f;code=list(q)[19]
+        for i,co in enumerate(q):
+            v=7. if i==20 else i*.29
+            q[co].update(price=100+v,high=100+v,low=99.,change_pct=v)
+        for offset,close in [(20,106/.92),(10,106/1.02),(5,100.),(4,116.),(3,100.),(2,101.),(1,102.)]:
+            h[code][-offset].update(open=close,close=close,high=close+.5,low=close-.5)
+        q[code].update(price=106.,open=102.,last_close=102.,high=106.,low=102.,change_pct=100*(106/102-1),limit_up=112.2)
+        r=run(f)[code];part=r['trend_parts_by_period']['5']
+        self.assertEqual(part['S'],95.);self.assertGreater(part['K'],.85);self.assertLess(part['K'],1.)
+        self.assertLess(r['trend_score'],70.55)  # only 2% completed-day accumulation, not 6% established trend
+        self.assertFalse(r['trend_strong']);self.assertEqual(r['dominant_period'],5)
+    def test_8330_case_through_raw_quotes_bars_and_actual_percentile(self):
+        f=fixture(21);s,q,p,h,c,n=f;code=list(q)[19]
+        for i,co in enumerate(q):
+            v=24. if i==20 else i
+            for b in h[co][-19:]:b.update(open=100+v,close=100+v,high=100+v+.5,low=100+v-.5)
+            q[co].update(price=100+v,last_close=100+v,open=100+v,high=100+v+.5,low=100+v-.5,change_pct=0.,limit_up=(100+v)*1.1)
+        for i,b in enumerate(h[code][-20:]):
+            v=100+1.3*i;b.update(open=v,close=v,high=v+2.,low=v-2.)
+        for offset,close in [(20,100.),(10,122/1.08),(5,122/.98),(1,132.)]:h[code][-offset].update(open=close,close=close,high=close+2.,low=close-2.)
+        q[code].update(price=122.,last_close=132.,open=132.,high=132.,low=122.,change_pct=100*(122/132-1),limit_up=145.2)
+        r=run(f)[code];part=r['trend_parts_by_period']['20']
+        self.assertEqual(part['S'],95.);self.assertGreaterEqual(part['K'],.5);self.assertLess(part['K'],.85)
+        self.assertGreater(part['dd'],2.5)  # drawdown uses the actual high 134, not close 132
+        self.assertFalse(r['trend_strong']);self.assertEqual(r['dominant_period'],20)
+    def test_midterm_pullback_full_pipeline_today_down(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q))
+        for i,b in enumerate(h[code][-20:]):
+            close=100.+1.2*i;b.update(open=close,close=close,high=close+.5,low=close-.5)
+        last=h[code][-1]['close'];price=last-2.
+        q[code].update(price=price,last_close=last,open=last,high=last,low=price,change_pct=100*(price/last-1))
+        r=run(f)[code];self.assertTrue(r['trend_strong']);self.assertTrue(r['focus']);self.assertEqual(r['phase'],'回踩整理');self.assertLess(q[code]['change_pct'],0)
+        self.assertIn(code,s['market_strength']['stocks']['pullback'])
+    def test_emotion_first_full_pipeline_with_valid_phase(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q))
+        # Recent down-structure forces K=.5; a 9% rebound is still below prior rolling lines.
+        for b in h[code][:-1]:b.update(open=115.,close=115.,high=115.5,low=114.5)
+        q[code].update(price=109.,last_close=100.,open=100.,high=109.,low=100.,change_pct=9.)
+        r=run(f)[code];self.assertFalse(r['trend_strong']);self.assertTrue(r['emotion_strong']);self.assertTrue(r['focus']);self.assertIsNone(r['phase']);self.assertIn('情绪进攻',r['labels']);self.assertNotIn('新进入强势',r['labels'])
+    def test_history_missing_emotion_admitted(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));h[code]=[]
+        q[code].update(price=109.,high=109.,low=100.,open=100.,change_pct=9.)
+        r=run(f)[code]
+        self.assertIsNone(r['trend_score']);self.assertIsNone(r['emotion_score']);self.assertTrue(r['day_attack_strong'])
+        self.assertIn(code,s['market_strength']['stocks']['day_attack']);self.assertIsNone(r['phase'])
+    def test_emotion_missing_does_not_block_trend(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q))
+        for i,b in enumerate(h[code][-20:]):
+            v=100+i;b.update(open=v,close=v,high=v+.5,low=v-.5)
+        q[code].update(price=120.,last_close=119.,change_pct=100*(120/119-1),open=None)
+        r=run(f)[code];self.assertIsNone(r['emotion_score']);self.assertTrue(r['trend_strong']);self.assertTrue(r['focus'])
+    def test_limit_equal_high_low_and_real_trade(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));q[code].update(price=110.,open=110.,high=110.,low=110.,change_pct=10.)
+        r=run(f)[code];self.assertEqual(r['emotion_parts']['H'],50.);self.assertTrue(r['day_attack_strong'])
+        self.assertLess(r['emotion_score'],80.)
+        q[code].update(price=100.,open=100.,high=100.,low=100.,change_pct=0.)
+        self.assertIsNone(run(f)[code]['emotion_score'])
+        q[code].update(price=110.,open=110.,high=110.,low=110.,change_pct=10.,amount_wan=0.,volume_shou=0.)
+        self.assertIsNone(run(f)[code]['emotion_score'])
+    def test_emotion_reference_pool_includes_valid_r0_unknown_hold(self):
+        f=fixture();code=next(iter(f[1]));f[1][code].update(high=100.,low=100.,price=100.,open=100.)
+        r=run(f);self.assertIsNone(r[code]['emotion_score']);pool=f[0]['market_strength']['emotion_reference_pools']['10.0']
+        self.assertEqual(pool['N'],10);self.assertEqual(pool['valid'],9);self.assertIn(code,pool['member_codes'])
+    def test_strict_limit_half_tick(self):
+        f=fixture();q=f[1][next(iter(f[1]))];q.update(price=109.99,open=109.99,high=109.99,low=109.99,change_pct=9.99)
+        self.assertIsNone(M.emotion_raw(q)[0]);q.update(price=110.,open=110.,high=110.,low=110.)
+        self.assertEqual(M.emotion_raw(q)[0]['H'],50.)
+    def test_push_vs_high_open_fall(self):
+        f=fixture();s,q,p,h,c,n=f;a,b=list(q)[:2]
+        q[a].update(price=105.,change_pct=5.,open=100.,high=105.,low=100.)
+        q[b].update(price=105.,change_pct=5.,open=108.,high=110.,low=100.)
+        r=run(f);self.assertEqual(r[a]['emotion_parts']['S0'],r[b]['emotion_parts']['S0']);self.assertGreater(r[a]['emotion_score'],r[b]['emotion_score'])
+    def test_slow_high_rank_and_damaged_old_gain(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));q[code].update(price=101.,change_pct=1.,high=101.)
+        self.assertFalse(run(f)[code]['trend_strong'])
+        # High historical return cannot overcome damage on all three periods.
+        for b in h[code][-19:]:b.update(open=130.,close=130.,high=130.5,low=129.5)
+        q[code].update(price=118.,last_close=130.,change_pct=-9.,open=118.,high=118.,low=117.)
+        r=run(f)[code];self.assertLessEqual(r['trend_score'],50.);self.assertFalse(r['trend_strong'])
+    def test_next_round_exit_no_wait(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));q[code].update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
+        self.assertTrue(run(f)[code]['focus']);q[code].update(price=100.,open=100.,high=101.,low=99.,change_pct=0.)
+        self.assertFalse(run(f)[code]['focus'])
+    def test_board_one_leader_does_not_make_resonance(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));q[code].update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
+        r=run(f);b=s['board_catalog'][0]['market_strength'];self.assertTrue(r[code]['focus']);self.assertFalse(b['focus']);self.assertIn(code,b['emotion_parts']['trimmed_codes']);self.assertEqual(b['emotion_parts']['B'],10.)
+    def test_board_emotion_axis_independent_and_dedup(self):
+        f=fixture(6);s,q,p,h,c,n=f
+        for code in q:
+            # The six-day emotion history is sufficient while ATR/trend history is unavailable.
+            h[code]=h[code][-6:];q[code].update(price=110.,high=110.,low=100.,open=100.,change_pct=10.)
+        s['board_catalog'][0]['member_codes']*=2
+        s['board_catalog'].append(dict(id='theme:重复',name='重复',type='theme',member_codes=list(q)))
+        run(f);b=s['board_catalog'][0]['market_strength'];self.assertIsNone(b['trend_score']);self.assertEqual(b['expected'],6)
+        self.assertTrue(b['emotion_strong']);self.assertEqual(s['market_strength']['counts']['focus'],6)
+        self.assertEqual(len(s['market_strength']['stocks']['day_attack']),6)
+        self.assertEqual(len(s['board_catalog'][0]['members']),6)
+    def test_board_periods_independent(self):
+        stocks={str(i):M.empty('time','test') for i in range(8)}
+        for m in stocks.values():m['trend_parts_by_period']={'5':dict(R=6.,historical_R=6.,K=1.,T=85.),'10':dict(T=None),'20':dict(T=None)}
+        boards=[dict(id='theme:x',type='theme',member_codes=list(stocks))]
+        r=M.board_scores(boards,stocks,list(stocks))['theme:x'];self.assertTrue(r['trend_strong']);self.assertEqual(r['dominant_period'],5);self.assertIsNone(r['trend_parts_by_period']['20']['T'])
+        stocks['0']['trend_parts_by_period']['5']['T']=None
+        stocks['1']['trend_parts_by_period']['5']['T']=None
+        self.assertIsNone(M.board_scores(boards,stocks,list(stocks))['theme:x']['trend_score']) # 6/8=75% even with six samples
+    def test_freshness_lunch_and_afternoon(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));q[code]['quote_at']=str(n-timedelta(hours=1))
+        self.assertIsNone(run(f)[code]['trend_score'])
+        s['session']='午间休市';f=(*f[:5],n.replace(hour=12));q[code]['quote_at']='2026-10-13 11:30:00';self.assertIsNotNone(run(f)[code]['trend_score'])
+        s['session']='午盘';f=(*f[:5],n.replace(hour=13,minute=1));self.assertIsNone(run(f)[code]['trend_score'])
+    def test_raw_data_unchanged_close_not_double_counted(self):
+        f=fixture();s,q,p,h,c,n=f;inputs=copy.deepcopy((q,p,h,c,s['board_catalog'][0]['member_codes']))
+        a=run(f);self.assertEqual(inputs,(q,p,h,c,s['board_catalog'][0]['member_codes']))
+        # Add a formal today bar. It must be excluded from the prior window.
+        for code in h:h[code].append(dict(h[code][-1],date=n.date().isoformat()))
+        b=run(f)
+        for code in a:self.assertEqual(a[code]['trend_score'],b[code]['trend_score'])
+    def test_reference_not_current(self):
+        for session in ('集合竞价','竞价结束','盘前','非交易日','收盘竞价'):
+            f=fixture();f[0]['session']=session;run(f);self.assertEqual(f[0]['market_strength']['counts']['focus'],0);self.assertEqual(f[0]['market_strength']['mode'],'参考行情')
+    def test_close_auction_uses_original_reference_time(self):
+        f=fixture();s,q,p,h,c,n=f
+        for v in q.values():v.update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
+        run(f);previous=copy.deepcopy(s);now=n.replace(hour=14,minute=58)
+        M.attach(s,q,p,h,c,now=now,previous=previous)
+        self.assertEqual(s['market_strength']['mode'],'参考行情')
+        self.assertEqual(s['stocks'][0]['market_strength']['trend_at'],str(n));self.assertIn('参考行情',s['board_catalog'][0]['market_strength']['mode'])
+    def test_post_close_quote_valid_without_duplicate_history(self):
+        f=fixture();s,q,p,h,c,n=f;code=next(iter(q));q[code]['quote_at']='2026-10-13 15:02:00'
+        s['session']='已收盘';M.attach(s,q,p,h,c,now=n.replace(hour=15,minute=5))
+        self.assertIsNotNone(s['stocks'][0]['market_strength']['trend_score'])
+    def test_actual_historical_evaluation_no_future(self):
+        f=fixture();s,q,p,h,c,n=f;day=c[-2];a=M.historical_scores(h,c,day)
+        for bars in h.values():bars[-1].update(close=500.,high=501.,low=99.)
+        self.assertEqual(a,M.historical_scores(h,c,day))
+
+if __name__=='__main__':unittest.main()

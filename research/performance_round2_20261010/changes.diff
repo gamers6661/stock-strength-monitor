@@ -1,0 +1,1602 @@
+--- before/board_trend.py
++++ after/board_trend.py
+@@ -9,6 +9,7 @@
+ 
+ import config
+ import datafeed
++import scan_cache
+ 
+ VERSION = "板块实时趋势3"
+ WINDOW = 22  # 当前/前一天的 MA20 斜率以及20个含跳空TR。
+@@ -227,6 +228,12 @@
+ 
+ 
+ def calculate(bars, calendar, asof):
++    return scan_cache.cached('board_replay', str(bars[0] if bars else ''),
++        [scan_cache.rules('board_trend.py', 'config.py'), bars, calendar, asof, RULES],
++        lambda: _calculate(bars, calendar, asof))
++
++
++def _calculate(bars, calendar, asof):
+     calendar = sorted(set(d for d in calendar if d <= asof))
+     # 重复日期、非交易日、未完成当日均不允许污染窗口。
+     by_date = {b["date"]: b for b in bars if valid(b) and b["date"] in calendar}
+--- before/classification.py
++++ after/classification.py
+@@ -4,9 +4,17 @@
+ 行业始终单列，不把交易板别或概念当行业。
+ """
+ import datafeed as df
++import scan_cache
+ 
+ 
+ def reconcile(theme_map, profiles, catalog, codes=None):
++    return scan_cache.cached('classification', 'current_pool',
++        [scan_cache.rules('classification.py', 'datafeed.py', 'config.py'), theme_map, profiles, catalog,
++         sorted(codes) if codes is not None else None],
++        lambda: _reconcile(theme_map, profiles, catalog, codes))
++
++
++def _reconcile(theme_map, profiles, catalog, codes=None):
+     result = {}
+     stats = {"f10_confirmed": 0, "member_pending": 0,
+              "concept_disagreements": 0, "industry_missing": 0}
+--- before/config.py
++++ after/config.py
+@@ -358,7 +358,10 @@
+     # 所以从 70 根提到 160 根（覆盖 120 分位窗口 + MA60 + 缓冲）。
+     # 代价：库体积约翻倍，全量重拉一次约 3-5 分钟。
+     "days": 160,
+-    "workers": 10,       # 并发线程（腾讯K线不封IP）
++    "workers": 10,       # 保持原并发，失败退避，不假定数据源不会限流。
++    "increment_days": 20,
++    "repair_per_scan": 50,
++    "increment_deadline_seconds": 60,
+     "ma_windows": [5, 10, 20, 60],
+     "rs_windows": {"short": 5, "mid": 20, "long": 60},   # 多周期相对强度
+     # 整批抓取的硬超时（秒）。单条请求 timeout=20×retry=2 最坏 60 秒，
+--- before/daily.py
++++ after/daily.py
+@@ -49,7 +49,7 @@
+     # 2. 看板
+     try:
+         import make_dashboard
+-        page = make_dashboard.build()
++        page = make_dashboard.build(snap)
+         if page is None or not page.exists():
+             raise RuntimeError('看板页面未生成')
+     except Exception as e:
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -1756,7 +1756,7 @@
+        }
+        if(RF.followBackground){
+          if(s.scan_active){
+-           rfLabel('后台刷新中 '+sec+'s',true);
++           rfLabel(((s.scan_progress||{}).stage||'后台刷新中')+' '+sec+'s',true);
+            if(sec>180&&!RF.warned){
+              RF.warned=true;
+              toast('后台仍在获取行情与历史数据，完成后本页自动更新');
+@@ -1773,7 +1773,7 @@
+          return;
+        }
+        if(rf.running){
+-         rfLabel('刷新中 '+sec+'s',true);
++         rfLabel(((s.scan_progress||{}).stage||'刷新中')+' '+sec+'s',true);
+         // 分类成员与概念指数映射由明确的分类更新命令维护；这里仅等待行情扫描。
+         if(sec>180&&!RF.warned){
+           RF.warned=true;
+--- before/datafeed.py
++++ after/datafeed.py
+@@ -20,7 +20,7 @@
+ import urllib.parse
+ import urllib.request
+ from contextlib import redirect_stderr, redirect_stdout
+-from concurrent.futures import ThreadPoolExecutor, as_completed
++from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+ from datetime import datetime, timedelta
+ 
+ import config
+@@ -294,7 +294,7 @@
+ 
+ 
+ def tencent_quotes(codes):
+-    """腾讯批量行情。codes 建议 <=400/批。不封 IP。"""
++    """每400只一批，保持串行节奏；单批失败留到下一轮，避免叠加重试。"""
+     t0 = time.time()
+     out = {}
+     failed = 0
+@@ -302,7 +302,7 @@
+         batch = codes[i:i + 400]
+         url = "https://qt.gtimg.cn/q=" + ",".join(_tencent_prefix(c) + c for c in batch)
+         try:
+-            txt = http_get(url, encoding="gbk")
++            txt = http_get(url, encoding="gbk", timeout=6, retry=0)
+         except Exception as e:
+             failed += 1
+             print(f"[WARN] 腾讯行情批次失败: {e}")
+@@ -680,9 +680,10 @@
+ # 避免每条请求都把三个主机各试一遍（5000 只 × 3 次 = 白等几百秒）。
+ _KLINE_HOST_IDX = 0
+ _KLINE_HOST_LOCK = threading.Lock()
+-
+-
+-def fetch_kline(code, days=None):
++_KLINE_HOST_COOLDOWN = {}
++
++
++def fetch_kline(code, days=None, deadline_at=None):
+     """前复权日K。返回按日期升序的 list[dict]
+ 
+     带**主机级故障转移**：腾讯的 K 线主机和东财一样会按域名封禁。
+@@ -695,15 +696,26 @@
+     hosts = config.KLINE.get("hosts") or []
+     if not hosts:
+         raise RuntimeError("config.KLINE['hosts'] 为空")
+-    # 先试上次成功的那个
+-    order = sorted(range(len(hosts)), key=lambda i: i != _KLINE_HOST_IDX)
++    deadline_at = min(deadline_at or float('inf'), time.monotonic()+config.KLINE.get('request_budget', 24))
++    # Host failures cool down across workers; retries are bounded across all hosts.
++    with _KLINE_HOST_LOCK:
++        order = sorted((i for i in range(len(hosts))
++                        if _KLINE_HOST_COOLDOWN.get(hosts[i], 0) <= time.monotonic()),
++                       key=lambda i: i != _KLINE_HOST_IDX)
++    if not order:
++        raise RuntimeError('K线主机冷却中，下一轮重试')
+     last_err = None
+     for i in order:
++        remaining = deadline_at-time.monotonic()
++        if remaining <= 0:
++            break
+         url = f"{hosts[i]}?param={pfx}{code},day,,,{days},qfq"
+         try:
+-            d = json.loads(http_get(url))
++            d = json.loads(http_get(url, timeout=min(config.KLINE.get('request_timeout', 8), remaining), retry=0))
+         except Exception as e:
+             last_err = e
++            with _KLINE_HOST_LOCK:
++                _KLINE_HOST_COOLDOWN[hosts[i]] = time.monotonic()+60
+             continue
+         node = (d.get("data") or {}).get(pfx + code) or {}
+         qfq_rows = node.get("qfqday") or []
+@@ -751,8 +763,8 @@
+     raise last_err if last_err else RuntimeError("所有K线主机均不可用")
+ 
+ 
+-def fetch_klines_bulk(codes, workers=None, progress=True, days=None):
+-    """并发拉取K线。腾讯不封IP，可安全并发。
++def fetch_klines_bulk(codes, workers=None, progress=True, days=None, deadline_seconds=None):
++    """并发拉取K线；保持并发上限并对失败主机冷却。
+ 
+     带整批硬超时（config.KLINE["deadline_seconds"]）：腾讯侧一旦限流，
+     单条最多要等 20s×2 次重试，3114 只 × 10 线程能把日更任务拖成"看上去卡死"。
+@@ -763,19 +775,21 @@
+     写进去就等于永久拉黑几千只股票（踩过这个坑）。
+     """
+     workers = workers or config.KLINE["workers"]
+-    deadline = config.KLINE.get("deadline_seconds", 420)
++    deadline = deadline_seconds if deadline_seconds is not None else config.KLINE.get("deadline_seconds", 420)
+     result, done = {}, [0]
+     total = len(codes)
+-    t0 = time.time()
++    t0 = time.monotonic()
++    deadline_at = t0+deadline
+ 
+     def work(c):
+         try:
+-            return c, fetch_kline(c, days=days)
++            return c, fetch_kline(c, days=days, deadline_at=deadline_at)
+         except Exception:
+             return c, []
+ 
+     truncated = False
+-    with ThreadPoolExecutor(max_workers=workers) as ex:
++    ex = ThreadPoolExecutor(max_workers=workers)
++    try:
+         futs = [ex.submit(work, c) for c in codes]
+         try:
+             for f in as_completed(futs, timeout=deadline):
+@@ -785,13 +799,20 @@
+                 done[0] += 1
+                 if progress and done[0] % 500 == 0:
+                     print(f"  [KLINE] {done[0]}/{total}")
+-        except TimeoutError:
++        except FuturesTimeoutError:
+             truncated = True
+             for f in futs:
+                 f.cancel()
++    finally:
++        # Running requests cannot be cancelled. They are read-only, independently bounded,
++        # and their late results are discarded; never wait for the executor on timeout.
++        ex.shutdown(wait=not truncated)
+     if truncated:
+         print(f"[WARN] K线抓取超时（>{deadline}s）：已取 {done[0]}/{total} 只，"
+               f"其余沿用库内旧数据（涨幅与评分仍可用，日线可能少最后一根）")
++    _source_mark('tencent_kline', 'partial' if truncated or len(result)<total else 'ok',
++                 elapsed=time.monotonic()-t0, coverage=len(result),
++                 detail=f'requested={total}, days={days or config.KLINE["days"]}, timeout={truncated}')
+     return result, truncated
+ 
+ 
+@@ -801,7 +822,7 @@
+ def _ths_board_kline_raw(idx_code):
+     """同花顺板块日线原始返回"""
+     url = f"http://d.10jqka.com.cn/v6/line/bk_{idx_code}/01/last.js"
+-    txt = http_get(url, headers={"Referer": "http://q.10jqka.com.cn/"}, encoding="gbk")
++    txt = http_get(url, headers={"Referer": "http://q.10jqka.com.cn/"}, encoding="gbk", timeout=8, retry=0)
+     m = re.search(r"\((.*)\)\s*;?\s*$", txt.strip(), re.S)
+     if not m:
+         return None
+@@ -2478,6 +2499,7 @@
+ def save_klines(conn, table, key_name, data_map):
+     """data_map: {code: list[dict]}"""
+     rows = []
++    before = conn.total_changes
+     if table == "kline":
+         for code, ks in data_map.items():
+             for k in ks:
+@@ -2485,8 +2507,10 @@
+                              k["low"], k["volume"], k.get("amount", 0),
+                              k.get("price_basis"), k.get("price_basis_source")))
+         conn.executemany(
+-            f"INSERT OR REPLACE INTO {table}({key_name},date,open,close,high,low,volume,amount,price_basis,price_basis_source) "
+-            f"VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
++            f"INSERT INTO {table}({key_name},date,open,close,high,low,volume,amount,price_basis,price_basis_source) "
++            f"VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT({key_name},date) DO UPDATE SET "
++            + ','.join(f'{k}=excluded.{k}' for k in ('open','close','high','low','volume','amount','price_basis','price_basis_source'))
++            + ' WHERE ' + ' OR '.join(f'{table}.{k} IS NOT excluded.{k}' for k in ('open','close','high','low','volume','amount','price_basis','price_basis_source')), rows)
+     else:
+         for code, ks in data_map.items():
+             for k in ks:
+@@ -2496,7 +2520,7 @@
+             f"INSERT OR REPLACE INTO {table}({key_name},date,open,close,high,low,volume,amount) "
+             f"VALUES(?,?,?,?,?,?,?,?)", rows)
+     conn.commit()
+-    return len(rows)
++    return conn.total_changes-before
+ 
+ 
+ def load_kline(conn, table, key_name, code, limit=None):
+@@ -2505,7 +2529,11 @@
+              f"FROM {table} WHERE {key_name}=? ORDER BY date")
+     else:
+         q = f"SELECT date,open,close,high,low,volume,amount FROM {table} WHERE {key_name}=? ORDER BY date"
+-    rows = conn.execute(q, (code,)).fetchall()
++    if limit and int(limit) > 0:
++        q = q.rsplit('ORDER BY date', 1)[0] + 'ORDER BY date DESC LIMIT ?'
++        rows = list(reversed(conn.execute(q, (code, int(limit))).fetchall()))
++    else:
++        rows = conn.execute(q, (code,)).fetchall()
+     if table == "kline":
+         ks = [{"date": r[0], "open": r[1], "close": r[2], "high": r[3],
+                "low": r[4], "volume": r[5], "amount": r[6],
+--- before/intraday.py
++++ after/intraday.py
+@@ -1605,18 +1605,18 @@
+ 
+ def build_validation_report():
+     """按交易日与规则版本汇总下一扫描、较长盘中窗口和收盘后表现。"""
++    import scan_cache
+     all_pairs = []
+     try:
+         if PAIR_HISTORY_PATH.exists():
+-            all_pairs = [json.loads(line) for line in PAIR_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+-                         if line.strip()]
++            all_pairs = scan_cache.read_json(PAIR_HISTORY_PATH, lines=True)
+     except (OSError, ValueError):
+         all_pairs = []
+     pairs = [p for p in all_pairs if p.get("model_version") == VERSION
+              and p.get("rule_version") == config.INTRADAY_RULE_VERSION]
+     close_records = []
+     try:
+-        close_records = [json.loads(path.read_text(encoding="utf-8"))
++        close_records = [scan_cache.read_json(path)
+                          for path in sorted(CLOSE_HISTORY_DIR.glob("????-??-??.json"))]
+     except (OSError, ValueError):
+         close_records = []
+--- before/make_dashboard.py
++++ after/make_dashboard.py
+@@ -56,11 +56,12 @@
+ 
+ 
+ @config.single_writer
+-def build():
+-    if not config.SNAPSHOT_JSON.exists():
++def build(snap=None):
++    if snap is None and not config.SNAPSHOT_JSON.exists():
+         print("[ERR] 还没有数据快照，请先运行：python scoring.py full")
+         return None
+-    snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
++    if snap is None:
++        snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+     import price_only
+     price_only.sanitize(snap)
+     import scoring
+--- before/README.md
++++ after/README.md
+@@ -113,6 +113,14 @@
+ 
+ 25日窗口扩大了比较池，日线基础强度研究版5另存于 `cache/stock_strength_daily/v5/`；35/25/20/20权重不变，旧版分位不与新版直接相减。
+ 
++## 2026-10-10 第二轮后台性能优化
++
++每轮继续获取最新报价，完成日线的纯计算结果按输入、样本、成员、日历和规则源码缓存；数据或规则变化自动重算。缺失正式日线通常拉最近20根并核对重叠，只有变化行写库；复权/价格口径变化要求完整历史修复后才恢复相关均线判断。失败退避与分批修复避免每五分钟重复全池重抓。刷新仍为五分钟、K线并发仍为10，筛选与评分规则保持原设定。
++
++`/__status` 新增 `scan_progress` 与 `last_pipeline_performance`；完整成功扫描将扫描至发布总耗时写入 `cache/last_pipeline_performance.json`。新增 `cache/scan_features.db` 只存派生计算缓存，不代替行情或正式历史。常规增量60秒、收盘180秒为采集阶段预算，不代表整个刷新周期的承诺时间。
++
++本地冻结基准扫描107.156秒→热缓存38.546秒，全量判断对照无差异，410项测试通过。实际交易时段网络总耗时仍待运行记录验证。详见[第二轮计划核查与验收](research/performance_round2_20261010/计划核查与验收.md)。
++
+ ## 2026-10-09 完整性排查
+ 
+ 扫描、分类周更、离线重建和看板发布共用跨进程锁，避免不同入口并发覆盖。单文件原子写使用独立临时文件；历史半行记录等待补齐后读取。旧规则进攻资格不复用，报价及可比均线事实仍保留。发布失败返回非零状态，不能报告更新成功。
+--- before/scoring.py
++++ after/scoring.py
+@@ -32,6 +32,7 @@
+ import strength
+ import theme_assist
+ import radar
++import scan_cache
+ 
+ CLOSE_REFRESH_VERSION = '收盘价格优先发布3'
+ 
+@@ -400,35 +401,85 @@
+     idx_codes = list(ths_map.keys())
+     t0 = time.time()
+ 
+-    from concurrent.futures import ThreadPoolExecutor, as_completed
++    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
++    # The legacy board score may consume an unfinished bar. Reuse only when its
++    # last bar is complete, and the source has been checked on this observation day.
++    now = datetime.now()
++    observation_day = now.strftime('%Y-%m-%d')
++    target = conn.execute('SELECT MAX(date) FROM kline').fetchone()[0]
++    cache_rule = scan_cache.signature([scan_cache.rules('datafeed.py', 'factors.py'), observation_day, target])
++    history_counts = Counter()
++    batch_deadline = time.monotonic()+60
+ 
+     def work(ic):
+         try:
+-            nm, ks = df.fetch_ths_board_kline(ic)
+-            if nm == ths_map.get(ic) and ks:
+-                # 新板块观察独立落库，不改变下方既有评分输入。
+-                import board_trend
+-                try:
+-                    board_trend.save(ic, ks)
+-                except Exception as error:
+-                    print(f"[WARN] 板块日线落库失败 {ic}: {error}")
++            if time.monotonic() >= batch_deadline:
++                return None
++            saved = scan_cache.get('board_history', ic, cache_rule) if not refresh else None
++            if saved and saved.get('name') == ths_map.get(ic):
++                nm, ks = saved['name'], saved['bars']
++                history_counts['reused'] += 1
++            else:
++                retry = scan_cache.get('board_history_retry', ic, 'retry') or {}
++                if not refresh and retry.get('next_retry', 0) > time.time():
++                    history_counts['deferred'] += 1
++                    return None
++                history_counts['requested'] += 1
++                nm, ks = df.fetch_ths_board_kline(ic)
++                if nm != ths_map.get(ic) or len(ks) < 25:
++                    raise ValueError('板块历史名称或窗口未齐全')
++                scan_cache.put('board_history_retry', ic, 'retry', {})
++                completed_today = now.hour*60+now.minute >= 15*60+5
++                if (nm == ths_map.get(ic) and len(ks) >= 25 and ks[-1]['date'] >= (target or '')
++                        and (ks[-1]['date'] < observation_day or completed_today)):
++                    scan_cache.put('board_history', ic, cache_rule, dict(name=nm, bars=ks))
+             if nm and len(ks) >= 25:
+                 m = F.board_raw_metrics(ks)
+                 m["name"] = nm
+                 m["idx_code"] = ic
+                 m["last_date"] = ks[-1]["date"]
++                m['completed_date'] = max((b['date'] for b in ks if b['date'] < observation_day
++                    or b['date'] == observation_day and now.hour*60+now.minute >= 15*60+5), default=None)
++                if not saved or not saved.get('stored'):
++                    m['_history'] = ks
+                 return m
+-        except Exception:
+-            pass
++        except Exception as error:
++            history_counts['failed'] += 1
++            state = scan_cache.get('board_history_retry', ic, 'retry') or {}
++            failures = state.get('failures', 0)+1
++            scan_cache.put('board_history_retry', ic, 'retry', dict(failures=failures,
++                next_retry=time.time()+min(1800, 300*2**min(failures-1, 3)), error=str(error)[:160]))
+         return None
+ 
+-    with ThreadPoolExecutor(max_workers=8) as ex:
++    ex = ThreadPoolExecutor(max_workers=8)
++    truncated = False
++    try:
+         futs = [ex.submit(work, ic) for ic in idx_codes]
+-        for f in as_completed(futs):
+-            r = f.result()
+-            if r:
+-                ths_rows.append(r)
++        try:
++            for f in as_completed(futs, timeout=max(.01,batch_deadline-time.monotonic())):
++                r = f.result()
++                if r:
++                    bars_to_save = r.pop('_history', None)
++                    if bars_to_save:
++                        import board_trend
++                        try:
++                            board_trend.save(r['idx_code'], bars_to_save)
++                            payload = scan_cache.get('board_history', r['idx_code'], cache_rule)
++                            if payload:
++                                payload['stored'] = True
++                                scan_cache.put('board_history', r['idx_code'], cache_rule, payload)
++                        except Exception as error:
++                            print(f"[WARN] 板块日线落库失败 {r['idx_code']}: {error}")
++                    ths_rows.append(r)
++        except FuturesTimeoutError:
++            truncated = True
++            for future in futs:
++                future.cancel()
++    finally:
++        ex.shutdown(wait=not truncated)
+     print(f"[BOARD] 同花顺板块有效 {len(ths_rows)} 个，耗时 {time.time()-t0:.1f}s")
++    df._source_mark('ths_board_history', 'partial' if len(ths_rows)<len(idx_codes) else 'ok',
++                   elapsed=time.time()-t0, coverage=len(ths_rows), detail=json.dumps(dict(history_counts)))
+ 
+     # 剔除「风格 / 状态」类板块（次新股、低价股、融资融券、AH股、指数…）：
+     # 它们没有题材含义、成分股跨行业，混进强度榜会挤掉真正有资金聚集的题材，
+@@ -506,6 +557,7 @@
+         score *= gate
+         boards.append({
+             "name": r["name"], "idx_code": r["idx_code"],
++            "last_date": r["last_date"], "completed_date": r.get('completed_date'),
+             "ret1": round(r["ret1"] or 0, 2),
+             "ret5": round(r["ret5"] or 0, 2),
+             "ret20": round(r["ret20"] or 0, 2),
+@@ -655,104 +707,24 @@
+     return ready
+ 
+ 
+-def load_klines(conn, codes, quotes, refresh=False, progress=True):
+-    """读缓存K线；缺失的补拉；盘中用实时行情覆盖/追加当日bar
+-
+-    「无K线」黑名单：长期停牌等取不到历史数据的标的只尝试一次，
+-    结果记入 no_kline.json，后续直接跳过，避免每次白跑（实测可省 75 秒）。
+-    """
+-    nk_path = config.CACHE_DIR / "no_kline.json"
+-    no_kline = set()
+-    if nk_path.exists():
+-        try:
+-            no_kline = set(json.loads(nk_path.read_text(encoding="utf-8")))
+-        except Exception:
+-            no_kline = set()
+-
+-    have = {r[0] for r in conn.execute("SELECT DISTINCT code FROM kline")}
+-    bars = dict(conn.execute("SELECT code, COUNT(*) FROM kline GROUP BY code"))
+-    # 每天盘中的最新K线只在内存中追加，不会写入库。次日必须补齐昨日完成日线，
+-    # 否则当前报价会追加今天的未完成bar，而趋势判断悄悄退回前天。
+-    latest = {c: (d, close) for c, d, close in conn.execute(
+-        "SELECT k.code,k.date,k.close FROM kline k JOIN "
+-        "(SELECT code,MAX(date) AS date FROM kline GROUP BY code) m "
+-        "ON k.code=m.code AND k.date=m.date")}
+-    quote_day_by_code = {c: intraday.quote_day(q.get("quote_at") or q.get("ts"), datetime.now())
+-                         for c, q in quotes.items()}
+-    quote_dates = Counter(day for day in quote_day_by_code.values() if day)
+-    quote_day = quote_dates.most_common(1)[0][0] if quote_dates else ""
+-    comparable = [(c, q) for c, q in quotes.items() if c in latest and
+-                  quote_day_by_code.get(c) == quote_day
+-                  and latest[c][0] < quote_day and
+-                  num(q.get("last_close")) > 0 and latest[c][1] > 0]
+-    changed = sum(abs(num(q["last_close"]) - latest[c][1]) > 0.005 for c, q in comparable)
+-    stale_day = bool(len(comparable) >= 100 and changed / len(comparable) > 0.2)
+-    # 黑名单**自愈**：只要库里已经有这个标的的K线，就把它从黑名单剔除。
+-    # 黑名单本意是记"长期停牌/退市、确实取不到历史数据"的标的，
+-    # 但历史上被一次网络抖动误写进去过一大批 —— 实测 389 条里有 373 条
+-    # 其实有最新K线（连比亚迪都在里面）。它们被永久跳过，等于每天悄悄少一根。
+-    # 现在用"库里有没有数据"这个事实去校正名单，误伤无法累积。
+-    stale_black = no_kline & have
+-    if stale_black:
+-        no_kline -= stale_black
+-        print(f"[KLINE] 黑名单自愈：移除 {len(stale_black)} 只误伤标的（库内已有K线）")
+-        try:
+-            nk_path.write_text(json.dumps(sorted(no_kline), ensure_ascii=False),
+-                               encoding="utf-8")
+-        except Exception:
+-            pass
+-    # 需要的根数：波段/短线模型要用 120 日历史分位，缓存必须有 config.KLINE["days"] 级别的量。
+-    # 只按"在不在库里"判断是不够的 —— K线窗口从 70 调大到 160 后，老标的明明
+-    # 在库里却只有 70 根，会被 Risk Gate 的 120 交易日门槛整体挡掉。
+-    # 所以这里额外按**根数**判断，缺多少补多少（留 10% 容差）。
+-    need = int(config.KLINE["days"] * 0.9)
+-    missing = [c for c in codes
+-               if (refresh or c not in have or bars.get(c, 0) < need)
+-               and (refresh or c not in no_kline)]
+-    if not refresh and missing:
+-        n_have = sum(1 for c in missing if c in have)
+-        print(f"[KLINE] 其中 {n_have} 只是历史不足 {need} 根，本周轮补齐")
+-    if missing:
+-        print(f"[KLINE] 需拉取 {len(missing)} 只 ...")
+-        t0 = time.time()
+-        got, truncated = df.fetch_klines_bulk(missing, progress=progress)
+-        n = df.save_klines(conn, "kline", "code", got)
+-        empty = [c for c in missing if c not in got]
+-        # 黑名单只记"确实没有历史数据"的标的：
+-        #  · 整批超时（truncated）时一律不记 —— 那只是这次请求没排上队；
+-        #  · 一次失败占比超过 5% 也不记 —— 全市场级别的大面积失败只可能是
+-        #    数据源侧出问题，写进去会把几千只正常股票永久拉黑。
+-        mass_fail = len(empty) > max(20, len(missing) * 0.05)
+-        if empty and not truncated and not mass_fail:
+-            no_kline |= set(empty)
+-            try:
+-                nk_path.write_text(json.dumps(sorted(no_kline), ensure_ascii=False),
+-                                   encoding="utf-8")
+-            except Exception:
+-                pass
+-        elif empty:
+-            why = "整批超时" if truncated else f"失败占比 {len(empty)/max(1,len(missing))*100:.0f}%（疑似数据源异常）"
+-            print(f"[WARN] {len(empty)} 只未取到K线（{why}），本次不写入无数据黑名单")
+-        print(f"[KLINE] 写入 {n} 行，新增无数据标的 {len(empty)} 只，耗时 {time.time()-t0:.1f}s")
+-    if stale_day:
+-        stale = [c for c, _ in comparable if c not in missing]
+-        print(f"[KLINE] 上日收盘与缓存不符 {changed}/{len(comparable)} 只，补齐 {len(stale)} 只最近日线")
+-        if stale:
+-            got, truncated = df.fetch_klines_bulk(stale, progress=progress, days=30)
+-            covered = sum(any(latest[c][0] < b["date"] < quote_day for b in got.get(c, [])) for c in stale)
+-            if covered < len(stale) * 0.8:
+-                raise DataNotReady(f"昨日完成日线仅补齐 {covered}/{len(stale)} 只，保留上一份快照")
+-            n = df.save_klines(conn, "kline", "code", got)
+-            print(f"[KLINE] 补齐 {covered}/{len(stale)} 只、写入 {n} 行；本轮不用过期趋势日线")
+-    if no_kline:
+-        print(f"[KLINE] 黑名单跳过 {len(no_kline & set(codes))} 只（无历史数据）")
+-
++def load_klines(conn, codes, quotes, refresh=False, progress=True,
++                required_day=None, history_cache=None, telemetry=None, budget_seconds=None):
++    """增量补齐正式历史；盘中报价仅覆盖内存比较副本，失败进入退避队列。"""
++    import history_increment
++    acquisition = history_increment.update(conn, codes, quotes, required_day,
++                                           force=refresh, progress=progress, budget_seconds=budget_seconds)
++    if telemetry is not None:
++        telemetry.update(acquisition)
++    history_cache = history_cache if history_cache is not None else {}
++    pending = {c for c, payload in conn.execute('SELECT code,payload FROM kline_fetch_state')
++               if json.loads(payload).get('integrity_pending')}
+     out = {}
+     for c in codes:
+-        if c in no_kline and c not in have:
+-            out[c] = []
+-            continue
+         ks = df.load_kline(conn, "kline", "code", c)
++        if c in pending:
++            # Keep originals in SQLite; unverified adjustment copies cannot create MA events.
++            ks = [dict(b, price_basis=None, price_basis_source=None) for b in ks]
++        history_cache[c] = ks
+         q = quotes.get(c) or {}
+         ts = str(q.get("ts") or "")
+         qdate = intraday.quote_day(q.get("quote_at") or ts, datetime.now())
+@@ -906,8 +878,10 @@
+ 
+ 
+ @config.single_writer
++@scan_cache.run_guard
+ def run(mode="quick", rebuild_pool=False, progress=True, boundary=None):
+     t_start = time.time()
++    timer = scan_cache.Timer(mode)
+     scan_started_at = datetime.now()
+     snap = {"scan_started_at": scan_started_at.isoformat(sep=" ", timespec="seconds"),
+             "generated_at": scan_started_at.strftime("%Y-%m-%d %H:%M:%S"), "mode": mode,
+@@ -947,6 +921,7 @@
+         pool = {code: item for code, item in pool.items() if code not in newly_excluded}
+         snap["pool_size"] = len(pool)
+         print(f"[POOL] 本轮新报价发现 {len(newly_excluded)} 只风险警示/退市名称，已从候选池剔除")
++    timer.mark("股票池与实时行情", "归属与外围")
+     quote_capture_at = datetime.now()
+     for q in quotes.values():
+         q["quote_at"] = (intraday.parse_quote_timestamp(q.get("ts"), quote_capture_at)
+@@ -1030,6 +1005,7 @@
+     print(f"[RUN] 题材分组 {len(theme_groups)} 个（成员≥5 的 "
+           f"{sum(1 for g in theme_groups.values() if g['n'] >= 5)} 个）")
+ 
++    timer.mark("归属与外围", "板块历史")
+     # 5. 板块
+     conn = df.db()
+     boards, board_ctx = build_board_board(
+@@ -1050,7 +1026,21 @@
+ 
+     # 6. K线
+     codes = list(quotes.keys())
+-    klines = load_klines(conn, codes, quotes, refresh=(mode in ("full", "close")), progress=progress)
++    timer.mark("板块历史", "正式日线增量")
++    history_cache, kline_telemetry = {}, {}
++    # Source-confirmed completed index dates provide a calendar bound; no weekday guessing.
++    quote_dates = [q.get('quote_at', '')[:10] for q in quotes.values() if q.get('quote_at')]
++    quote_day = Counter(quote_dates).most_common(1)[0][0] if quote_dates else ''
++    now = datetime.now()
++    daily_closed = now.hour*60+now.minute >= 15*60+5
++    historical_dates = [b.get('completed_date') for b in boards if b.get('completed_date') and
++                        (b['completed_date'] < quote_day or daily_closed and b['completed_date'] == quote_day)]
++    required_day = quote_day if mode == 'close' else max(historical_dates, default=None)
++    klines = load_klines(conn, codes, quotes, refresh=(mode == "full"), progress=progress,
++                         required_day=required_day, history_cache=history_cache, telemetry=kline_telemetry,
++                         budget_seconds=180 if mode == 'close' else config.KLINE['deadline_seconds'] if mode == 'full' else 60)
++    timer.mark("正式日线增量", "个股计算")
++    snap['kline_acquisition'] = kline_telemetry
+     if mode == "close":
+         validate_close_daily(klines, quotes, scan_started_at)
+         snap['close_daily_verified_at'] = datetime.now().isoformat(sep=' ', timespec='seconds')
+@@ -1108,7 +1098,7 @@
+     # 「入池 3118 → 通过 0（停牌 3093）」。这份快照一旦落盘覆盖，看板会被清空成
+     # "今天没有数据"。宁可这一轮不写：保留上一份数据，界面上的新鲜度指标会说明
+     # 数据是旧的，用户看到的是"没更新"，而不是"数据没了"。
+-    _prev = _prev_stock_count()
++    _prev = int(previous_snapshot.get("stock_count") or 0)
+     if len(raw_list) == 0 or (_prev and len(raw_list) < _prev * 0.6):
+         # 盘前/集合竞价时成交额为 0 是正常现象；盘中仍触发则优先提示
+         # “行情覆盖或历史K线不完整”，避免把 10:00 之后的源中断误报成竞价。
+@@ -1152,7 +1142,7 @@
+     ind_path = config.CACHE_DIR / "ths_industry_members.json"
+     ind_members = json.loads(ind_path.read_text(encoding="utf-8")).get("map", {}) if ind_path.exists() else {}
+     industry_lookup = strength.industry_map(cached_profiles, ind_members)
+-    formal=formal_histories(list(pool),conn)
++    formal={c: history_cache[c][-160:] if c in history_cache else df.load_kline(conn,'kline','code',c,limit=160) for c in pool}
+     formal_calendar=strength.trading_calendar({c:strength.completed(v) for c,v in formal.items()})
+     if formal_calendar:
+         snap['history_reference']=history_reference.ensure(formal,formal_calendar[-1])
+@@ -1161,14 +1151,9 @@
+         stocks, model = strength.build(stocks, klines, industry_lookup)
+     except ValueError as e:
+         raise DataNotReady(str(e)) from e
+-    if config.SNAPSHOT_JSON.exists():
+-        try:
+-            previous_asof = (json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+-                             .get("strength_model") or {}).get("asof")
+-        except (OSError, ValueError):
+-            previous_asof = None
+-        if previous_asof and model["asof"] < previous_asof:
+-            raise DataNotReady(f"完成日线从 {previous_asof} 回退到 {model['asof']}，保留上一份快照")
++    previous_asof = (previous_snapshot.get('strength_model') or {}).get('asof')
++    if previous_asof and model['asof'] < previous_asof:
++        raise DataNotReady(f"完成日线从 {previous_asof} 回退到 {model['asof']}，保留上一份快照")
+     if not stocks:
+         raise DataNotReady("完成日线对齐后无有效个股，保留上一份快照")
+     market_emotion, emotion_detail, emotion_extra = emotion.build(
+@@ -1195,10 +1180,12 @@
+         if not (item["fund_covered"] or item["fund_today_covered"]):
+             item["fund_observed_at"] = None
+     completed_bars = {c: strength.completed(v) for c, v in klines.items()}
++    timer.mark("个股计算", "板块趋势与最新指数")
+     import board_trend
+     snap["board_trend_model"] = board_trend.attach(
+         snap, strength.trading_calendar(completed_bars), fetch=True,
+         previous_snapshot=previous_snapshot)
++    timer.mark("板块趋势与最新指数", "盘中与结构")
+     catalog, catalog_stats = coverage.build(
+         quotes, klines, {s["code"] for s in stocks}, raw_reasons,
+         {m["code"]: m for m in raw_all}, model["asof"],
+@@ -1350,26 +1337,33 @@
+     trend_consolidation.attach(snap, klines, quotes, price_contexts,
+         strength.trading_calendar(completed_bars), history=path_history,
+         previous=previous_snapshot, persist=True,
+-        close_history_loader=lambda code: df.load_kline(conn,'kline','code',code))
++        close_history_loader=lambda code: history_cache[code] if code in history_cache else df.load_kline(conn,'kline','code',code))
+     wyckoff_structure.attach(snap, klines, strength.trading_calendar(completed_bars),
+                             contexts=price_contexts, history=path_history, persist=True,
+-                            daily_history_loader=lambda code: df.load_kline(conn,'kline','code',code))
++                            daily_history_loader=lambda code: history_cache[code] if code in history_cache else df.load_kline(conn,'kline','code',code))
+     price_only.sanitize(snap)
+     session_context.attach(snap,quotes,formal,formal_calendar,contexts=price_contexts)
+ 
+-    config.atomic_write_text(
+-        config.SNAPSHOT_JSON,
+-        json.dumps(snap, ensure_ascii=False, separators=(",", ":")))   # 原子写：并发读取不会拿到半截 JSON
++    timer.mark("盘中与结构", "观察留档与研究")
+     append_history(snap)
+     strength.save_observation(snap)
+     stock_strength.save_daily(snap)
+     intraday.save_observation(snap)
+     snap["intraday_research"] = intraday.build_validation_report()
++    scan_cache.flush()
++    timer.mark("观察留档与研究", "快照写盘")
++    snap['scan_performance'] = timer.result()
++    snap['elapsed'] = round(time.time()-t_start, 3)
++    # generated_at remains the judgment clock; performance clocks are separate.
+     # 研究报告随快照更新，页面与磁盘快照继续保持同一版本。
+     config.atomic_write_text(
+         config.SNAPSHOT_JSON,
+         json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+-    print(f"[RUN] 完成，耗时 {snap['elapsed']}s -> {config.SNAPSHOT_JSON.name}")
++    timer.mark("快照写盘", "页面发布")
++    snap['scan_performance'] = timer.result()
++    snap['elapsed'] = round(time.time()-t_start, 3)
++    conn.close()
++    print(f"[RUN] 扫描完成（含写盘），耗时 {snap['elapsed']}s -> {config.SNAPSHOT_JSON.name}")
+     return snap
+ 
+ 
+--- before/serve.py
++++ after/serve.py
+@@ -115,16 +115,16 @@
+ 
+ 
+ @config.single_writer
+-def publish_outputs():
++def publish_outputs(snapshot=None):
+     """后台每次完成扫描后同步发布看板和文字日报。"""
+-    snapshot = None
+     try:
+-        page = make_dashboard.build()
++        if snapshot is None:
++            snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding='utf-8'))
++        page = make_dashboard.build(snapshot)
+         if page is None or not page.exists():
+             raise RuntimeError("看板页面未生成")
+-        config.atomic_write_text(config.ROOT / "snapshot_report.md", report.build())
++        config.atomic_write_text(config.ROOT / "snapshot_report.md", report.build(snapshot))
+         try:
+-            snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+             SNAPSHOT_META.update({
+                 "snapshot_generated_at": snapshot.get("generated_at"),
+                 "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
+@@ -250,8 +250,26 @@
+ @config.single_writer
+ def scan_and_publish(mode, **kwargs):
+     """扫描至页面/日报发布始终持有跨进程锁，避免读到其他轮次的快照。"""
+-    scoring.run(mode=mode, **kwargs)
+-    publish_outputs()
++    import scan_cache
++    started = time.monotonic()
++    try:
++        snapshot = scoring.run(mode=mode, **kwargs)
++        scan_seconds = time.monotonic()-started
++        scan_cache.PROGRESS.update(active=True, stage='页面发布')
++        publish_outputs(snapshot)
++        INIT['last_pipeline_performance'] = dict(version=scan_cache.VERSION,
++            seconds=round(time.monotonic()-started, 3), scan_seconds=round(scan_seconds, 3),
++            publish_seconds=round(time.monotonic()-started-scan_seconds, 3),
++            phases=(snapshot.get('scan_performance') or {}).get('phases'),
++            cache=(snapshot.get('scan_performance') or {}).get('cache'),
++            kline_acquisition=snapshot.get('kline_acquisition'),
++            published_at=datetime.now().isoformat(timespec='seconds'))
++        config.atomic_write_text(config.CACHE_DIR/'last_pipeline_performance.json',
++                                 json.dumps(INIT['last_pipeline_performance'], ensure_ascii=False))
++        print('[PERF] 刷新至页面发布：' + json.dumps(INIT['last_pipeline_performance'], ensure_ascii=False))
++    finally:
++        scan_cache.flush()
++        scan_cache.PROGRESS.update(active=False, stage=None)
+ 
+ 
+ def boundary_capture_done(now, boundary):
+@@ -445,8 +463,9 @@
+                              and not close_review_done(now, snapshot if matches else {}))
+             if not matches or close_pending:
+                 print("[INIT] 本地快照与已加载模型不一致，先完成一次新版扫描 ...")
+-                scoring.run(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")
+-            publish_outputs()
++                scan_and_publish(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")
++            else:
++                publish_outputs(snapshot)
+             INIT["needs_model_refresh"] = False
+         INIT["phase"] = "ready"
+         INIT["last_scan_ok"] = True
+@@ -614,6 +633,8 @@
+             body = json.dumps(
+                 {**STATE, **INIT, **SNAPSHOT_META,
+                  'member_refresh': weekly_members.status(),
++                 'scan_progress': __import__('scan_cache').progress(),
++                 'code_scan_cache_version': __import__('scan_cache').VERSION,
+                  'code_board_quote_version': board_quote.VERSION,
+                  'code_ui_payload_version': ui_payload.VERSION,
+                  'ui_generation': ui_payload.active_generation(),
+--- before/strength.py
++++ after/strength.py
+@@ -5,6 +5,7 @@
+ import math
+ 
+ import config
++import scan_cache
+ import stock_strength
+ 
+ 
+@@ -222,14 +223,20 @@
+         if issue:
+             dropped[issue] += 1
+             continue
+-        m = day_metrics(bars, calendar)
++        m = scan_cache.cached('day_metrics', code,
++            [scan_cache.rules('strength.py', 'config.py'), bars, calendar],
++            lambda: day_metrics(bars, calendar))
+         if m is None:
+             dropped["invalid"] += 1
+             continue
+         metrics[code] = m
+         ks[code] = bars
+-    contexts = industry_context(metrics, industries)
+-    own_strength, strength_reference_count = stock_strength.score(metrics, contexts, ks)
++    contexts = scan_cache.cached('industry_daily', 'current_pool',
++        [scan_cache.rules('strength.py', 'config.py'), metrics, industries],
++        lambda: industry_context(metrics, industries))
++    own_strength, strength_reference_count = scan_cache.cached('daily_rank', 'current_pool',
++        [scan_cache.rules('stock_strength.py', 'attack_model.py', 'strength.py', 'config.py'),
++         metrics, contexts, ks], lambda: stock_strength.score(metrics, contexts, ks))
+     out = []
+     for source in stocks:
+         code = source["code"]
+--- before/test_close_refresh.py
++++ after/test_close_refresh.py
+@@ -45,7 +45,8 @@
+              patch.object(serve, 'boundary_capture_done', return_value=False), \
+              patch.object(serve.time, 'monotonic', return_value=1000), \
+              patch.object(serve.time, 'sleep', side_effect=RuntimeError('stop')), \
+-             patch.object(serve.scoring, 'run') as scan, patch.object(serve, 'publish_outputs'):
++             patch.object(serve.scoring, 'run', return_value={}) as scan, patch.object(serve, 'publish_outputs'), \
++             patch.object(config, 'atomic_write_text'):
+             clock.now.return_value = now
+             with self.assertRaisesRegex(RuntimeError, 'stop'):
+                 serve.boundary_capture_loop()
+--- before/theme_assist.py
++++ after/theme_assist.py
+@@ -1,9 +1,30 @@
+ """同花顺题材的逐项关系；不代股票事后挑一个最好看的题材。"""
+ from collections import defaultdict
+ from statistics import mean
++import scan_cache
+ 
+ 
+ MIN_PEERS = 5
++
++
++def _daily_stats(rows):
++    members = defaultdict(list)
++    for row in rows:
++        for name in set(row.get('boards') or []):
++            members[name].append(row)
++    market_ret5 = mean(r['ret5'] for r in rows)
++    stats = []
++    for row in rows:
++        item = {}
++        for name in dict.fromkeys(row.get('boards') or []):
++            peers = [r for r in members[name] if r['code'] != row['code']]
++            item[name] = {'size': len(peers)}
++            if len(peers) >= MIN_PEERS:
++                item[name].update(trend=[sum(bool(p.get(key)) for p in peers) for key in
++                    ('trend_online_prev2', 'trend_online_prev', 'trend_online')],
++                    excess5=mean(p['ret5'] for p in peers)-market_ret5)
++        stats.append(item)
++    return stats
+ 
+ 
+ def enrich_stocks(rows):
+@@ -13,14 +34,30 @@
+             members[name].append(row)
+     if not rows:
+         return rows
++    daily = [{k:r.get(k) for k in ('code','boards','ret5','trend_online_prev2','trend_online_prev','trend_online')}
++             for r in rows]
++    stats = scan_cache.cached('theme_daily', 'current_pool',
++        [scan_cache.rules('theme_assist.py'), daily, MIN_PEERS], lambda: _daily_stats(daily))
++    member_sets = {name: {p['code'] for p in group} for name, group in members.items()}
++    overlap = {}
++    # Only daily relationships are cached. Current emotion/limits are aggregated anew.
++    totals, own = {}, {}
++    emotion_keys = ('emotion_strong','emotion_limit','emotion_yesterday_limit')
++    for name, group in members.items():
++        totals[name] = [sum(bool(p.get(k)) for p in group) for k in emotion_keys]
++        by_code = defaultdict(lambda: [0,0,0])
++        for p in group:
++            for j,k in enumerate(emotion_keys):
++                by_code[p['code']][j] += bool(p.get(k))
++        own[name] = by_code
+     market_trend = mean(bool(r.get("trend_online")) for r in rows) * 100
+     market_active = mean(bool(r.get("emotion_strong")) for r in rows) * 100
+     market_ret5 = mean(r["ret5"] for r in rows)
+-    for row in rows:
++    for row_index, row in enumerate(rows):
+         relations = []
+         for name in dict.fromkeys(row.get("boards") or []):
+-            peers = [r for r in members[name] if r["code"] != row["code"]]
+-            size = len(peers)
++            daily_peer = stats[row_index][name]
++            size = daily_peer['size']
+             rel = {"id": "theme:" + name, "name": name, "peers": size,
+                    "wide": size >= 60, "source": row.get("theme_basis"),
+                    "checked_at": row.get("theme_checked_at"),
+@@ -28,15 +65,14 @@
+             if row.get("theme_basis") == "同花顺详情成员待F10核对":
+                 rel["reason"] = "个股F10尚未核对归属"
+             elif size >= MIN_PEERS:
+-                trend = [sum(bool(p.get(key)) for p in peers) for key in
+-                         ("trend_online_prev2", "trend_online_prev", "trend_online")]
++                trend = daily_peer['trend']
+                 rising_days = int(trend[1] > trend[0]) + int(trend[2] > trend[1])
+                 trend_pct = trend[2] / size * 100
+-                excess5 = mean(p["ret5"] for p in peers) - market_ret5
+-                active = sum(bool(p.get("emotion_strong")) for p in peers)
++                excess5 = daily_peer['excess5']
++                active = totals[name][0]-own[name][row['code']][0]
+                 active_pct = active / size * 100
+-                limit_now = sum(bool(p.get("emotion_limit")) for p in peers)
+-                limit_prior = sum(bool(p.get("emotion_yesterday_limit")) for p in peers)
++                limit_now = totals[name][1]-own[name][row['code']][1]
++                limit_prior = totals[name][2]-own[name][row['code']][2]
+                 trend_support = trend_pct >= market_trend + 5 and rising_days >= 1 and excess5 > 0
+                 emotion_support = (active >= 2 and active_pct >= market_active + 5
+                                    and limit_now >= 1 and limit_now > limit_prior)
+@@ -49,10 +85,13 @@
+             relations.append(rel)
+         for i, rel in enumerate(relations):
+             rel["overlap_group"] = rel["id"]
+-            mine = {p["code"] for p in members[rel["name"]]}
++            mine = member_sets[rel['name']]
+             for previous in relations[:i]:
+-                other = {p["code"] for p in members[previous["name"]]}
+-                if mine and other and len(mine & other) / len(mine | other) >= .6:
++                other = member_sets[previous['name']]
++                pair = tuple(sorted((rel['name'], previous['name'])))
++                if pair not in overlap:
++                    overlap[pair] = bool(mine and other and len(mine & other) / len(mine | other) >= .6)
++                if overlap[pair]:
+                     rel["overlap_group"] = previous["overlap_group"]
+                     break
+         row["theme_relations"] = relations
+--- /dev/null
++++ after/scan_cache.py
+@@ -0,0 +1,188 @@
++"""Only pure derived data is cached; keys include full input content and rule sources."""
++from collections import OrderedDict, Counter
++from copy import deepcopy
++import hashlib
++import json
++import os
++import sqlite3
++import threading
++import time
++import sys
++from functools import wraps
++
++import config
++
++VERSION = '后台增量缓存1'
++_lock = threading.RLock()
++_memory = OrderedDict()
++_connections = {}
++_rules = {}
++COUNTS = Counter()
++PROGRESS = {'active': False, 'stage': None}
++
++
++def signature(value):
++    return hashlib.sha256(json.dumps([VERSION, list(sys.version_info[:2]), value], sort_keys=True, ensure_ascii=False,
++        separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
++
++
++def rules(*files):
++    """Source fingerprint, including modifications made without a version bump."""
++    parts = []
++    for file in files:
++        path = config.ROOT / file
++        stamp = (str(path), path.stat().st_mtime_ns, path.stat().st_size)
++        with _lock:
++            if stamp not in _rules:
++                _rules[stamp] = hashlib.sha256(path.read_bytes()).hexdigest()
++            parts.append(_rules[stamp])
++    return parts
++
++
++def _connection():
++    path = config.CACHE_DIR / 'scan_features.db'
++    key = str(path)
++    if key not in _connections:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        conn = sqlite3.connect(str(path), timeout=1, check_same_thread=False)
++        conn.execute('PRAGMA journal_mode=WAL')
++        conn.execute('CREATE TABLE IF NOT EXISTS feature(ns TEXT,id TEXT,key TEXT,payload TEXT,PRIMARY KEY(ns,id))')
++        _connections[key] = conn
++    return _connections[key]
++
++
++def get(ns, identity, key):
++    if os.environ.get('STOCK_DISABLE_FEATURE_CACHE') == '1':
++        return None
++    scope = (str(config.CACHE_DIR), ns, str(identity), key)
++    with _lock:
++        if scope in _memory:
++            COUNTS['memory_hits'] += 1
++            _memory.move_to_end(scope)
++            return deepcopy(_memory[scope])
++        try:
++            row = _connection().execute('SELECT payload FROM feature WHERE ns=? AND id=? AND key=?',
++                                       (ns, str(identity), key)).fetchone()
++            if row:
++                value = json.loads(row[0])
++                _remember(scope, value)
++                COUNTS['disk_hits'] += 1
++                return deepcopy(value)
++        except (sqlite3.Error, OSError, ValueError):
++            COUNTS['errors'] += 1
++        COUNTS['misses'] += 1
++    return None
++
++
++def _remember(scope, value):
++    _memory[scope] = deepcopy(value)
++    _memory.move_to_end(scope)
++    while len(_memory) > 5000:
++        _memory.popitem(last=False)
++
++
++def put(ns, identity, key, value):
++    if os.environ.get('STOCK_DISABLE_FEATURE_CACHE') == '1':
++        return
++    with _lock:
++        _remember((str(config.CACHE_DIR), ns, str(identity), key), value)
++        try:
++            _connection().execute('INSERT OR REPLACE INTO feature VALUES(?,?,?,?)',
++                (ns, str(identity), key, json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)))
++        except (sqlite3.Error, OSError, ValueError):
++            COUNTS['errors'] += 1
++
++
++def cached(ns, identity, inputs, compute):
++    try:
++        key = signature(inputs)
++    except (TypeError, ValueError):
++        # Caching must never make otherwise usable source data unavailable.
++        COUNTS['errors'] += 1
++        return deepcopy(compute())
++    value = get(ns, identity, key)
++    if value is None:
++        value = compute()
++        if value is not None:
++            put(ns, identity, key, value)
++    return deepcopy(value)
++
++
++def flush():
++    with _lock:
++        for conn in _connections.values():
++            try:
++                if conn.execute('SELECT COUNT(*) FROM feature').fetchone()[0] > 12000:
++                    conn.execute('DELETE FROM feature WHERE rowid NOT IN (SELECT rowid FROM feature ORDER BY rowid DESC LIMIT 10000)')
++                conn.commit()
++            except sqlite3.Error:
++                conn.rollback()
++                COUNTS['errors'] += 1
++
++
++class Timer:
++    def __init__(self, mode):
++        self.started = self.last = time.monotonic()
++        self.phases = {}
++        self.counts = dict(COUNTS)
++        PROGRESS.update(active=True, stage='准备', mode=mode, started=time.time())
++
++    def mark(self, label, next_stage=None):
++        now = time.monotonic()
++        self.phases[label] = round(now - self.last, 3)
++        self.last = now
++        PROGRESS['stage'] = next_stage or label
++
++    def result(self):
++        return dict(version=VERSION, seconds=round(time.monotonic()-self.started, 3),
++                    phases=dict(self.phases), cache={k: v-self.counts.get(k, 0) for k, v in COUNTS.items()})
++
++
++def progress():
++    return dict(PROGRESS, running_seconds=round(time.time()-PROGRESS['started'], 1)
++                if PROGRESS.get('active') else None)
++
++
++def run_guard(function):
++    @wraps(function)
++    def call(*args, **kwargs):
++        try:
++            return function(*args, **kwargs)
++        finally:
++            flush()
++            PROGRESS.update(active=False, stage=None)
++    return call
++
++
++_json_files = {}
++
++
++def read_json(path, lines=False):
++    """Append-only JSONL reads only its new tail; replaced files invalidate by inode/time."""
++    try:
++        stat = path.stat()
++        key = (str(path), lines)
++        prior = _json_files.get(key)
++        stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
++        if prior and prior[0] == stamp:
++            return deepcopy(prior[1])
++        if lines:
++            append = prior and prior[0][0] == stat.st_ino and stat.st_size > prior[0][1]
++            with path.open('rb') as stream:
++                # Confirm old tail too; a replacement of the same/larger size is not an append.
++                if append:
++                    start, tail = prior[2]
++                    stream.seek(start)
++                    append = stream.read(len(tail)) == tail
++                stream.seek(prior[0][1] if append else 0)
++                added = [json.loads(line) for line in stream.read().decode('utf-8').splitlines() if line.strip()]
++                stream.seek(max(0, stat.st_size-128))
++                anchor = (stream.tell(), stream.read())
++            value = prior[1] + added if append else added
++        else:
++            value = json.loads(path.read_text(encoding='utf-8'))
++            anchor = None
++        _json_files[key] = (stamp, value, anchor)
++        return deepcopy(value)
++    except (OSError, ValueError):
++        return [] if lines else {}
+--- /dev/null
++++ after/history_increment.py
+@@ -0,0 +1,173 @@
++"""Incremental formal daily acquisition, overlap validation and bounded recovery."""
++from datetime import datetime
++import json
++import time
++import math
++
++import config
++import datafeed as df
++import strength
++
++VERSION = '正式日线增量1'
++PRICE_KEYS = ('open', 'close', 'high', 'low')
++
++
++def has_activity(quote):
++    quote = quote or {}
++    return float(quote.get('amount_wan') or 0) > 0 or float(quote.get('volume_shou') or 0) > 0
++
++
++def valid_source(rows):
++    """Authentic no-trade bars may have zero volume; eligibility stays in strength.py."""
++    try:
++        dates = [datetime.strptime(b['date'], '%Y-%m-%d') for b in rows]
++        if not dates or dates != sorted(set(dates)):
++            return False
++        for b in rows:
++            if not (all(math.isfinite(b[k]) and b[k]>0 for k in PRICE_KEYS)
++                    and b['low'] <= min(b['open'], b['close']) <= max(b['open'], b['close']) <= b['high']
++                    and math.isfinite(b['volume']) and b['volume'] >= 0):
++                return False
++        return True
++    except (KeyError, TypeError, ValueError):
++        return False
++
++
++def requires_full(old, recent):
++    """Price revisions/basis changes invalidate the ENTIRE adjustment history."""
++    if not old or not recent or not valid_source(recent):
++        return True
++    sources = {(b.get('price_basis'), b.get('price_basis_source')) for b in old + recent}
++    if len(sources) != 1 or None in next(iter(sources)):
++        return True
++    by_date = {b['date']: b for b in old}
++    overlap = [b for b in recent if b['date'] in by_date]
++    if not overlap:
++        return True
++    # Exact source floats, no "within 5%" shortcut. Volume/amount revisions are merged.
++    return any(any(b[k] != by_date[b['date']][k] for k in PRICE_KEYS) for b in overlap)
++
++
++def update(conn, codes, quotes, required_day=None, force=False, progress=True, budget_seconds=None):
++    conn.execute('CREATE TABLE IF NOT EXISTS kline_fetch_state(code TEXT PRIMARY KEY,checked REAL,next_retry REAL,failures INT,payload TEXT)')
++    conn.commit()
++    now = time.time()
++    deadline = time.monotonic()+(budget_seconds if budget_seconds is not None else config.KLINE.get('increment_deadline_seconds', 60))
++    clock = datetime.now()
++    today = clock.strftime('%Y-%m-%d')
++    closed = clock.hour*60+clock.minute >= 15*60+5
++    states = {c: (checked, retry, failures, json.loads(payload)) for c, checked, retry, failures, payload
++              in conn.execute('SELECT * FROM kline_fetch_state')}
++    counts = dict(conn.execute('SELECT code,COUNT(*) FROM kline GROUP BY code'))
++    latest = dict(conn.execute('SELECT code,MAX(date) FROM kline GROUP BY code'))
++    day_counts = list(conn.execute('SELECT date,COUNT(*) FROM kline GROUP BY date ORDER BY date'))
++    threshold = max((n for _, n in day_counts), default=0)*.5
++    calendar = [d for d,n in day_counts if n >= threshold]
++    recent_by_code = {}
++    if len(calendar) >= strength.CORE_BARS:
++        for row in conn.execute('SELECT code,date,open,close,high,low,volume FROM kline WHERE date>=? ORDER BY date',
++                                (calendar[-strength.CORE_BARS],)):
++            recent_by_code.setdefault(row[0], []).append(dict(zip(('date','open','close','high','low','volume'), row[1:])))
++    need = int(config.KLINE['days'] * .9)
++    short, incremental, periodic = [], [], []
++    target = required_day or max(latest.values(), default='')
++    for code in codes:
++        state = states.get(code, (0, 0, 0, {}))
++        meta = state[3]
++        if not force and now < state[1]:
++            continue
++        insufficient = counts.get(code, 0) < need
++        active = has_activity(quotes.get(code))
++        broken_core = bool(active and len(calendar) >= strength.CORE_BARS
++                           and counts.get(code, 0) >= strength.CORE_BARS
++                           and strength.core_window_issue(recent_by_code.get(code, []), calendar)
++                           in ('invalid', 'unaligned', 'short_history'))
++        # A verified short listing is not capable of inventing a 160-bar history.
++        short_known = bool(meta.get('short_checked_day') and meta.get('full_checked', 0) >= now-7*86400)
++        if force or (insufficient and not short_known) or (broken_core and meta.get('core_checked_day') != target):
++            short.append(code)
++        elif required_day and latest.get(code, '') < target and not (
++                not active and meta.get('no_trade_checked_day') == target):
++            incremental.append(code)
++        elif meta.get('full_checked', 0) < now-7*86400 and clock.hour >= 18:
++            periodic.append(code)
++    # Prioritize oldest/untried repairs, so failed/new symbols cannot starve one another.
++    short.sort(key=lambda c: states.get(c, (0,))[0])
++    limit = config.KLINE.get('repair_per_scan', 50)
++    selected = short if force else short[:limit]
++    pending = len(short) - len(selected)
++    periodic.sort(key=lambda c: states.get(c, (0, 0, 0, {}))[3].get('full_checked', 0))
++    selected_periodic = periodic[:max(0, limit-len(selected))] if not force else []
++    selected += selected_periodic
++    pending += len(periodic)-len(selected_periodic)
++    requested, changed, failed, upgraded = 0, 0, [], []
++    full_due = []
++    got_all, adjustment_pending = {}, set()
++    for batch, days in ((incremental, config.KLINE.get('increment_days', 20)),
++                        (selected, config.KLINE['days'])):
++        if not batch:
++            continue
++        requested += len(batch)
++        got, truncated = df.fetch_klines_bulk(batch, progress=progress, days=days,
++                                             deadline_seconds=max(.01, deadline-time.monotonic()))
++        for code in batch:
++            rows = [b for b in (got.get(code) or []) if b['date'] < today or b['date'] == today and closed]
++            old = df.load_kline(conn, 'kline', 'code', code)
++            if not rows or not valid_source(rows) or (target and rows[-1]['date'] < target
++                    and has_activity(quotes.get(code))):
++                failed.append(code)
++                continue
++            if code in incremental and requires_full(old, rows):
++                adjustment_pending.add(code)
++                full_due.append(code)
++                continue
++            if code in selected and old and requires_full(old, rows) and not set(b['date'] for b in old).issubset({b['date'] for b in rows}):
++                adjustment_pending.add(code)
++                full_due.append(code)
++                continue
++            got_all[code] = rows
++    # Full repair must cover all cached history when the adjustment scale was revised.
++    if full_due:
++        old_series = {c: df.load_kline(conn, 'kline', 'code', c) for c in full_due}
++        days = max(config.KLINE['days'], max(len(v) for v in old_series.values())+20)
++        requested += len(full_due)
++        got, truncated = df.fetch_klines_bulk(full_due, progress=progress, days=days,
++                                             deadline_seconds=max(.01, deadline-time.monotonic()))
++        for code in full_due:
++            rows = [b for b in (got.get(code) or []) if b['date'] < today or b['date'] == today and closed]
++            old = old_series[code]
++            if (not rows or not valid_source(rows)
++                    or (requires_full(old, rows) and not {b['date'] for b in old}.issubset({b['date'] for b in rows}))
++                    or (target and rows[-1]['date'] < target and has_activity(quotes.get(code)))):
++                failed.append(code)
++                continue
++            got_all[code] = rows
++            upgraded.append(code)
++    changed = df.save_klines(conn, 'kline', 'code', got_all) if got_all else 0
++    for code, rows in got_all.items():
++        meta = dict(states.get(code, (0, 0, 0, {}))[3])
++        if code in selected or code in upgraded:
++            meta['full_checked'] = now
++            meta['core_checked_day'] = target
++        else:
++            meta.setdefault('full_checked', now)
++        if len(rows) < need and code in selected:
++            meta['short_checked_day'] = target
++        meta.update(latest=rows[-1]['date'], error=None, integrity_pending=False)
++        if not has_activity(quotes.get(code)):
++            meta['no_trade_checked_day'] = target
++        conn.execute('INSERT OR REPLACE INTO kline_fetch_state VALUES(?,?,?,?,?)',
++                     (code, now, 0, 0, json.dumps(meta)))
++    for code in set(failed):
++        prior = states.get(code, (0, 0, 0, {}))
++        failures = prior[2]+1
++        meta = dict(prior[3], error='请求失败或正式日线尚未齐全')
++        if code in adjustment_pending:
++            meta['integrity_pending'] = True
++        conn.execute('INSERT OR REPLACE INTO kline_fetch_state VALUES(?,?,?,?,?)',
++            (code, now, now+min(1800, 30*2**min(failures-1, 6)), failures, json.dumps(meta)))
++    conn.commit()
++    result = dict(version=VERSION, required_day=target, requested=requested, changed_rows=changed,
++                  failed=len(set(failed)), full_repairs=len(upgraded), deferred=pending)
++    print('[KLINE] 增量：' + json.dumps(result, ensure_ascii=False))
++    return result
+--- /dev/null
++++ after/test_scan_performance.py
+@@ -0,0 +1,297 @@
++"""Cache invalidation, true daily increment, retry fairness and wall-clock limits."""
++from copy import deepcopy
++from datetime import datetime
++from datetime import timedelta
++import json
++from pathlib import Path
++import sqlite3
++from tempfile import TemporaryDirectory
++import time
++import unittest
++from unittest.mock import patch
++
++import config
++import datafeed as df
++import history_increment as H
++import scan_cache as C
++import strength
++import board_trend
++from test_strength import bars
++
++
++def bar(day, close=10):
++    return dict(date=day, open=close, close=close, high=close+1, low=close-1,
++                volume=100, amount=1000, price_basis='qfq', price_basis_source='tencent_qfqday')
++
++
++class Morning(datetime):
++    @classmethod
++    def now(cls):
++        return cls(2026, 10, 12, 10)
++
++
++class IncrementTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = TemporaryDirectory()
++        self.cache = patch.object(config, 'CACHE_DIR', Path(self.tmp.name))
++        self.cache.start()
++        self.settings = patch.dict(config.KLINE, {'days': 2, 'repair_per_scan': 2})
++        self.settings.start()
++        self.conn = sqlite3.connect(':memory:')
++        self.conn.execute('CREATE TABLE kline(code TEXT,date TEXT,open REAL,close REAL,high REAL,low REAL,volume REAL,amount REAL,price_basis TEXT,price_basis_source TEXT,PRIMARY KEY(code,date))')
++        self.old = bar('2026-10-08')
++        df.save_klines(self.conn, 'kline', 'code', {'a': [self.old]})
++        self.quotes = {'a': {'amount_wan': 1}}
++
++    def tearDown(self):
++        self.conn.close()
++        C.flush()
++        self.cache.stop()
++        self.settings.stop()
++        # Windows cannot remove a SQLite file while a connection remains open.
++        with C._lock:
++            for key in list(C._connections):
++                if key.startswith(self.tmp.name):
++                    C._connections.pop(key).close()
++        self.tmp.cleanup()
++
++    def update(self, day, **kwargs):
++        with patch.object(H, 'datetime', Morning):
++            return H.update(self.conn, list(self.quotes), self.quotes, day, progress=False, **kwargs)
++
++    def test_warm_completed_day_does_not_request_history(self):
++        with patch.object(df, 'fetch_klines_bulk') as fetch:
++            self.assertEqual(self.update('2026-10-08')['requested'], 0)
++        fetch.assert_not_called()
++
++    def test_increment_writes_only_new_bar_then_no_requests(self):
++        recent = [self.old, bar('2026-10-09', 11)]
++        with patch.object(df, 'fetch_klines_bulk', return_value=({'a': recent}, False)) as fetch:
++            result = self.update('2026-10-09')
++            self.assertEqual(result['changed_rows'], 1)
++            self.assertEqual(fetch.call_args.kwargs['days'], 20)
++            self.assertEqual(self.update('2026-10-09')['requested'], 0)
++            fetch.assert_called_once()
++        self.assertEqual(len(df.load_kline(self.conn, 'kline', 'code', 'a')), 2)
++
++    def test_price_revision_requires_full_overlap_and_replaces_old_prices(self):
++        revised = [bar('2026-10-08', 9), bar('2026-10-09')]
++        with patch.object(df, 'fetch_klines_bulk', side_effect=[({'a': revised}, False), ({'a': revised}, False)]) as fetch:
++            result = self.update('2026-10-09')
++        self.assertEqual(fetch.call_count, 2)
++        self.assertGreater(fetch.call_args.kwargs['days'], 20)
++        self.assertEqual(result['full_repairs'], 1)
++        self.assertEqual(df.load_kline(self.conn, 'kline', 'code', 'a')[0]['close'], 9)
++
++    def test_failed_adjustment_repair_keeps_originals_and_marks_pending(self):
++        revised = [bar('2026-10-08', 9), bar('2026-10-09')]
++        with patch.object(df, 'fetch_klines_bulk', side_effect=[({'a': revised}, False), ({}, True)]):
++            self.assertEqual(self.update('2026-10-09')['failed'], 1)
++        self.assertEqual(df.load_kline(self.conn, 'kline', 'code', 'a'), [self.old])
++        payload = json.loads(self.conn.execute('SELECT payload FROM kline_fetch_state WHERE code="a"').fetchone()[0])
++        self.assertTrue(payload['integrity_pending'])
++
++    def test_volume_revision_does_not_need_full_adjustment_repair(self):
++        recent = [dict(self.old, volume=120), bar('2026-10-09')]
++        with patch.object(df, 'fetch_klines_bulk', return_value=({'a': recent}, False)) as fetch:
++            self.assertEqual(self.update('2026-10-09')['changed_rows'], 2)
++            fetch.assert_called_once()
++
++    def test_missing_overlap_and_unknown_basis_require_full(self):
++        self.assertTrue(H.requires_full([self.old], [bar('2026-10-09')]))
++        self.assertTrue(H.requires_full([dict(self.old, price_basis=None)], [self.old]))
++        self.assertTrue(H.requires_full([self.old], [dict(self.old, price_basis='raw')]))
++
++    def test_short_listing_is_not_repeatedly_full_fetched(self):
++        self.quotes = {'b': {'amount_wan': 1}}
++        recent = [bar('2026-10-09')]
++        with patch.dict(config.KLINE, {'days': 160}), patch.object(df, 'fetch_klines_bulk', return_value=({'b': recent}, False)) as fetch:
++            self.update('2026-10-09')
++            self.update('2026-10-09')
++        fetch.assert_called_once()
++
++    def test_unfinished_source_bar_never_enters_formal_db(self):
++        with patch.object(df, 'fetch_klines_bulk', return_value=({'a': [self.old, bar('2026-10-12')]}, False)):
++            self.update('2026-10-08', force=True)
++        self.assertEqual(df.load_kline(self.conn, 'kline', 'code', 'a'), [self.old])
++
++    def test_failed_symbols_backoff_without_permanent_blacklist(self):
++        with patch.object(df, 'fetch_klines_bulk', return_value=({}, True)) as fetch:
++            self.update('2026-10-09')
++            self.update('2026-10-09')
++        fetch.assert_called_once()
++        self.assertFalse((config.CACHE_DIR/'no_kline.json').exists())
++
++    def test_volume_alone_does_not_accept_stale_history_as_no_trade(self):
++        self.quotes['a'] = {'amount_wan': 0, 'volume_shou': 10}
++        with patch.object(df, 'fetch_klines_bulk', return_value=({'a': [self.old]}, False)):
++            self.assertEqual(self.update('2026-10-09')['failed'], 1)
++        meta = json.loads(self.conn.execute('SELECT payload FROM kline_fetch_state WHERE code="a"').fetchone()[0])
++        self.assertNotIn('no_trade_checked_day', meta)
++
++    def test_no_trade_history_is_checked_once_and_resumption_rechecks(self):
++        self.quotes['a'] = {'amount_wan': 0, 'volume_shou': 0}
++        with patch.object(df, 'fetch_klines_bulk', return_value=({'a': [self.old]}, False)) as fetch:
++            self.update('2026-10-09')
++            self.update('2026-10-09')
++            fetch.assert_called_once()
++            self.quotes['a']['amount_wan'] = 1
++            self.update('2026-10-09')
++            self.assertEqual(fetch.call_count, 2)
++
++    def test_zero_volume_source_bar_is_stored_without_relaxing_eligibility(self):
++        self.quotes['a'] = {'amount_wan': 0, 'volume_shou': 0}
++        stopped = dict(bar('2026-10-09'), volume=0)
++        with patch.object(df, 'fetch_klines_bulk', return_value=({'a': [self.old, stopped]}, False)) as fetch:
++            self.update('2026-10-09')
++            self.update('2026-10-09')
++        fetch.assert_called_once()
++        self.assertEqual(df.load_kline(self.conn, 'kline', 'code', 'a')[-1], stopped)
++        self.assertFalse(strength.valid_bars([stopped]))
++
++    def test_repair_quota_fairly_advances_past_recent_failures(self):
++        self.quotes = {c: {'amount_wan': 1} for c in ['b', 'c', 'd']}
++        with patch.object(df, 'fetch_klines_bulk', return_value=({}, False)) as fetch:
++            self.assertEqual(self.update('2026-10-09')['deferred'], 1)
++            self.update('2026-10-09')
++        self.assertEqual(fetch.call_args.args[0], ['d'])
++
++    def test_upsert_unchanged_rows_and_sql_limit_preserve_complete_history(self):
++        self.assertEqual(df.save_klines(self.conn, 'kline', 'code', {'a': [self.old]}), 0)
++        df.save_klines(self.conn, 'kline', 'code', {'a': [bar('2026-10-09')]})
++        self.assertEqual(len(df.load_kline(self.conn, 'kline', 'code', 'a')), 2)
++        self.assertEqual(df.load_kline(self.conn, 'kline', 'code', 'a', limit=1)[0]['date'], '2026-10-09')
++
++
++class CacheTests(unittest.TestCase):
++    setUp = IncrementTests.setUp
++    tearDown = IncrementTests.tearDown
++    def test_cache_content_calendar_and_rule_changes_invalidate(self):
++        count = []
++        compute = lambda: (count.append(1) or {'score': 5})
++        value = C.cached('test', 'a', ['day', 1], compute)
++        value['score'] = 99
++        self.assertEqual(C.cached('test', 'a', ['day', 1], compute)['score'], 5)
++        C.cached('test', 'a', ['day', 2], compute)
++        C.cached('test', 'a', ['next_day', 2], compute)
++        self.assertEqual(len(count), 3)
++        C.flush()
++        C._memory.clear()
++        self.assertEqual(C.cached('test', 'a', ['next_day', 2], compute)['score'], 5)
++        self.assertEqual(len(count), 3)
++
++    def test_real_strength_current_quotes_change_while_daily_score_stays(self):
++        series = {'a': bars(), 'b': bars(slope=.2)}
++        source = [{'code': c, 'price': 10, 'limit_today': False} for c in series]
++        before, model = strength.build(source, series, {'a': '行业一', 'b': '行业一'})
++        changed = deepcopy(source)
++        changed[0].update(price=99, limit_today=True)
++        after, _ = strength.build(changed, series, {'a': '行业一', 'b': '行业一'})
++        old = {r['code']: r for r in before}
++        new = {r['code']: r for r in after}
++        self.assertEqual(old['a']['stock_strength_score'], new['a']['stock_strength_score'])
++        self.assertEqual(new['a']['price'], 99)
++        self.assertIn('现价接近涨停，需确认成交条件', new['a']['risk_notes'])
++
++    def test_board_replay_cache_does_not_mutate_or_ignore_history_revisions(self):
++        ks = bars()
++        days = [b['date'] for b in ks]
++        first = board_trend.calculate(ks, days, days[-1])
++        first['name'] = '外部变更'
++        second = board_trend.calculate(ks, days, days[-1])
++        self.assertNotIn('name', second)
++        revised = deepcopy(ks)
++        revised[-1]['high'] += 2
++        self.assertNotEqual(second['atr20'], board_trend.calculate(revised, days, days[-1])['atr20'])
++
++    def test_jsonl_append_and_replacement_both_refresh(self):
++        path = config.CACHE_DIR/'pairs.jsonl'
++        path.write_text('{"a":1}\n', encoding='utf-8')
++        self.assertEqual(C.read_json(path, True), [{'a': 1}])
++        with path.open('a', encoding='utf-8') as stream:
++            stream.write('{"a":2}\n')
++        self.assertEqual(C.read_json(path, True), [{'a': 1}, {'a': 2}])
++        path.write_text('{"a":8}\n', encoding='utf-8')
++        self.assertEqual(C.read_json(path, True), [{'a': 8}])
++
++    def test_cache_unserializable_input_falls_back_to_calculation(self):
++        self.assertEqual(C.cached('test', 'a', float('nan'), lambda: {'a': 3}), {'a': 3})
++
++    def test_live_emotion_changes_without_invalidating_daily_theme_context(self):
++        import theme_assist
++        rows = [dict(code=str(i), boards=['主题'] if i<7 else ['其他'], ret5=1,
++                    trend_online=False, emotion_strong=False, emotion_limit=False,
++                    emotion_yesterday_limit=False) for i in range(15)]
++        theme_assist.enrich_stocks(rows)
++        self.assertEqual(rows[0]['theme_relations'][0]['state'], '未见扩散')
++        for r in rows[1:4]: r.update(emotion_strong=True, emotion_limit=True)
++        theme_assist.enrich_stocks(rows)
++        self.assertEqual(rows[0]['theme_relations'][0]['state'], '情绪扩散')
++
++
++class BoardHistoryTests(unittest.TestCase):
++    setUp = IncrementTests.setUp
++    tearDown = IncrementTests.tearDown
++
++    def prepare(self, unfinished=False):
++        series = bars()
++        end = datetime(2026, 10, 8)
++        for i, b in enumerate(series):
++            b['date'] = (end-timedelta(days=len(series)-1-i)).strftime('%Y-%m-%d')
++        if unfinished:
++            series.append(bar('2026-10-12', 18))
++        return series
++
++    def test_complete_board_history_is_requested_once_then_reused(self):
++        import scoring
++        with patch.object(scoring, 'datetime', Morning), patch.object(df, 'scan_ths_boards', return_value={'885001':'概念甲'}), \
++             patch.object(df, 'fetch_ths_board_kline', return_value=('概念甲',self.prepare())) as fetch, \
++             patch.object(board_trend, 'save') as save:
++            first, _ = scoring.build_board_board(self.conn)
++            second, _ = scoring.build_board_board(self.conn)
++        self.assertEqual(first, second)
++        fetch.assert_called_once()
++        save.assert_called_once()
++
++    def test_unfinished_board_bar_is_never_frozen(self):
++        import scoring
++        with patch.object(scoring, 'datetime', Morning), patch.object(df, 'scan_ths_boards', return_value={'885001':'概念甲'}), \
++             patch.object(df, 'fetch_ths_board_kline', return_value=('概念甲',self.prepare(True))) as fetch, \
++             patch.object(board_trend, 'save'):
++            scoring.build_board_board(self.conn)
++            scoring.build_board_board(self.conn)
++        self.assertEqual(fetch.call_count, 2)
++
++    def test_board_failures_backoff(self):
++        import scoring
++        with patch.object(scoring, 'datetime', Morning), patch.object(df, 'scan_ths_boards', return_value={'885001':'概念甲'}), \
++             patch.object(df, 'fetch_ths_board_kline', side_effect=OSError('offline')) as fetch:
++            self.assertEqual(scoring.build_board_board(self.conn)[0], [])
++            self.assertEqual(scoring.build_board_board(self.conn)[0], [])
++        fetch.assert_called_once()
++
++
++class DeadlineTests(unittest.TestCase):
++    def test_quote_batches_keep_full_request_count_without_internal_retries(self):
++        with patch.object(df, 'http_get', side_effect=OSError('offline')) as get:
++            self.assertEqual(df.tencent_quotes([str(600000+i) for i in range(850)]), {})
++        self.assertEqual(get.call_count, 3)
++        self.assertEqual(get.call_args.kwargs['timeout'], 6)
++        self.assertEqual(get.call_args.kwargs['retry'], 0)
++
++    def test_batch_deadline_does_not_wait_for_running_executor_and_discards_late_data(self):
++        def slow(code, **kwargs):
++            time.sleep(.25)
++            return [bar('2026-10-09')]
++        start = time.monotonic()
++        with patch.dict(config.KLINE, {'deadline_seconds': .04}), patch.object(df, 'fetch_kline', side_effect=slow):
++            result, truncated = df.fetch_klines_bulk(['a', 'b', 'c'], workers=1, progress=False)
++            self.assertTrue(truncated)
++            self.assertEqual(result, {})
++            self.assertLess(time.monotonic()-start, .20)
++            time.sleep(.27)
++            self.assertEqual(result, {})
++
++
++if __name__ == '__main__':
++    unittest.main()

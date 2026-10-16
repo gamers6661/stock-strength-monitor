@@ -1,0 +1,475 @@
+--- before/config.py
++++ after/config.py
+@@ -13,7 +13,7 @@
+ 
+ ROOT = Path(__file__).resolve().parent
+ MA_TREND = {
+-    'version': 'ma-trend-2026-10-14.3',
++    'version': 'ma-trend-2026-10-15.1',
+     'origin_days': 5, 'origin_base_days': 5,
+     'impulse_day_pct': 4., 'impulse_two_day_pct': 6., 'impulse_rise_atr': 1.2,
+     'volume_ratio': 1.8, 'close_position': .75,
+@@ -25,6 +25,7 @@
+     'ma20_rise_pct': 20., 'ma20_rise_atr': 4.,
+     'platform_width_atr': 2., 'platform_width_pct': 10., 'platform_volume_ratio': .8,
+     'platform_retrace_fraction': 1./3., 'platform_rise_atr': .5,
++    'ma20_width_pct_hard': False, 'ma20_retained_gain': True, 'ma20_rise_volume_days': 5,
+     'ma20_below_atr': .3, 'ma20_below_pct': 1.5,
+     'near_atr': .4, 'entry_near_atr': .8, 'rebound_atr': .3,
+     'repair_minutes': 15, 'break_atr': .5, 'minute_fetch_limit': 24,
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -926,9 +926,10 @@
+ #ms-stock-host .ms-section-head p{margin-top:5px;font-size:11px;color:#8190a2}
+ .ms-clear-button{background:transparent;border-color:#e1e7ef;color:#7b8a9d;font-size:11px;padding:6px 10px;border-radius:8px}
+ .ms-direction-search-wrap{position:relative}
+-.ms-direction-search-wrap>span{position:absolute;left:14px;top:7px;font-size:24px;line-height:1;color:#8ca0b9;pointer-events:none}
+-#ms-stock-host .ms-direction-search{padding:11px 15px 11px 40px;background:#fff;border-color:#dfe7f2;outline:none;border-radius:11px;transition:border-color .15s,box-shadow .15s}
+-#ms-stock-host .ms-direction-search:focus{border-color:#86afd5;box-shadow:0 0 0 3px #eaf2ff}
++.ms-direction-search-wrap .ms-direction-search{box-sizing:border-box;padding:11px 15px;background:#fff;border-color:#dfe7f2;outline:none;border-radius:11px;transition:border-color .15s,box-shadow .15s}
++.ms-direction-search-wrap .ms-direction-search:focus{border-color:#86afd5;box-shadow:0 0 0 3px #eaf2ff}
++.pct-change.up{color:var(--up)}.pct-change.down{color:var(--down)}.pct-change.flat{color:var(--flat)}
++.ma-reason{max-width:300px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.6}
+ #ms-stock-host .ms-selected-directions{margin:11px 0 8px;min-height:23px;align-items:center}
+ .ms-direction-browser>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:7px;width:max-content;margin-left:auto;color:#7890aa;font-size:11px;padding:3px 0}
+ .ms-direction-browser>summary::-webkit-details-marker{display:none}
+@@ -1276,6 +1277,7 @@
+   return (x>0?'+':'')+x.toFixed(d);}
+ function cls(v){var x=Number(v);return x>0?'up':(x<0?'down':'flat');}
+ function pct(v,d){var value=sgn(v,d);return value==='—'?value:value+'%';}
++function pctHtml(v,d){var value=pct(v,d);return value==='—'?value:'<span class="pct-change '+cls(v)+'">'+value+'</span>';}
+ /* 成交额格式化：入参单位是万元（腾讯行情/我方估算都用万元）。
+    原实现把"万元÷1e4=亿元"的结果又拿去和 1e4 比，于是阈值等于"≥1万亿元"、
+    永远走不到亿元分支 —— 9.58 亿的成交额被显示成「9.6万」，
+--- before/ma_trend.py
++++ after/ma_trend.py
+@@ -99,7 +99,7 @@
+     def line_at(j,n):return features['ma'][n][j] if features else average(bars,j,n)
+     if not positive(unit):return choices
+     start=root['index']
+-    for n,minimum in ((10,P['ma10_days']),(20,P['ma20_days'])):
++    for n,minimum in ((10,P['ma10_days']),):
+         if i-start<minimum:continue
+         anchors=range(start,i-minimum+1)
+         peak=max(anchors,key=lambda j:(bars[j]['close'],-j))
+@@ -130,7 +130,53 @@
+             rise_pct=rise_pct,rise_atr=rise_atr,base_low=root['base_low'],base_at=root['base_at'],
+             width_atr=width,volume_ratio=vr,rise_volume=mean(b['volume'] for b in rise),
+             width_pct=100*(high/low-1),origin=copy.deepcopy(root),confirmed=True)
++    platform=latest_platform(bars,i,root,features,require_position)
++    if platform:choices[20]=platform
+     return choices
++
++
++def latest_platform(bars,i,root,features=None,require_position=True):
++    """Only the latest rise peak and its following settled range can qualify.
++
++    The initial pullback ends at the first lowest low after that peak. No older
++    peak is searched when the latest rise has not finished. Once locked by daily,
++    subsequent lower lows cannot move this floor down.
++    """
++    if not root:return None
++    start=root['index'];unit=features['atr'][i] if features else atr(bars,i)
++    if not positive(unit) or i-start<P['ma20_days']:return None
++    peak=max(range(start,i+1),key=lambda j:(bars[j]['close'],-j))
++    if not P['ma20_days']<=i-peak<=P['platform_max_days']:return None
++    trough=min(range(peak+1,i+1),key=lambda j:(bars[j]['low'],j))
++    window=bars[trough:i+1]
++    if len(window)<P['ma20_days'] or falling(window):return None
++    line=features['ma'][20][i] if features else average(bars,i,20)
++    previous=features['ma'][20][i-1] if features else average(bars,i-1,20)
++    if line<=previous:return None
++    close=bars[i]['close']
++    if require_position and (not ma20_position(close,line,unit)[0] or (close-line)/unit>P['entry_near_atr']):return None
++    low=min(b['low'] for b in window);high=max(b['high'] for b in window)
++    amplitude=bars[peak]['close']-root['base_low']
++    rise_pct=100*amplitude/root['base_low'];rise_atr=amplitude/root['atr']
++    retained_pct=100*(low/root['base_low']-1);retained_atr=(low-root['base_low'])/root['atr']
++    width=(high-low)/unit;width_pct=100*(high/low-1)
++    if rise_pct<P['ma20_rise_pct'] or rise_atr<P['ma20_rise_atr'] or width>P['platform_width_atr']:return None
++    if P['ma20_width_pct_hard'] and width_pct>P['platform_width_pct']:return None
++    if P['ma20_retained_gain']:
++        if retained_pct<P['ma20_rise_pct'] or retained_atr<P['ma20_rise_atr']:return None
++    elif (bars[peak]['close']-low)/amplitude>P['platform_retrace_fraction']:return None
++    if max(b['close'] for b in window)>bars[peak]['close']+P['platform_rise_atr']*unit:return None
++    rise=bars[max(start,peak-P['ma20_rise_volume_days']+1):peak+1]
++    if not all(positive(b.get('volume')) for b in rise+window):return None
++    rise_volume=mean(b['volume'] for b in rise);ratio=mean(b['volume'] for b in window)/rise_volume
++    if ratio>P['platform_volume_ratio']:return None
++    return dict(id=root['date']+':'+bars[peak]['date'],formed_at=bars[i]['date'],
++        start=window[0]['date'],peak_date=bars[peak]['date'],rise_start=root['base_at'],rise_end=bars[peak]['date'],
++        days=len(window),low=low,high=high,atr20=unit,peak_close=bars[peak]['close'],
++        rise_pct=rise_pct,rise_atr=rise_atr,base_low=root['base_low'],base_at=root['base_at'],
++        retained_pct=retained_pct,retained_atr=retained_atr,width_atr=width,width_pct=width_pct,
++        volume_ratio=ratio,rise_volume=rise_volume,rise_volume_days=len(rise),origin=copy.deepcopy(root),
++        confirmed=True,latest_cycle=True)
+ 
+ 
+ def catchment(bars,i,root,features=None):
+@@ -174,13 +220,30 @@
+               'atr':[atr(bars,i) for i in range(len(bars))],'limit_pct':limit_pct}
+     active=None;root=None;last_exit=None;roots=[];platform={};entered=None;exits=[]
+     invalid_platforms=set();lifecycle=None;transitions=[];last_confirmation=None
+-    ma20_platform={};last_exit_index=-1
++    ma20_platform={};last_exit_index=-1;ma20_root=None;last_platform={}
+     for i in range(21,len(bars)):
+         signal=origin(bars,i,features)
+         if signal:
+             roots.append(signal)
+             if active:last_confirmation=copy.deepcopy(signal)
++            if not ma20_root or (not active and i>last_exit_index):
++                ma20_root=copy.deepcopy(signal);ma20_platform={};last_platform={}
++                if active==20:active=None;platform={}
+         close=bars[i]['close'];line5=features['ma'][5][i]
++        preceding=last_platform or (platform if active==10 and platform.get('confirmed') else {})
++        if (preceding and preceding['id']!=(ma20_root or {}).get('prior_platform')
++                and close>=preceding['high']+P['breakout_atr']*features['atr'][i]):
++            # A new rising leg cannot borrow the previous leg's large gain or floor.
++            original=copy.deepcopy(ma20_root)
++            ma20_root=copy.deepcopy(signal or original)
++            ma20_root.update(index=i,date=bars[i]['date'],base_low=preceding['low'],
++                base_at=preceding['start'],atr=features['atr'][i-1],prior_cycle=original['date'],prior_platform=preceding['id'])
++            if not signal:
++                baseline=mean(b['volume'] for b in bars[i-5:i]) if all(positive(b.get('volume')) for b in bars[i-5:i+1]) else None
++                ma20_root.update(kind='平台突破后新上涨',basis='完成日平台突破',price=close,
++                    volume_ratio=bars[i]['volume']/baseline if baseline else None)
++            ma20_platform={};last_platform={}
++            if active==20:active=None;platform={};lifecycle='新上涨阶段'
+         # Lock a real high platform before a failed MA10 bar. Never lower its floor
+         # with that bar, and never use the rise threshold alone as a sideways signal.
+         if active==5 and close<line5:
+@@ -208,14 +271,22 @@
+             if recent and close>=line5 and line5>features['ma'][5][i-1]:
+                 root=copy.deepcopy(recent[-1]);active=5;platform={};entered=bars[i]['date'];lifecycle='沿线推进'
+                 last_confirmation=copy.deepcopy(root);ma20_platform={}
+-        if active:
+-            formed=structure(bars,i,root,features,require_position=False).get(20)
+-            if formed and (20,formed['id']) not in invalid_platforms:
+-                if not ma20_platform or ma20_platform['id']!=formed['id']:ma20_platform=formed
+-            if ma20_platform:
+-                platform_progress(ma20_platform,bars,i,features['atr'][i])
+-                if close<ma20_platform['low'] or ma20_platform['current_days']>P['platform_max_days']:
+-                    invalid_platforms.add((20,ma20_platform['id']));ma20_platform={}
++        formed=latest_platform(bars,i,ma20_root,features,require_position=False)
++        if formed and (20,formed['id']) not in invalid_platforms:
++            if not ma20_platform or ma20_platform['id']!=formed['id']:
++                ma20_platform=formed;last_platform=copy.deepcopy(formed)
++        if ma20_platform:
++            platform_progress(ma20_platform,bars,i,features['atr'][i])
++            if close<ma20_platform['low'] or ma20_platform['current_days']>P['platform_max_days']:
++                invalid_platforms.add((20,ma20_platform['id']));ma20_platform={}
++            elif active!=20 and latest_platform(bars,i,ma20_root,features,require_position=True):
++                # MA10 may have failed before five settled bars existed. That exit
++                # does not prevent a later, independently completed current MA20 setup.
++                previous_stage=active
++                active=20;root=copy.deepcopy(ma20_root);platform=copy.deepcopy(ma20_platform)
++                entered=bars[i]['date'];lifecycle='整理观察'
++                transitions.append(dict(date=entered,from_stage=previous_stage,to_stage=20,
++                    reason='最近上涨结束后形成独立MA20高位平台'))
+         if active in (10,20):
+             platform_progress(platform,bars,i,features['atr'][i])
+             if platform.get('confirmed') and close>=platform['high']+P['breakout_atr']*features['atr'][i]:lifecycle='推进延续'
+@@ -446,12 +517,12 @@
+     ratio=p.get('current_volume_ratio');m['volume']['consolidation_ratio']=ratio
+     if ratio is None:return '整理量能待核验'
+     if ratio>P['platform_volume_ratio'] or p.get('current_width_atr',p['width_atr'])>P['platform_width_atr']:return '整理结构扩散'
+-    if n==20 and p.get('current_width_pct',p['width_pct'])>P['platform_width_pct']:return '整理结构扩散'
++    if n==20 and P['ma20_width_pct_hard'] and p.get('current_width_pct',p['width_pct'])>P['platform_width_pct']:return '整理结构扩散'
+     if context['provisional_ma'][n]<context['daily_ma'][n]:return '均线仍向下'
+     if n==20:
+         allowed,below=ma20_position(price,m['ma_value'],unit);m['ma20_below_allowance']=below
+         if not allowed:return 'MA20偏离过多'
+-    if price-m['ma_value']>P['entry_near_atr']*unit:return '位置偏离'
++    if n!=20 and price-m['ma_value']>P['entry_near_atr']*unit:return '位置偏离'
+     return None
+ 
+ 
+@@ -463,7 +534,7 @@
+         if (platform['rise_pct']<P['ma20_rise_pct'] or platform['rise_atr']<P['ma20_rise_atr']
+             or platform.get('current_days',platform['days'])>P['platform_max_days']
+             or platform.get('current_width_atr',platform['width_atr'])>P['platform_width_atr']
+-            or platform.get('current_width_pct',platform['width_pct'])>P['platform_width_pct']
++            or P['ma20_width_pct_hard'] and platform.get('current_width_pct',platform['width_pct'])>P['platform_width_pct']
+             or not ma20_position(price,context['provisional_ma'][20],unit)[0]):platform=None
+     if stage==20 or not platform:
+         reason=event['reason']+('；MA10失守且没有合格MA20高位横盘平台' if stage==10 else '')
+@@ -593,7 +664,9 @@
+         code=row['code'];m,ctx=live(row,quotes.get(code) or {},histories.get(code) or [],calendar,now,snap.get('session'),prior_rows.get(code),center)
+         models[code]=m;row['ma_trend']=m
+         if ctx:contexts[code]=ctx
+-    needed=sorted(c for c,m in models.items() if m.get('minute_needed'))
++    # Reference-only copies can retain yesterday's minute_needed flag. They have
++    # no live context (and may have no current quote), so never replay minutes.
++    needed=sorted(c for c,m in models.items() if m.get('minute_needed') and c in contexts and c in quotes)
+     cursor=int(prior_meta.get('minute_cursor') or 0)%max(1,len(needed));rotated=needed[cursor:]+needed[:cursor]
+     selected=rotated[:P['minute_fetch_limit']]
+     requested=len(selected) if minute_data is None and fetch_minutes else 0
+@@ -659,5 +732,8 @@
+             if m['stage']==20:
+                 assert m['support_price']==m['platform']['low']
+                 assert m['platform']['rise_pct']>=P['ma20_rise_pct'] and m['platform']['rise_atr']>=P['ma20_rise_atr']
++                assert m['platform']['latest_cycle']
++                if P['ma20_retained_gain']:
++                    assert m['platform']['retained_pct']>=P['ma20_rise_pct'] and m['platform']['retained_atr']>=P['ma20_rise_atr']
+         if m['status']=='已退出':assert not m['eligible'] and m['exit_at']
+     return True
+--- before/ma_trend_ui.js
++++ after/ma_trend_ui.js
+@@ -1,5 +1,6 @@
+ /* MA judgments, stage membership and order are read from the backend. */
+ function mtModel(){return DATA.ma_trend||null;}
++function mtHistorical(m){return m.status==='已退出';}
+ function mtSnapshotFresh(m){
+  if(typeof sessionNow!=='function')return true;
+  var phase=sessionNow();if(m.reference_only||phase==='集合竞价'||phase==='竞价结束'||phase==='非交易日')return false;
+@@ -14,21 +15,21 @@
+   if(!r||!msMatchDirections(r,'radar'))return false;
+   var m=r.ma_trend||{},phase=v.phase;
+   if(['trend','focus','advance'].indexOf(v.scope)>=0&&!mtSnapshotFresh(m))return false;
+-  if(phase&&(['5','10','20'].indexOf(phase)>=0?String(m.stage)!==phase:(m.events||[]).indexOf(phase)<0))return false;
++  if(phase&&(['5','10','20'].indexOf(phase)>=0?(String(m.stage)!==phase||v.scope!=='exited'&&mtHistorical(m)):(m.events||[]).indexOf(phase)<0))return false;
+   return !v.q||String(r.code+' '+r.name).indexOf(v.q)>=0;
+  });
+ }
+ function mtValue(v,d){return v==null?'—':fmt(v,d==null?2:d);}
+ function mtTools(){var v=MS_VIEW.radar;return '<div class="ms-toolbar">'+
+- msSelect('scope',[['trend','有效观察'],['advance','推进延续'],['startup_pending','启动待确认'],['displaced','位置 / 结构偏离'],['repair','支撑修复观察'],['exited','已退出'],['pending','数据待核验'],['all','全部成员']],'radar','趋势观察范围')+
++ msSelect('scope',[['all','全部成员（默认）'],['trend','有效观察'],['advance','推进延续'],['startup_pending','启动待确认'],['displaced','位置 / 结构偏离'],['repair','支撑修复观察'],['exited','历史退出记录'],['pending','数据待核验']],'radar','趋势观察范围')+
+  msSelect('phase',[['','全部阶段'],['5','MA5初期推进'],['10','MA10承接整理'],['20','MA20横盘再启动'],['底部反弹','底部反弹'],['快速收回','快速收回']],'radar','均线阶段')+
+  '<input aria-label="雷达股票搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="radar" data-ms-search-field="q" oninput="msSearchInput(event,this,\'radar\',\'q\')"><button class="btn" onclick="mtCSV()">导出当前雷达 CSV</button></div>';}
+ function mtOpen(id,phase){var v=MS_VIEW.radar;v.scope='trend';v.phase=String(phase||'');v.industryIds=[];v.themeIds=[];v.boardQuery='';v.q='';if(id){var b=boardById(id);if(b)v[b.type==='industry'?'industryIds':'themeIds']=[id];}closeDrawer();RENDERED.radar=false;goPane('radar');mtRender();}
+-function renderRadar(){MS_VIEW.radar.axis='trend';if(MS_VIEW.radar.scope==='all'&&!MS_VIEW.radar.initialized)MS_VIEW.radar.scope='trend';MS_VIEW.radar.initialized=true;mtRender();}
++function renderRadar(){MS_VIEW.radar.axis='trend';MS_VIEW.radar.initialized=true;mtRender();}
+ function mtCSV(){return msExportRows(mtRows(),'radar','均线雷达_'+DATA.ui_generation+'.csv');}
+ function mtTable(rows,limit){var shown=limit?rows.slice(0,limit):rows,h='<div class="tw"><table class="market-strength-table ms-research-table ma-trend-table"><thead><tr><th class="l">名称 / 所属方向</th><th>阶段 / 当前状态</th><th>支撑 / 距离</th><th class="l">本轮启动 / 最近确认</th><th class="l">反弹 / 板块同步</th><th>当日涨幅</th></tr></thead><tbody>';
+  shown.forEach(function(r){var m=r.ma_trend||{},o=m.origin||{},p=m.platform||{},b=m.board||{},rb=m.rebound||{};
+-  h+='<tr class="clickable" data-strength-id="'+esc(r.code)+'" data-ma-stage="'+esc(m.stage||'')+'" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+esc(r.code)+'</span>'+msAffiliation(r,'stocks')+'</td><td><b '+msTipAttrs(m.status,m.reason+(m.exit_at?'；确认退出时间 '+m.exit_at:''))+' class="ma-state '+(m.eligible?'ma-active':'ma-inactive')+'">'+esc(m.status||'未入选')+'</b><span '+msTipAttrs(m.stage_label,m.structure_state)+' class="cd">'+esc(m.stage_label||'暂无合格阶段')+'</span><span class="cd">'+esc(m.exit_at?'确认退出 '+m.exit_at:'')+'</span><span class="cd">'+esc(m.reason||'')+'</span></td><td><b>'+esc(m.status==='已退出'&&m.last_exit?(m.stage===20?'退出平台底部':'退出日完成MA'+m.stage):(m.support_basis||'支撑'))+' '+mtValue(m.support_price,3)+'</b><span class="cd">暂态MA'+(m.stage||'—')+' '+mtValue(m.ma_value,3)+'</span><span class="cd">距防守位 '+mtValue(m.distance_atr)+' ATR</span></td><td class="l"><b '+msTipAttrs(o.kind||'无强势起点')+'>'+esc(o.kind||'无强势起点')+'</b><span class="cd">'+esc(o.date||'—')+'启动 · 最近确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+'</span><span class="cd">启动量比 '+mtValue(o.volume_ratio)+' · 上涨 '+mtValue(o.day_return_pct)+'%</span><span class="cd">前段上涨 '+mtValue(p.rise_pct)+'% · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</span></td><td class="l"><b>'+ (rb.distance_atr==null?'—':'底部反弹 '+mtValue(rb.distance_atr)+' ATR')+'</b><span class="cd">'+esc(rb.basis||'')+'</span><span class="cd">'+esc(b.name||'板块同步待核验')+' '+(b.trend_pct==null?'':mtValue(b.trend_pct,1)+'%成员入选')+'</span><span class="cd">'+esc((m.data_reasons||[]).join('；'))+'</span></td><td>'+pct(m.change_pct==null?r.change_pct:m.change_pct,2)+'<span class="cd">'+esc(String(m.quote_at||'').slice(11,19))+'</span></td></tr>';
++  h+='<tr class="clickable" data-strength-id="'+esc(r.code)+'" data-ma-stage="'+esc(m.stage||'')+'" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l"><b>'+esc(r.name)+'</b><span class="cd">'+esc(r.code)+'</span>'+msAffiliation(r,'stocks')+'</td><td><b '+msTipAttrs(m.status,m.reason+(m.exit_at?'；确认退出时间 '+m.exit_at:''))+' class="ma-state '+(m.eligible?'ma-active':'ma-inactive')+'">'+esc(m.status||'未入选')+'</b><span '+msTipAttrs(m.stage_label,m.structure_state)+' class="cd">'+esc((mtHistorical(m)?'历史阶段 · ':'')+(m.stage_label||'暂无合格阶段'))+'</span><span class="cd">'+esc(m.exit_at?'确认退出 '+m.exit_at:'')+'</span><span class="cd ma-reason" '+msTipAttrs(m.status,m.reason)+'>'+esc(m.reason||'')+'</span></td><td><b>'+esc(m.status==='已退出'&&m.last_exit?(m.stage===20?'退出平台底部':'退出日完成MA'+m.stage):(m.support_basis||'支撑'))+' '+mtValue(m.support_price,3)+'</b><span class="cd">'+(m.stage===20&&p.start?'平台 '+esc(p.start)+' → '+esc(p.validated_at||p.formed_at||'—')+' · '+mtValue(p.low,3)+'—'+mtValue(p.high,3):'')+'</span><span class="cd">暂态MA'+(m.stage||'—')+' '+mtValue(m.ma_value,3)+'</span><span class="cd">距防守位 '+mtValue(m.distance_atr)+' ATR</span></td><td class="l"><b '+msTipAttrs(o.kind||'无强势起点')+'>'+esc(o.kind||'无强势起点')+'</b><span class="cd">'+esc(o.date||'—')+'启动 · 最近确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+'</span><span class="cd">启动量比 '+mtValue(o.volume_ratio)+' · 上涨 '+pctHtml(o.day_return_pct)+'</span><span class="cd">前段上涨 '+pctHtml(p.rise_pct)+' · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</span></td><td class="l"><b>'+ (rb.distance_atr==null?'—':'底部反弹 '+mtValue(rb.distance_atr)+' ATR')+'</b><span class="cd">'+esc(rb.basis||'')+'</span><span class="cd">'+esc(b.name||'板块同步待核验')+' '+(b.trend_pct==null?'':mtValue(b.trend_pct,1)+'%成员入选')+'</span><span class="cd">'+esc((m.data_reasons||[]).join('；'))+'</span></td><td>'+pctHtml(m.change_pct==null?r.change_pct:m.change_pct,2)+'<span class="cd">'+esc(String(m.quote_at||'').slice(11,19))+'</span></td></tr>';
+  });return h+'</tbody></table></div>';
+ }
+ function mtRender(){var host=document.getElementById('ma-radar-host'),focused=document.activeElement;
+@@ -37,17 +38,19 @@
+  var subtitle=document.getElementById('radar-sub');if(subtitle)subtitle.textContent=mtModel().mode+' · 行情截至 '+(mtModel().source_at||'—')+' · 沪深主板';
+  var v=MS_VIEW.radar,rows=mtRows(),label=focused&&focused.getAttribute('aria-label'),start=focused&&focused.selectionStart,end=focused&&focused.selectionEnd;
+  var h=msDirectionPicker('radar')+mtTools()+'<p class="ms-muted">通过量价强势前提后，按MA5 / MA10 / MA20分阶段观察。当前筛选 '+rows.length+' 只。MA5有效失守转MA10；MA10有效失守须已有合格MA20平台，否则退出。MA20以锁定的平台底部防守。过期快照不展示为当前有效观察。</p>';
+- [5,10,20].forEach(function(n){var selected=rows.filter(function(r){return (r.ma_trend||{}).stage===n;});if(v.phase&&['5','10','20'].indexOf(v.phase)>=0&&Number(v.phase)!==n)return;
+-  var names={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'},tips={5:'放量上攻、有效突破或涨停突破，沿MA5运行',10:'MA5失守后转入承接；紧缩平台形成与底部反弹单列',20:'上涨后高位横盘，等待MA20上移与底部反弹'};
+-  h+='<section class="card ma-stage-section" data-ma-section="'+n+'"><div class="ms-section-head"><div><h3 '+msTipAttrs(names[n])+'>'+names[n]+' <span class="ms-muted">'+selected.length+' 只</span></h3><p class="ms-muted">'+tips[n]+' · 排序：'+esc(mtModel().sorting[n])+'</p></div></div>'+(selected.length?mtTable(selected,v.limit):'<p class="ms-muted">当前筛选没有符合本阶段的股票。</p>')+'</section>';
++ [5,10,20].forEach(function(n){var selected=rows.filter(function(r){var m=r.ma_trend||{};return m.stage===n&&(v.scope==='exited'||!mtHistorical(m));});if(v.phase&&['5','10','20'].indexOf(v.phase)>=0&&Number(v.phase)!==n)return;
++  var names={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'},tips={5:'放量上攻、有效突破或涨停突破，沿MA5运行',10:'MA5失守后转入承接；紧缩平台形成与底部反弹单列',20:'最近上涨结束后的整理；平台底部保留≥20%且≥4 ATR涨幅，区间≤2 ATR'};
++  if(v.scope==='exited')names[n]='历史退出 · '+names[n];
++  h+='<section class="card ma-stage-section" data-ma-section="'+n+'"><div class="ms-section-head"><div><h3 '+msTipAttrs(names[n])+'>'+names[n]+' <span class="ms-muted">'+selected.length+' 只 · 有效观察 '+selected.filter(function(r){return r.ma_trend.eligible&&mtSnapshotFresh(r.ma_trend);}).length+' 只</span></h3><p class="ms-muted">'+tips[n]+' · 排序：'+esc(mtModel().sorting[n])+'</p></div></div>'+(selected.length?mtTable(selected,v.limit):'<p class="ms-muted">当前筛选没有符合本阶段的股票。</p>')+'</section>';
+  });
+- var unknown=rows.filter(function(r){return !(r.ma_trend||{}).stage;});if(unknown.length)h+='<section class="card"><h3>未入选 / 待核验 · '+unknown.length+' 只</h3>'+mtTable(unknown,v.limit)+'</section>';
+- if(rows.some(function(r){return rows.filter(function(x){return x.ma_trend&&r.ma_trend&&x.ma_trend.stage===r.ma_trend.stage;}).length>v.limit;}))h+='<button class="btn" onclick="MS_VIEW.radar.limit+=100;msRender(\'radar\')">加载更多</button>';
++ var unknown=rows.filter(function(r){var m=r.ma_trend||{};return !m.stage||v.scope!=='exited'&&mtHistorical(m);});if(unknown.length)h+='<section class="card" data-ma-unselected><h3>未入选 / 历史退出 / 待核验 · '+unknown.length+' 只</h3><p class="ms-muted">退出记录仅供回看，不代表当前阶段。选择“历史退出记录”可按旧阶段检索。</p>'+mtTable(unknown,v.limit)+'</section>';
++ var groupCounts={};rows.forEach(function(r){var m=r.ma_trend||{},key=mtHistorical(m)&&v.scope!=='exited'?0:m.stage||0;groupCounts[key]=(groupCounts[key]||0)+1;});
++ if(Object.keys(groupCounts).some(function(key){return groupCounts[key]>v.limit;}))h+='<button class="btn" onclick="MS_VIEW.radar.limit+=100;msRender(\'radar\')">加载更多</button>';
+  h+='<p class="ms-muted">'+esc(mtModel().version)+' · UI '+esc(DATA.ui_generation||'')+' · 数据时间 '+esc(mtModel().at)+'</p>';
+  if(typeof msHideTooltip==='function')msHideTooltip();host.innerHTML=h;if(label==='雷达股票搜索'||label==='搜索板块题材'){var next=host.querySelector('[aria-label="'+label+'"]');if(next){next.focus({preventScroll:true});if(start!=null)next.setSelectionRange(start,end);}}
+ }
+ function mtDetail(m){if(!m)return '';var p=mtModel().parameters,o=m.origin||{},pl=m.platform||{},rb=m.rebound||{};
+- return '<details class="card ma-trend-detail"><summary>均线趋势判断依据 · '+esc(m.stage_label)+' · '+esc(m.status)+'</summary><div><p>'+esc(m.mode)+' · 源报价 '+esc(m.quote_at||'—')+' · 完成日 '+esc(m.asof||'—')+'</p><p>'+esc(m.reason)+'</p><p>'+esc((m.events||[]).join(' / '))+'</p><p>防守依据 '+esc(m.support_basis||'—')+' · 本阶段支撑触线价 '+mtValue(m.support_price,4)+' · 暂态均线 '+mtValue(m.ma_value,4)+'</p><p>本轮强势启动 '+esc(o.date||'—')+' · '+esc(o.kind||'—')+' · '+esc(o.basis||'—')+'</p><p>最近强势确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+' · 实际覆盖 '+(m.history_days||'—')+' 个完成交易日（'+esc(m.history_from||'—')+' 至 '+esc(m.asof||'—')+'）</p><p>阶段转换 '+esc((m.transitions||[]).map(function(t){return (t.at||t.date)+' MA'+t.from_stage+'→MA'+t.to_stage;}).join('；')||'暂无')+'</p><p>单日上涨 '+mtValue(o.day_return_pct)+'% / 两日 '+mtValue(o.two_day_return_pct)+'%；'+(o.rise_days||'—')+'日净上攻 '+mtValue(o.rise_atr)+' ATR（放量上攻门槛 '+p.impulse_rise_atr+'）；量比 '+mtValue(o.volume_ratio)+'（上攻 '+p.volume_ratio+' / 突破 '+p.breakout_volume_ratio+'）；收盘位置 '+mtValue(o.close_position==null?null:o.close_position*100,1)+'%</p><p>前段上涨 '+mtValue(pl.rise_pct)+'% / '+mtValue(pl.rise_atr)+' ATR；固定低点 '+mtValue(pl.base_low)+'（'+esc(pl.base_at||'—')+'）</p><p>锁定平台 '+mtValue(pl.low)+' 至 '+mtValue(pl.high)+' · 成立 '+esc(pl.formed_at||'—')+' · 最近核验 '+esc(pl.validated_at||'—')+' · 当前 '+(pl.current_days||pl.days||'—')+' 日 · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</p><p>本次底部反弹 '+mtValue(rb.distance_atr)+' ATR（门槛 '+p.rebound_atr+'） · '+esc(rb.basis||'尚无本次反弹证据')+' · '+esc(rb.at||'—')+'</p><p>MA20允许线下偏离 '+p.ma20_below_atr+' ATR与'+p.ma20_below_pct+'%取小；平台底部仍是防守位。</p><p class="ms-card-risk">失守 '+p.repair_minutes+' 个交易分钟未收回：MA5转MA10，MA10无合格MA20平台则退出，MA20平台失守退出；明显跌破 '+p.break_atr+' ATR提前退出。'+esc(m.exit_at?' 已退出：'+m.exit_at:'')+'</p><p class="ms-muted">'+esc((m.data_reasons||[]).join('；')||'当前必要数据已核验')+'</p><details><summary>完整阶段、支撑与分钟依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details></div></details>';
++ return '<details class="card ma-trend-detail"><summary>均线趋势判断依据 · '+esc(m.stage_label)+' · '+esc(m.status)+'</summary><div><p>'+esc(m.mode)+' · 源报价 '+esc(m.quote_at||'—')+' · 完成日 '+esc(m.asof||'—')+'</p><p>'+esc(m.reason)+'</p><p>'+esc((m.events||[]).join(' / '))+'</p><p>防守依据 '+esc(m.support_basis||'—')+' · 本阶段支撑触线价 '+mtValue(m.support_price,4)+' · 暂态均线 '+mtValue(m.ma_value,4)+'</p><p>本轮强势启动 '+esc(o.date||'—')+' · '+esc(o.kind||'—')+' · '+esc(o.basis||'—')+'</p><p>最近强势确认 '+esc((m.last_confirmation||{}).date||o.date||'—')+' · 实际覆盖 '+(m.history_days||'—')+' 个完成交易日（'+esc(m.history_from||'—')+' 至 '+esc(m.asof||'—')+'）</p><p>阶段转换 '+esc((m.transitions||[]).map(function(t){return (t.at||t.date)+' MA'+t.from_stage+'→MA'+t.to_stage;}).join('；')||'暂无')+'</p><p>单日上涨 '+pctHtml(o.day_return_pct)+' / 两日 '+pctHtml(o.two_day_return_pct)+'；'+(o.rise_days||'—')+'日净上攻 '+mtValue(o.rise_atr)+' ATR（放量上攻门槛 '+p.impulse_rise_atr+'）；量比 '+mtValue(o.volume_ratio)+'（上攻 '+p.volume_ratio+' / 突破 '+p.breakout_volume_ratio+'）；收盘位置 '+mtValue(o.close_position==null?null:o.close_position*100,1)+'%</p><p>前段上涨 '+pctHtml(pl.rise_pct)+' / '+mtValue(pl.rise_atr)+' ATR；固定低点 '+mtValue(pl.base_low)+'（'+esc(pl.base_at||'—')+'）</p>'+(pl.latest_cycle?'<p>最近上涨 '+esc(pl.rise_start||pl.base_at||'—')+' → '+esc(pl.rise_end||pl.peak_date||'—')+'；整理起于 '+esc(pl.start||'—')+'；平台底部保留 '+pctHtml(pl.retained_pct)+' / '+mtValue(pl.retained_atr)+' ATR。振幅 '+mtValue(pl.width_pct)+'%（超过10%仅提示），宽度 '+mtValue(pl.width_atr)+' ATR（≤2）。</p>':'')+'<p>锁定平台 '+mtValue(pl.low)+' 至 '+mtValue(pl.high)+' · 成立 '+esc(pl.formed_at||'—')+' · 最近核验 '+esc(pl.validated_at||'—')+' · 当前 '+(pl.current_days||pl.days||'—')+' 日 · 整理量比 '+mtValue(m.volume&&m.volume.consolidation_ratio)+'</p><p>本次底部反弹 '+mtValue(rb.distance_atr)+' ATR（门槛 '+p.rebound_atr+'） · '+esc(rb.basis||'尚无本次反弹证据')+' · '+esc(rb.at||'—')+'</p><p>MA20允许线下偏离 '+p.ma20_below_atr+' ATR与'+p.ma20_below_pct+'%取小；平台底部仍是防守位。</p><p class="ms-card-risk">失守 '+p.repair_minutes+' 个交易分钟未收回：MA5转MA10，MA10无合格MA20平台则退出，MA20平台失守退出；明显跌破 '+p.break_atr+' ATR提前退出。'+esc(m.exit_at?' 已退出：'+m.exit_at:'')+'</p><p class="ms-muted">'+esc((m.data_reasons||[]).join('；')||'当前必要数据已核验')+'</p><details><summary>完整阶段、支撑与分钟依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details></div></details>';
+ }
+ function mtOverview(){var meta=mtModel(),breadth=DATA.breadth||{},temperature=DATA.market_emotion||{},host=document.getElementById('ms-overview-host');
+  document.getElementById('hero-h1').textContent='今天重点看哪里';document.getElementById('hero-p').textContent='均线三阶段观察 · 板块同步 · 情绪参考';document.getElementById('hero-stamp').textContent=msStamp();
+@@ -57,7 +60,7 @@
+  var h='<section class="card ms-overview-section"><div class="ms-section-head"><h3>均线趋势三阶段</h3><button class="btn" onclick="mtOpen()">查看全部观察 →</button></div><div class="ma-stage-grid">';
+  [5,10,20].forEach(function(n){var ids=(meta.lists[n]||[]).filter(function(c){return mtSnapshotFresh(by[c].ma_trend);}),names={5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'};h+='<article class="ms-direction-card trend"><button class="ms-name-link" onclick="mtOpen(null,'+n+')">'+names[n]+' · '+ids.length+'只</button><div class="ms-leaders">'+ids.slice(0,4).map(function(c){return '<button onclick="showStock(\''+c+'\')">'+esc(by[c].name)+' · '+esc(by[c].ma_trend.status)+'</button>';}).join('')+'</div>'+(!ids.length?'<p class="ms-muted">当前没有合格观察</p>':'')+'</article>';});h+='</div><p class="ms-muted">推进延续 '+(meta.advance||[]).length+' 只 · 修复观察 '+meta.repair.length+' 只 · 已退出 '+meta.exited.length+' 只 · 数据待核验 '+meta.pending.length+' 只</p></section>';
+  h+='<section class="card ms-overview-section"><h3>均线观察集中方向</h3><div class="ma-stage-grid">'+(meta.current.some(function(c){return mtSnapshotFresh(by[c].ma_trend);})?meta.boards:[]).slice(0,6).map(function(b){return '<article class="ms-direction-card trend"><button class="ms-name-link" onclick="mtOpen(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button><p>入选 '+b.count+' / '+b.valid+'只 · '+mtValue(b.trend_pct,1)+'%</p><p class="ms-muted">MA5 '+b.stages[5]+' · MA10 '+b.stages[10]+' · MA20 '+b.stages[20]+' · 覆盖 '+mtValue(b.coverage_pct,1)+'%</p></article>';}).join('')+'</div></section>';
+- h+='<section class="card ms-overview-section"><h3>市场与情绪参考</h3><p>上涨占比 '+mtValue(breadth.up_ratio,1)+'% · 涨停 / 跌停 '+(temperature.limit_up||0)+' / '+(temperature.limit_down||0)+' · 昨日涨停股 '+pct(temperature.yesterday_limit_median_pct,2)+'</p><button class="btn" onclick="msOpenStocks(null,\'emotion\')">查看情绪榜 →</button></section><p class="ms-muted">'+esc(meta.version)+' · '+esc(meta.at)+' · 同花顺确认主板成员，行业与题材可能重合。</p>';
++ h+='<section class="card ms-overview-section"><h3>市场与情绪参考</h3><p>上涨占比 '+mtValue(breadth.up_ratio,1)+'% · 涨停 / 跌停 '+(temperature.limit_up||0)+' / '+(temperature.limit_down||0)+' · 昨日涨停股 '+pctHtml(temperature.yesterday_limit_median_pct,2)+'</p><button class="btn" onclick="msOpenStocks(null,\'emotion\')">查看情绪榜 →</button></section><p class="ms-muted">'+esc(meta.version)+' · '+esc(meta.at)+' · 同花顺确认主板成员，行业与题材可能重合。</p>';
+  host.innerHTML=h;
+ }
+ var MT_OLD_OVERVIEW=renderOverview,MT_OLD_STOCK=showStock,MT_OLD_DETAIL=msDetail;
+--- before/radar_ui.js
++++ after/radar_ui.js
+@@ -68,7 +68,7 @@
+  h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="'+key+'" data-ms-search-field="q" oninput="msSearchInput(event,this,\''+key+'\',\'q\')"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
+ }
+ function msDirectionPicker(key){key=key||'stocks';var v=MS_VIEW[key],selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
+- var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺官方板块 · 确认成员 · 同类多选取并集，行业与题材取交集</p></div><button class="btn ms-clear-button" onclick="msClearDirections(\''+key+'\')">清除方向</button></div><div class="ms-direction-search-wrap"><span aria-hidden="true">⌕</span><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" data-ms-search-key="'+key+'" data-ms-search-field="boardQuery" oninput="msSearchInput(event,this,\''+key+'\',\'boardQuery\')"></div>';
++ var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺官方板块 · 确认成员 · 同类多选取并集，行业与题材取交集</p></div><button class="btn ms-clear-button" onclick="msClearDirections(\''+key+'\')">清除方向</button></div><div class="ms-direction-search-wrap"><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" data-ms-search-key="'+key+'" data-ms-search-field="boardQuery" oninput="msSearchInput(event,this,\''+key+'\',\'boardQuery\')"></div>';
+  h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\',\''+key+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向 · 按当前筛选范围展示股票</span>')+'</div>';
+  h+='<details class="ms-direction-browser" '+(q||v.browseOpen?'open':'')+'><summary onclick="MS_VIEW[\''+key+'\'].browseOpen=!this.parentNode.open">浏览行业 / 题材 <span>展开目录</span></summary><div class="ms-direction-browser-content">';
+  ['industry','theme'].forEach(function(kind){var rows=msBoardCatalog().filter(function(b){return b.type===kind&&(!q||b.name.indexOf(q)>=0);}),rank=((msModel().boards||{}).sorts||{}).trend||[],order={};rank.forEach(function(id,i){order[id]=i;});rows.sort(function(a,b){return (order[a.id]==null?1e9:order[a.id])-(order[b.id]==null?1e9:order[b.id]);});
+@@ -77,7 +77,7 @@
+ }
+ function msScore(m,axis){return m[axis+'_score']==null?'—':fmt(m[axis+'_score'],1)+' · '+esc(m[axis+'_level']||'—');}
+ function msBadge(m,axis){return '<span '+msTipAttrs(axis==='trend'?'趋势力度':'情绪强度',(m.reasons||[]).join('；'))+' class="ms-badge ms-'+axis+' '+(m[axis+'_score']>=65?'ms-hot':'')+'">'+(axis==='trend'?'趋势力度 ':'情绪 ')+msScore(m,axis)+'</span>';}
+-function msHistory(m,n){var r=(m.history_returns||{})[n];return r==null?'—':pct(r,2);}
++function msHistory(m,n){var r=(m.history_returns||{})[n];return r==null?'—':pctHtml(r,2);}
+ function msTags(m){return (m.labels||m.events||[]).map(function(t){return msTag(t,(m.reasons||[]).join('；'),t==='明显回落'?'risk':'');}).join('')||'<span class="ms-muted">暂无新增形态标签</span>';}
+ function msAffiliation(r,key){var rel=msRelations(r.code),v=MS_VIEW.stocks,selected=v.industryIds.concat(v.themeIds),matched=key==='stocks'?rel.filter(function(b){return selected.indexOf(b.id)>=0;}):[],themes=rel.filter(function(b){return b.type==='theme';}),industry=r.industry_detail||r.industry||'行业未收录';
+  var h='<div class="ms-affiliation"><span class="ms-industry">'+esc(industry)+'</span>';
+@@ -91,7 +91,7 @@
+  var ranked=key==='stocks',h='<div class="tw"><table class="market-strength-table ms-research-table"><thead><tr>'+(ranked?'<th class="ms-rank-heading">排名</th>':'')+'<th class="l">名称 / 所属方向</th><th>当日涨幅</th><th>趋势强度</th><th>情绪强度</th><th>'+ (axis==='emotion'?'进攻 / 保持 / 活跃':'历史5 / 10 / 20日')+'</th><th class="l">结构 / 个性标签</th></tr></thead><tbody>';
+  shown.forEach(function(r,i){var m=r.market_strength||{},chg=boards?(m.emotion_parts||{}).R0:r.change_pct,ev=m.display_evidence||{},recent=m.recent_emotion||{};
+  var metric=axis==='emotion'?'<b>'+fmt(m.day_attack,1)+' / '+fmt(ev.hold,1)+' / '+(recent.active_days==null?'—':recent.active_days+'/5')+'</b><span class="cd">完成日5日 '+msHistory(m,5)+'</span>':[5,10,20].map(function(n){return '<span class="ms-return '+(m.dominant_period===n?'dominant':'')+'">'+n+'日 '+msHistory(m,n)+'</span>';}).join('');
+- h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'">'+(ranked?'<td class="ms-rank-cell"><span class="ms-rank '+(i<3?'podium rank-'+(i+1):'')+'">'+(i+1)+'</span></td>':'')+'<td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span>'+(boards?'':msAffiliation(r,key))+'</td><td>'+pct(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td class="ms-metric-cell">'+metric+'</td><td class="l"><span class="cd">'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</span><div class="ms-tag-list">'+msTags(m)+'</div><span class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
++ h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'">'+(ranked?'<td class="ms-rank-cell"><span class="ms-rank '+(i<3?'podium rank-'+(i+1):'')+'">'+(i+1)+'</span></td>':'')+'<td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span>'+(boards?'':msAffiliation(r,key))+'</td><td>'+pctHtml(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td class="ms-metric-cell">'+metric+'</td><td class="l"><span class="cd">'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</span><div class="ms-tag-list">'+msTags(m)+'</div><span class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
+  });return h+'</tbody></table></div>'+msMore(rows,shown,key);
+ }
+ function msStamp(){var m=msModel();return esc(m.mode||'')+' · 行情截至 '+esc(String((DATA.direction_changes||{}).source_at||m.at||'—').slice(0,19))+' · 沪深主板';}
+@@ -117,13 +117,13 @@
+  if(STATE.q){MS_VIEW.stocks.q=STATE.q;MS_VIEW.stocks.scope='all';}msRender('stocks');
+ }
+ function msDirectionCard(b,axis){var m=b.market_strength||{},share=(m.member_strength||{})[axis+'_pct'],r0=(m.emotion_parts||{}).R0,dc=m.direction_change,a=dc&&dc.axes&&dc.axes[axis],lists=msModel().stocks||{},lookup={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){lookup[r.code]=r;});var leaders=(((lists.sorts||{})[axis])||[]).filter(function(c){return (b.member_codes||[]).indexOf(c)>=0&&lookup[c]&&(lookup[c].market_strength||{})[axis+'_strong'];}).slice(0,3);
+- return '<article class="ms-direction-card '+axis+'" data-board-id="'+esc(b.id)+'" data-axis="'+axis+'"><div class="ms-card-head"><button class="ms-name-link" onclick="msOpenStocks(\''+jsq(b.id)+'\',\''+axis+'\')">'+esc(b.name)+'</button><button class="ms-detail-link" onclick="showBoardById(\''+jsq(b.id)+'\')">详情 ↗</button></div>'+msBadge(m,axis)+'<div class="ms-mini-metrics"><span>成员整体涨幅<b>'+pct(r0,2)+'</b></span><span>'+ (axis==='trend'?'趋势':'情绪')+'强股占比<b>'+fmt(share,1)+'%</b></span></div>'+(a?'<p class="ms-muted">较 '+esc(dc.from_at.slice(11,16))+' · 成员涨幅 '+msDelta(dc.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(a.share_delta_pp,1)+'个百分点</p>':'')+'<div class="ms-leaders">'+leaders.map(function(c){return '<button onclick="showStock(\''+jsq(c)+'\')">'+esc(lookup[c].name)+'</button>';}).join('')+'</div></article>';
++ return '<article class="ms-direction-card '+axis+'" data-board-id="'+esc(b.id)+'" data-axis="'+axis+'"><div class="ms-card-head"><button class="ms-name-link" onclick="msOpenStocks(\''+jsq(b.id)+'\',\''+axis+'\')">'+esc(b.name)+'</button><button class="ms-detail-link" onclick="showBoardById(\''+jsq(b.id)+'\')">详情 ↗</button></div>'+msBadge(m,axis)+'<div class="ms-mini-metrics"><span>成员整体涨幅<b>'+pctHtml(r0,2)+'</b></span><span>'+ (axis==='trend'?'趋势':'情绪')+'强股占比<b>'+fmt(share,1)+'%</b></span></div>'+(a?'<p class="ms-muted">较 '+esc(dc.from_at.slice(11,16))+' · 成员涨幅 '+msDelta(dc.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(a.share_delta_pp,1)+'个百分点</p>':'')+'<div class="ms-leaders">'+leaders.map(function(c){return '<button onclick="showStock(\''+jsq(c)+'\')">'+esc(lookup[c].name)+'</button>';}).join('')+'</div></article>';
+ }
+ function renderOverview(){document.getElementById('hero-h1').textContent='今天重点看哪里';document.getElementById('hero-p').textContent='市场温度 · 趋势与情绪集中方向 · 最新行情中的转强变化';document.getElementById('hero-stamp').textContent=msStamp();
+  ['ov-work-live','ov-work-close','overview-more'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});var sw=document.querySelector('#p-overview .work-switch');if(sw)sw.style.display='none';
+  var host=document.getElementById('ms-overview-host');if(!host){host=document.createElement('div');host.id='ms-overview-host';document.querySelector('#p-overview .main').prepend(host);}
+  var meta=msModel(),counts=meta.counts||{},breadth=DATA.breadth||{},temperature=DATA.market_emotion||{},bl={};msBoardCatalog().forEach(function(b){bl[b.id]=b;});var dc=DATA.direction_changes||{},pool=(meta.coverage||{}).pool||0;
+- var metrics=[['上涨占比',fmt(breadth.up_ratio,1)+'%'],['涨停 / 跌停',(temperature.limit_up||0)+' / '+(temperature.limit_down||0)],['昨日涨停股表现',pct(temperature.yesterday_limit_median_pct,2)],['趋势强 / 情绪强',(counts.trend||0)+' / '+(counts.emotion||0)]];
++ var metrics=[['上涨占比',fmt(breadth.up_ratio,1)+'%'],['涨停 / 跌停',(temperature.limit_up||0)+' / '+(temperature.limit_down||0)],['昨日涨停股表现',pctHtml(temperature.yesterday_limit_median_pct,2)],['趋势强 / 情绪强',(counts.trend||0)+' / '+(counts.emotion||0)]];
+  var h='<section class="card ms-overview-section"><div class="ms-section-head"><h3>市场温度</h3><span class="ms-muted">沪深主板 · '+(temperature.traded||breadth.traded||0)+'只成交</span></div><div class="ms-temperature-grid">'+metrics.map(function(x){return '<div><span>'+x[0]+'</span><strong>'+x[1]+'</strong></div>';}).join('')+'</div><p class="ms-muted">股票池 '+pool+' 只 · 趋势强占比 '+fmt(pool?100*(counts.trend||0)/pool:null,1)+'% · 情绪强占比 '+fmt(pool?100*(counts.emotion||0)/pool:null,1)+'%'+(dc.temperature_change?' · 较 '+esc(dc.from_at.slice(11,16))+' 可比样本上涨占比变化 '+msDelta(dc.temperature_change.up_ratio_delta_pp,1)+'个百分点':'')+'</p></section>';
+  h+='<section class="card ms-overview-section"><div class="ms-section-head"><h3>正在转强</h3><span class="ms-muted">'+(dc.from_at?'比较 '+esc(dc.from_at.slice(11,19))+' → '+esc(dc.source_at.slice(11,19)):'依据同日可比行情变化')+'</span></div>';
+  var changes=(dc.items||[]).slice(0,6);h+=changes.length?'<div class="ms-turning-grid">'+changes.map(function(x){return '<button class="ms-turning-card '+x.axis+'" onclick="msOpenStocks(\''+jsq(x.id)+'\',\''+x.axis+'\')"><b>'+esc(x.name)+'</b><span>'+ (x.axis==='trend'?'趋势':'情绪')+' · '+esc(x.kind)+'</span><small>成员涨幅 '+msDelta(x.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(x.share_delta_pp,1)+'个百分点</small></button>';}).join('')+'</div>':'<p class="ms-muted">'+(dc.from_at?'本次可比行情中暂无符合转强条件的方向。':'暂无同日可比行情变化记录；下面展示最新强势方向。')+'</p>';h+='</section>';
+@@ -132,14 +132,14 @@
+ }
+ function renderWorkboard(){renderOverview();}
+ 
+-function msDetail(m){var ev=m.display_evidence||{},h='<section class="card market-strength-detail"><div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><div class="ms-tag-list">'+msTags(m)+'</div><p>'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</p><p>'+esc((m.reasons||[]).join('；')||'—')+'</p><p class="ms-muted">距阶段高点 '+fmt(ev.drawdown_atr,2)+' ATR · '+[5,10,20].map(function(n){return '距MA'+n+' '+pct((ev.ma_distance_pct||{})[n],2);}).join(' / ')+'</p>'+(m.new_strong_axes||[]).map(function(x){return '<p class="ms-muted">'+(x.axis==='trend'?'趋势':'情绪')+'新进入强势：'+esc(x.basis)+' '+esc(x.from_at)+' → '+esc(x.to_at||'—')+'</p>';}).join('')+'<p class="ms-card-risk">'+esc((m.risks||[]).join('；')||'')+'</p>';
++function msDetail(m){var ev=m.display_evidence||{},h='<section class="card market-strength-detail"><div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><div class="ms-tag-list">'+msTags(m)+'</div><p>'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</p><p>'+esc((m.reasons||[]).join('；')||'—')+'</p><p class="ms-muted">距阶段高点 '+fmt(ev.drawdown_atr,2)+' ATR · '+[5,10,20].map(function(n){return '距MA'+n+' '+pctHtml((ev.ma_distance_pct||{})[n],2);}).join(' / ')+'</p>'+(m.new_strong_axes||[]).map(function(x){return '<p class="ms-muted">'+(x.axis==='trend'?'趋势':'情绪')+'新进入强势：'+esc(x.basis)+' '+esc(x.from_at)+' → '+esc(x.to_at||'—')+'</p>';}).join('')+'<p class="ms-card-risk">'+esc((m.risks||[]).join('；')||'')+'</p>';
+  h+='<details><summary>强度计算依据与实际数值</summary><p>趋势：75%完成日历史力度 + 25%当前窗口力度，乘连续结构系数形成周期基础分；5/10/20日择主导，再按当前回落与短周期冲突折减总分。力度内部60%绝对收益 + 40%同周期分位；绝对收益在参考尺度80%以内线性计分，以上递减增长。个股参考尺度8/12/20%，板块5/8/12%；20/60日背景另列。板块结构与当前回落取有效成员均值。个股情绪：60%当日进攻 + 20%保持 + 20%近5日活跃；保持为75%日内位置与开盘后推进 + 25%有效报价抽样过程，抽样不足时过程分中性50。近5日按1/2/3/4/5递增权重，并扣减近期下跌压力。板块情绪：40%成员整体进攻 + 35%情绪强股比例 + 25%成员保持中位数。≥65强，≥80很强；单一价格涨停的快照保持分50，报价抽样不代表封板时长。</p><div class="tw"><table><thead><tr><th>周期</th><th>完成日涨幅</th><th>当前窗口涨幅</th><th>历史力度</th><th>当前力度</th><th>结构系数</th><th>趋势分</th></tr></thead><tbody>';
+  [5,10,20].forEach(function(n){var p=(m.trend_parts_by_period||{})[n]||{};h+='<tr><td>'+n+'日</td>'+['historical_R','R','historical_G','G','K','T'].map(function(k){return '<td>'+fmt(p[k],2)+'</td>';}).join('')+'</tr>';});
+  h+='</tbody></table></div><p>'+esc(m.version||'')+' · '+esc(m.mode||'')+' · 截至 '+esc(m.trend_at||m.emotion_at||'—')+' · UI '+esc(DATA.ui_generation||'')+'</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据来源与缺口</summary>'+esc((m.data_reasons||[]).join('；')||'当前计算数据完整')+'</details></section>';return h;
+ }
+ function showStock(code,boardId){var s=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0];if(!s)return;
+  var bars=s.chart_history||s.strength_history||[],hasOHLC=bars.length>=5,hasClose=s.k&&s.k.length>=5;
+- var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(s.price,2)+' <small>'+pct(s.change_pct,2)+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC||hasClose?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(hasOHLC?(s.chart_source?'日K · MA5 / MA10 / MA20 · 成交量 · 截至 '+esc(s.chart_at||bars[bars.length-1].date):'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。'):'完成日收盘走势 · OHLC不足，当前价与历史口径需结合来源。')+'</p>':'<p class="ms-muted">暂无可用历史走势图</p>')+'</section>'+msDetail(s.market_strength||{});
++ var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(s.price,2)+' <small>'+pctHtml(s.change_pct,2)+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC||hasClose?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(hasOHLC?(s.chart_source?'日K · MA5 / MA10 / MA20 · 成交量 · 截至 '+esc(s.chart_at||bars[bars.length-1].date):'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。'):'完成日收盘走势 · OHLC不足，当前价与历史口径需结合来源。')+'</p>':'<p class="ms-muted">暂无可用历史走势图</p>')+'</section>'+msDetail(s.market_strength||{});
+  var themes=s.themes||s.concepts||[];if(!Array.isArray(themes))themes=[themes];h+='<section class="card"><h3>个股概念归属</h3><p>'+esc(themes.map(function(t){return typeof t==='string'?t:t.name||'';}).join(' / ')||s.industry||'—')+'</p></section>';
+  var confirmed=msBoardCatalog().filter(function(b){return (b.member_codes||[]).indexOf(code)>=0;});if(confirmed.length)h+='<section class="card"><h3>确认成员关系</h3><div class="ms-axis">'+confirmed.map(function(b){return '<button class="btn" onclick="pickBoardMembers(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></section>'; openDrawer(esc(s.name)+' '+esc(code),'个股研究 · 历史结构与实时进攻',h,true);
+  setTimeout(function(){var cv=document.getElementById('k-cv');if(cv){if(hasOHLC){var price=(s.market_strength||{}).quote_at&&(s.market_strength||{}).price_context&&s.market_strength.price_context.valid?s.price:null;MS_CHART={bars:bars,price:price};var tools=document.createElement('div');tools.className='ms-chart-tools';tools.innerHTML='<label>显示区间 <select aria-label="K线显示区间" onchange="msChartRange(Number(this.value))"><option value="60">60日</option><option value="40">40日</option><option value="20">20日</option></select></label><span id="k-readout">移到K线上查看日期、OHLC与成交量</span>';cv.parentNode.insertBefore(tools,cv);msDrawCandles(cv,bars,price,60);}else if(hasClose)drawTrend(cv,s.k);}},30);
+@@ -158,7 +158,7 @@
+  g.fillStyle='#8b929d';g.fillText(bars[0].date,pad,h-3);g.fillText(bars[bars.length-1].date,w-85,h-3);g.fillText('成交量',pad,volTop-3);
+  cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+fmt(b.volume,0);};
+ }
+-function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],idx=(b.market_strength||{}).index_reference||{};var html=msDetail(b.market_strength||{})+'<section class="card"><h3>官方指数参照</h3><p>'+esc(idx.source||'同花顺指数')+' · '+pct(idx.change_pct==null?idx.ret1:idx.change_pct,2)+' · '+esc(idx.quote_at||idx.asof||'—')+'</p><p class="ms-muted">成员共振与官方指数分别计算。</p></section><section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members,'members')+'</section>';openDrawer(esc(b.name),'板块研究 · 成员共振与指数参照',html,true);}
++function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],idx=(b.market_strength||{}).index_reference||{};var html=msDetail(b.market_strength||{})+'<section class="card"><h3>官方指数参照</h3><p>'+esc(idx.source||'同花顺指数')+' · '+pctHtml(idx.change_pct==null?idx.ret1:idx.change_pct,2)+' · '+esc(idx.quote_at||idx.asof||'—')+'</p><p class="ms-muted">成员共振与官方指数分别计算。</p></section><section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members,'members')+'</section>';openDrawer(esc(b.name),'板块研究 · 成员共振与指数参照',html,true);}
+ function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';STATE.boardFilterId=null;MS_VIEW.stocks=msStockDefaults();}
+ function pickBoardMembers(id){if(!boardById(id))return toast('板块成员暂无数据');msOpenStocks(id,'trend',true);}
+ function clearMSMembers(){resetMSMemberView();MS_VIEW.stocks.scope='all';renderStocks();}
+--- before/stock_rank_ui.js
++++ after/stock_rank_ui.js
+@@ -2,7 +2,7 @@
+ var MS_EXPLANATIONS={
+  'MA5初期推进':'有完成日放量上攻、有效突破或涨停突破的强势入口，随后沿MA5推进。确认失守MA5转入MA10承接，不直接退出。',
+  'MA10承接整理':'本轮强势推进失守MA5后转入MA10承接。承接观察与紧缩整理平台分别说明；有效失守MA10，须已有合格MA20高位横盘平台才能继续，否则退出。',
+- 'MA20横盘再启动':'从本轮固定启动低点到最高收盘价上涨至少20%且至少4 ATR，随后形成合格高位横盘。锁定平台底部为防守位，允许小幅靠近或偏离MA20。',
++ 'MA20横盘再启动':'只检查最近上涨结束后的平台，至少5个完成交易日、宽度≤2 ATR、整理量比≤0.8；平台底部仍保留≥20%且≥4 ATR上涨成果。10%振幅仅作提示。底部成立后锁定，旧平台退出记录不属于当前入选。',
+  '趋势力度':'5/10/20日收益力度和连续结构的独立参考分，≥65为强。它不决定均线趋势入选，也不表示本轮启动日期。',
+  '情绪强度':'当前模型：当日进攻60%、保持20%、近5日活跃20%，≥65为强。属于短线强度参考，尚不能单独证明连板、龙头或补涨潜力。',
+  '趋势观察':'当前有合格均线阶段或推进延续证据；与情绪强度分别判断。',
+@@ -59,7 +59,7 @@
+ function msRankRows(){var v=MS_VIEW.stocks,ctx=msRankContext(),ranks=ctx.ranking||{},map={},fallback={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){map[r.code]=r;});((ctx.board||{}).members||[]).forEach(function(r){fallback[r.code]=r;});return (ranks[v.sort==='trend'?'trend':v.sort==='emotion'?'emotion':'all']||[]).map(function(c){return map[c]||Object.assign({code:c,name:c,ranking_unavailable:true},fallback[c]||{});}).filter(function(r){var item=(ranks.items||{})[r.code]||{},m=r.market_strength||{},mt=r.ma_trend||{},tags=(m.labels||m.events||[]).concat(item.style_labels||[],mt.stage_label||[]);return msMatchDirections(r)&&(!v.q||String(r.code+' '+r.name).indexOf(v.q)>=0)&&(!v.phase||tags.indexOf(v.phase)>=0)&&(v.scope==='all'||v.scope==='trend'&&item.trend&&mtSnapshotFresh(mt)||v.scope==='emotion'&&item.emotion&&msRankFresh(r,item)||v.scope==='focus'&&(item.trend&&mtSnapshotFresh(mt)||item.emotion&&msRankFresh(r,item))||v.scope==='both'&&item.trend&&mtSnapshotFresh(mt)&&item.emotion&&msRankFresh(r,item));});}
+ function msRankTools(){var ctx=msRankContext(),v=MS_VIEW.stocks,h='<div class="ms-toolbar">';if(ctx.selected.length>1)h+=msSelect('rankBoardId',ctx.selected.map(function(id){var b=boardById(id);return [id,b?b.name:id];}),'stocks','排名参照板块');return h+msSelect('scope',[['all','全部成员（默认）'],['trend','趋势观察'],['emotion','情绪强势'],['focus','任一强势'],['both','趋势与情绪同时强']],'stocks','成员范围')+msSelect('sort',[['board','板块地位优先'],['trend','趋势力度排序'],['emotion','情绪强度排序']],'stocks','个股排名方式')+msSelect('phase',[['','全部标签'],['MA5初期推进','MA5初期推进'],['MA10承接整理','MA10承接整理'],['MA20横盘再启动','MA20横盘再启动'],['趋势前排','趋势前排'],['情绪前排','情绪前排']],'stocks','个股标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="stocks" data-ms-search-field="q" oninput="msSearchInput(event,this,\'stocks\',\'q\')"><button class="btn" onclick="msRankCSV()">导出当前完整排名 CSV</button></div><p class="ms-muted">排名参照：'+esc(ctx.name)+' · 确认主板成员 '+((ctx.ranking||{}).expected||0)+' 只；趋势力度有效 '+((ctx.ranking||{}).trend_valid||0)+'、情绪有效 '+((ctx.ranking||{}).emotion_valid||0)+'。'+esc(DATA.stock_board_ranking.sorting)+' 多选时可切换排名参照板块，其他方向条件仍取交集。</p>';}
+ function msRankTable(rows,limit){var ctx=msRankContext(),ranking=ctx.ranking||{},shown=limit?rows.slice(0,limit):rows,h='<div class="tw"><table class="market-strength-table ms-research-table ms-rank-table"><thead><tr><th>板块排名</th><th class="l">个股 / 所属方向</th><th>当日涨幅</th><th>趋势力度 / 板块名次</th><th>情绪强度 / 板块名次</th><th class="l">类型 / 均线阶段 / 状态</th></tr></thead><tbody>';
+- shown.forEach(function(r){var m=r.market_strength||{},mt=r.ma_trend||{},item=(ranking.items||{})[r.code]||{},fresh=msRankFresh(r,item),labels=item.style_labels||[],tags=fresh?labels.map(function(t){return msTag(t,ctx.name+' · 源行情 '+(item.source_at||'待核验'));}).join(''):msTag('快照已过期');if(mt.pending)tags+=msTag('数据待核验','均线阶段：'+mt.reason+'；情绪强度独立判断');if(mt.stage)tags+=msTag(mt.stage_label,mt.reason)+' '+msTag(mt.status,mt.reason+(mt.exit_at?'；确认退出时间 '+mt.exit_at:''));if(item.missing||r.ranking_unavailable)tags+=msTag('数据待核验','该确认成员本轮没有完整个股数据');h+='<tr data-strength-id="'+esc(r.code)+'" data-board-rank="'+(item.rank||'')+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td><span class="ms-rank" '+msTipAttrs('板块地位',ctx.name+'完整成员第'+item.rank+'位，搜索和标签过滤不重算名次。')+'>'+(item.rank||'—')+'</span></td><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code)+'</span>'+msAffiliation(r,'stocks')+'</td><td>'+pct(r.change_pct,2)+'</td><td>'+msBadge(m,'trend')+'<span class="cd">'+(item.trend_rank==null?'待核验':'板块第 '+item.trend_rank+' / '+ranking.trend_valid)+'</span></td><td>'+msBadge(m,'emotion')+'<span class="cd">'+(item.emotion_rank==null?'待核验':'板块第 '+item.emotion_rank+' / '+ranking.emotion_valid)+'</span></td><td class="l"><div class="ms-tag-list">'+tags+'</div><span class="cd">源行情 '+esc(item.source_at||'待核验')+'</span>'+(mt.exit_at?'<span class="cd">确认退出 '+esc(mt.exit_at)+'</span>':'')+'</td></tr>';});return h+'</tbody></table></div>'+msMore(rows,shown,'stocks');}
++ shown.forEach(function(r){var m=r.market_strength||{},mt=r.ma_trend||{},item=(ranking.items||{})[r.code]||{},fresh=msRankFresh(r,item),labels=item.style_labels||[],tags=fresh?labels.map(function(t){return msTag(t,ctx.name+' · 源行情 '+(item.source_at||'待核验'));}).join(''):msTag('快照已过期');if(mt.pending)tags+=msTag('数据待核验','均线阶段：'+mt.reason+'；情绪强度独立判断');if(mt.stage)tags+=msTag(mt.stage_label,mt.reason)+' '+msTag(mt.status,mt.reason+(mt.exit_at?'；确认退出时间 '+mt.exit_at:''));if(item.missing||r.ranking_unavailable)tags+=msTag('数据待核验','该确认成员本轮没有完整个股数据');h+='<tr data-strength-id="'+esc(r.code)+'" data-board-rank="'+(item.rank||'')+'" class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td><span class="ms-rank" '+msTipAttrs('板块地位',ctx.name+'完整成员第'+item.rank+'位，搜索和标签过滤不重算名次。')+'>'+(item.rank||'—')+'</span></td><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code)+'</span>'+msAffiliation(r,'stocks')+'</td><td>'+pctHtml(r.change_pct,2)+'</td><td>'+msBadge(m,'trend')+'<span class="cd">'+(item.trend_rank==null?'待核验':'板块第 '+item.trend_rank+' / '+ranking.trend_valid)+'</span></td><td>'+msBadge(m,'emotion')+'<span class="cd">'+(item.emotion_rank==null?'待核验':'板块第 '+item.emotion_rank+' / '+ranking.emotion_valid)+'</span></td><td class="l"><div class="ms-tag-list">'+tags+'</div><span class="cd">源行情 '+esc(item.source_at||'待核验')+'</span>'+(mt.exit_at?'<span class="cd">确认退出 '+esc(mt.exit_at)+'</span>':'')+'</td></tr>';});return h+'</tbody></table></div>'+msMore(rows,shown,'stocks');}
+ function msExportRows(rows,view,name){var ctx=msRankContext(),contexts={view:view,rankBoardId:ctx.id};if(!DATA.ui_lazy){downloadMSCSV(buildStockCSV(rows,DATA,contexts),name);return Promise.resolve();}var generation=DATA.ui_generation;return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:generation,codes:rows.map(function(r){return r.code;}),contexts:contexts})}).then(function(r){if(!r.ok)throw new Error(r.status===409?'数据版本已过期，请更新后导出':'导出失败 '+r.status);return r.text();}).then(function(text){downloadMSCSV(text,name);}).catch(function(e){toast(e.message);throw e;});}
+ function msRankCSV(){return msExportRows(msRankRows(),'ranking','板块个股排名_'+DATA.ui_generation+'.csv');}
+ var MS_TOOLTIP=null,MS_TOOLTIP_TARGET=null;
+--- /dev/null
++++ after/test_latest_ma20.py
+@@ -0,0 +1,96 @@
++import copy,unittest
++from datetime import timedelta
++import ma_trend as T
++from test_ma_trend import sample,run
++from test_market_strength_integration import render
++
++
++class LatestMA20(unittest.TestCase):
++    def test_fresh_strong_wave_does_not_keep_an_earlier_wave_base(self):
++        f=sample('ma20');bars=f[3][next(iter(f[3]))]
++        bars[25].update(open=100.,close=105.,high=105.2,low=99.8,volume=250.)
++        setup=T.daily(bars,f[4])
++        self.assertEqual(setup['stage'],20)
++        self.assertEqual(setup['platform']['origin']['date'],bars[-22]['date'])
++
++    def test_recent_new_peak_cannot_borrow_an_older_flat_window(self):
++        f=sample('ma20');bars=f[3][next(iter(f[3]))];root=T.daily(bars,f[4])['origin']
++        bars[-2].update(close=123.,high=123.2)
++        self.assertIsNone(T.latest_platform(bars,len(bars)-1,root))
++
++    def test_a_new_small_rise_cannot_reuse_the_previous_big_rise(self):
++        f=sample('ma20');bars=f[3][next(iter(f[3]))];before=T.daily(bars,f[4]);self.assertEqual(before['stage'],20)
++        dates=list(f[4]);day=f[5].date()
++        for j in range(8):
++            d=(day+timedelta(days=j)).isoformat();dates.append(d)
++            bars.append(dict(bars[-1],date=d,open=122.4,close=122.5,low=122.3,high=122.7,volume=40.))
++        after=T.daily(bars,dates)
++        self.assertNotEqual(after['stage'],20)
++        self.assertFalse(after['ma20_candidate'])
++
++    def test_ma10_platform_breakout_starts_its_own_rise_measurement(self):
++        f=sample('ma10');bars=f[3][next(iter(f[3]))];self.assertEqual(T.daily(bars,f[4])['stage'],10)
++        dates=list(f[4]);day=f[5].date()
++        for j,price in enumerate([117.,121.,125.,126.]+[125.5]*16):
++            d=(day+timedelta(days=j)).isoformat();dates.append(d)
++            bars.append(dict(bars[-1],date=d,open=price-.1,close=price,low=price-.2,high=price+.05,volume=30.))
++        setup=T.daily(bars,dates)
++        self.assertNotEqual(setup['stage'],20)
++        self.assertFalse(setup['ma20_candidate'])
++
++    def test_completed_platform_can_form_after_an_earlier_ma10_exit(self):
++        f=sample('ma20');bars=f[3][next(iter(f[3]))];start=len(bars)-26
++        prices=[105.+5*j for j in range(10)]+[136.]*16
++        for j,price in enumerate(prices):
++            bars[start+j].update(open=price-.2,close=price,low=price-.4,high=price+.05,
++                volume=250. if j==0 else 100. if j<10 else 35.)
++        setup=T.daily(bars,f[4]);self.assertEqual(setup['stage'],20)
++        self.assertTrue(any(e['stage']==10 for e in setup['exits']))
++        self.assertGreater(setup['entry_date'],setup['exits'][-1]['date'])
++        self.assertTrue(setup['platform']['latest_cycle'])
++
++    def test_platform_bottom_must_retain_twenty_percent_not_just_peak(self):
++        f=sample('ma20');bars=f[3][next(iter(f[3]))];root=T.daily(bars,f[4])['origin']
++        for b in bars[-15:]:b.update(open=110.1,close=110.,low=109.8,high=110.2)
++        self.assertIsNone(T.latest_platform(bars,len(bars)-1,root,require_position=False))
++
++    def test_failed_floor_is_not_lowered_to_create_a_new_platform(self):
++        f=sample('ma20');bars=f[3][next(iter(f[3]))];before=T.daily(bars,f[4]);floor=before['platform']['low']
++        dates=list(f[4]);day=f[5].date()
++        for j in range(6):
++            d=(day+timedelta(days=j)).isoformat();dates.append(d)
++            bars.append(dict(bars[-1],date=d,open=floor-.05,close=floor-.1,low=floor-.2,high=floor))
++        setup=T.daily(bars,dates);self.assertNotEqual(setup['stage'],20)
++        self.assertEqual(setup['last_exit']['support'],floor)
++        self.assertIn('平台底部',setup['last_exit']['reason'])
++
++    def test_auction_reference_does_not_replay_yesterdays_minute_request(self):
++        f=sample('ma20');run(f);previous=copy.deepcopy(f[0]);c=next(iter(f[1]))
++        previous['stocks'][0]['ma_trend']['minute_needed']=True
++        f[0]['session']='集合竞价'
++        T.attach(f[0],{},f[2],f[3],f[4],now=f[5],previous=previous,fetch_minutes=False)
++        self.assertTrue(f[0]['stocks'][0]['ma_trend']['reference_only'])
++        self.assertEqual(f[0]['ma_trend']['minute_needed'],0)
++
++    def test_default_radar_contains_all_members_with_all_stages(self):
++        f=sample();run(f);out=render(f[0],"renderRadar();")
++        html=out['els']['ma-radar-host']['innerHTML']
++        self.assertIn('value="all" selected',html);self.assertIn('全部阶段',html)
++
++    def test_old_ma20_exit_is_not_a_current_ma20_member(self):
++        f=sample('ma20');run(f);m=f[0]['stocks'][0]['ma_trend']
++        m.update(status='已退出',eligible=False,exit_at='2026-09-01 15:00:00')
++        f[0]['ma_trend']['current']=[]
++        f[0]['ma_trend']['exited']=[m['code']]
++        out=render(f[0],"MS_VIEW.radar.phase='20';mtRender();")
++        self.assertNotIn('data-strength-id=',out['els']['ma-radar-host']['innerHTML'])
++        out=render(f[0],"MS_VIEW.radar.scope='exited';MS_VIEW.radar.phase='20';mtRender();")
++        self.assertIn('data-strength-id=',out['els']['ma-radar-host']['innerHTML'])
++        self.assertIn('历史退出 · MA20',out['els']['ma-radar-host']['innerHTML'])
++
++    def test_search_has_no_overlaid_icon_and_returns_are_colored(self):
++        f=sample();run(f);out=render(f[0],"mtRender();")
++        html=out['els']['ma-radar-host']['innerHTML']
++        self.assertNotIn('⌕',html);self.assertIn('pct-change up',html)
++
++if __name__=='__main__':unittest.main()

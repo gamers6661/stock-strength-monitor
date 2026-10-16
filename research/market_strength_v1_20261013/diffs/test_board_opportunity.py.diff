@@ -1,0 +1,482 @@
+--- before/test_board_opportunity.py
++++ after/test_board_opportunity.py
+@@ -1,422 +1,62 @@
+-"""固定业务门槛、源采样、真实历史与投影链路的验收。"""
++"""Board current contract replaces V1 sampling/advance-member/event qualification."""
+ import copy
+-import json
+-import tempfile
+ import unittest
+-from datetime import datetime, timedelta
+-from pathlib import Path
+-from unittest.mock import patch
++from datetime import timedelta
++import market_strength as M
++import board_opportunity as B
++from test_market_strength import fixture,run
+ 
+-import board_opportunity as B
+-import board_trend
+-import ui_payload
+-
+-
+-def fixture(count=6, r5=6., r0=3., market_r0=0., trend=1):
+-    day = '2026-10-12'
+-    codes = ['600%03d' % i for i in range(1, count+25)]
+-    stocks, pool, quotes = [], {}, {}
+-    for i, code in enumerate(codes):
+-        stocks.append(dict(code=code, name=code, board_type='sh_main', signal_date='2026-10-09',
+-                           ret5=r5 if i<count else 0., trend_online=trend if i<count else 0,
+-                           intraday_quote_at=day+' 10:00:00', intraday_judgment_at=day+' 10:00:00',
+-                           intraday_observation_available=True, intraday_price_basis_comparable=True,
+-                           intraday_serious_weakness=False, intraday_trade_restriction=None,
+-                           live_attack_status='盘中暂态，待收盘确认', live_attack_event='整理突破', live_attack_pattern={},
+-                           stock_strength_score=60))
+-        pool[code] = dict(name=code, board_type='sh_main')
+-        quotes[code] = dict(price=10., open=10., high=11., low=9., change_pct=r0 if i<count else market_r0,
+-                            quote_at=day+' 10:00:00', amount_wan=100., volume_shou=100.)
+-    snap = dict(session='早盘', generated_at=day+' 10:00:00', quote_capture_at=day+' 10:00:00',
+-                strength_model=dict(asof='2026-10-09'), stocks=stocks, coverage_catalog=[],
+-                board_catalog=[dict(id='industry:测试', type='industry', name='测试', member_codes=codes[:count], index_trend=None, index_current=None)],
+-                board_trend_model=dict(calendar=[]))
+-    return snap, quotes, pool
+-
+-
+-def advance(s, q, at, session='早盘'):
+-    s.update(quote_capture_at=at, generated_at=at, session=session)
+-    for quote in q.values():
+-        quote['quote_at'] = at
+-    for r in s['stocks']+s['coverage_catalog']:
+-        r.update(intraday_quote_at=at, intraday_judgment_at=at)
+-
+-
+-class OpportunityTest(unittest.TestCase):
++class BoardOpportunityTests(unittest.TestCase):
+     def setUp(self):
+-        self.tmp = tempfile.TemporaryDirectory()
+-        self.addCleanup(self.tmp.cleanup)
+-        self.folder = Path(self.tmp.name)
+-
+-    def run_model(self, s, q, pool, old=None, persist=False, loader=lambda code:[]):
+-        B.enrich(s, q, pool, old, persist=persist, history_dir=self.folder, index_loader=loader)
+-        return s['board_catalog'][0]['opportunity']
+-
+-    def test_falling_market_outperformance_is_not_mainline(self):
+-        s,q,p = fixture(r0=-1., market_r0=-4.)
+-        o = self.run_model(s,q,p)
+-        self.assertGreater(o['current']['E0'],0)
+-        self.assertFalse(o['current_opportunity'])
+-
+-    def test_high_trend_but_low_r5_not_mainline(self):
+-        s,q,p = fixture(r5=1.5)
+-        o = self.run_model(s,q,p)
+-        self.assertFalse(o['daily_mainline'])
+-
+-    def test_leaders_only_fail_trimmed_breadth(self):
+-        s,q,p = fixture(count=10)
+-        for i,r in enumerate(s['stocks'][:10]):
+-            q[r['code']]['change_pct']=15 if i<3 else -1
+-            r['ret5']=15 if i<3 else -1
+-        o = self.run_model(s,q,p)
+-        self.assertLess(o['current']['trimmed_R0'],0)
+-        self.assertFalse(o['current_opportunity'])
+-        self.assertFalse(o['daily_mainline'])
+-
+-    def test_daily_background_survives_current_failure(self):
+-        s,q,p = fixture()
+-        first = self.run_model(s,q,p,persist=True)
+-        self.assertTrue(first['qualifications']['mainline'])
+-        old=copy.deepcopy(s)
+-        advance(s,q,'2026-10-12 10:05:00')
+-        for c in s['board_catalog'][0]['member_codes']:
+-            q[c]['change_pct']=-2
+-        o=self.run_model(s,q,p,old)
+-        self.assertEqual(o['daily'],first['daily'])
+-        self.assertFalse(o['current_opportunity'])
+-        self.assertEqual(o['status'],'日线持续强势·当前未共振')
+-
+-    def test_current_missing_keeps_daily_pending_label(self):
+-        s,q,p=fixture();self.run_model(s,q,p,persist=True)
+-        old=copy.deepcopy(s);advance(s,q,'2026-10-12 10:05:00')
+-        o=self.run_model(s,{},p,old)
+-        self.assertTrue(o['daily_mainline'])
+-        self.assertEqual(o['status'],'日线持续强势·当前待核验')
+-
++        self.f=fixture(10);self.s,self.q,self.p,self.h,self.c,self.now=self.f
++        for q in self.q.values():q.update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
++    def model(self):
++        B.enrich(self.s,self.q,self.p,histories=self.h,calendar=self.c,now=self.now,persist=True)
++        B.validate(self.s);return self.s['board_catalog'][0]['market_strength']
++    def test_first_valid_batch_admitted(self):self.assertTrue(self.model()['focus'])
++    def test_projection_does_not_sample_or_rescore(self):
++        m=copy.deepcopy(self.model());self.assertEqual(m,self.model())
++    def test_official_index_missing_not_block(self):self.s['board_catalog'][0]['index_quote']={};self.assertTrue(self.model()['focus'])
+     def test_official_index_alone_cannot_qualify(self):
+-        s,q,p=fixture(r0=-1,r5=1)
+-        s['board_catalog'][0]['index_current']=dict(ready=True,strong_advance=True)
+-        o=self.run_model(s,q,p)
+-        self.assertTrue(o['index_member_divergence'])
+-        self.assertFalse(o['current_opportunity'])
+-
+-    def test_no_daily_multiline_requirement_for_startup(self):
+-        s,q,p=fixture(r5=-1,trend=0)
+-        for minute in (0,5,10):
+-            old=copy.deepcopy(s);advance(s,q,'2026-10-12 10:%02d:00'%minute)
+-            o=self.run_model(s,q,p,old)
+-        self.assertFalse(o['daily_mainline'])
+-        self.assertTrue(o['qualifications']['startup'])
+-        self.assertEqual(o['primary_label'],'新启动')
+-
+-    def test_duplicate_batch_does_not_confirm(self):
+-        s,q,p=fixture(r5=-1)
+-        for _ in range(3):
+-            old=copy.deepcopy(s);o=self.run_model(s,q,p,old)
+-        self.assertEqual(o['startup_confirmation']['count'],1)
+-        self.assertFalse(o['qualifications']['startup'])
+-
+-    def test_three_samples_short_span_pending(self):
+-        s,q,p=fixture(r5=-1)
+-        for minute in (0,2,4):
+-            old=copy.deepcopy(s);advance(s,q,'2026-10-12 10:%02d:00'%minute);o=self.run_model(s,q,p,old)
+-        self.assertEqual(o['startup_confirmation']['count'],3)
+-        self.assertFalse(o['qualifications']['startup'])
+-        self.assertTrue(o['pending'])
+-
+-    def test_failure_breaks_and_preserves_first_confirmation(self):
+-        s,q,p=fixture(r5=-1)
+-        for minute in (0,5,10):
+-            old=copy.deepcopy(s);advance(s,q,'2026-10-12 10:%02d:00'%minute);o=self.run_model(s,q,p,old)
+-        first=o['startup_confirmation']['first_confirmed_at'];old=copy.deepcopy(s)
+-        advance(s,q,'2026-10-12 10:15:00')
+-        for c in s['board_catalog'][0]['member_codes']:q[c]['change_pct']=0
+-        o=self.run_model(s,q,p,old)
+-        self.assertFalse(o['qualifications']['startup'])
+-        self.assertEqual(o['startup_confirmation']['count'],0)
+-        self.assertEqual(o['startup_confirmation']['first_confirmed_at'],first)
+-
+-    def test_lunch_retains_and_afternoon_restarts(self):
+-        s,q,p=fixture(r5=-1)
+-        for at in ('2026-10-12 11:20:00','2026-10-12 11:25:00','2026-10-12 11:30:00'):
+-            old=copy.deepcopy(s);advance(s,q,at);o=self.run_model(s,q,p,old)
+-        old=copy.deepcopy(s);advance(s,q,'2026-10-12 12:00:00','午间休市');o=self.run_model(s,q,p,old)
+-        self.assertTrue(o['qualifications']['startup']);self.assertEqual(o['startup_confirmation']['count'],3)
+-        self.assertEqual(o['retained_until'],'2026-10-12 11:30:00')
+-        self.assertEqual(s['board_opportunity_model']['market'],old['board_opportunity_model']['market'])
+-        self.assertEqual(s['board_opportunity_model']['quote_audit'],old['board_opportunity_model']['quote_audit'])
+-        B.validate(s)
+-        old=copy.deepcopy(s);advance(s,q,'2026-10-12 13:00:00','午盘');o=self.run_model(s,q,p,old)
+-        self.assertEqual(o['startup_confirmation']['count'],1);self.assertFalse(o['qualifications']['startup'])
+-
+-    def test_day_version_members_and_long_gap_reset(self):
+-        base=B.confirmation(None,True,'2026-10-12 10:00:00','2026-10-12','a','早盘',3,600)
+-        for at,day,member,old in [('2026-10-13 10:05:00','2026-10-13','a',base),
+-                                   ('2026-10-12 10:05:00','2026-10-12','b',base),
+-                                   ('2026-10-12 10:11:00','2026-10-12','a',base),
+-                                   ('2026-10-12 10:05:00','2026-10-12','a',dict(base,scope=['old','2026-10-12','a']))]:
+-            self.assertEqual(B.confirmation(old,True,at,day,member,'早盘',3,600)['count'],1)
+-
+-    def test_quote_min_time_and_market_deduplication(self):
+-        s,q,p=fixture();s['stocks'].append(copy.deepcopy(s['stocks'][0]))
+-        q[s['stocks'][0]['code']]['quote_at']='2026-10-12 09:59:00'
+-        s['stocks'][0].update(intraday_quote_at='2026-10-12 09:59:00',intraday_judgment_at='2026-10-12 09:59:00')
+-        s['stocks'][-1].update(intraday_quote_at='2026-10-12 09:59:00',intraday_judgment_at='2026-10-12 09:59:00')
+-        o=self.run_model(s,q,p)
+-        self.assertEqual(o['current']['sample_at'],'2026-10-12 09:59:00')
+-        self.assertEqual(s['board_opportunity_model']['market']['daily_count'],len(p))
+-
+-    def test_exact_coverage_boundary_without_rounding(self):
+-        market=dict(R5=0,T=0,daily_coverage_pct=100,daily_count=100,daily_ready=True)
+-        for count,expected in ((7999,False),(8000,True)):
+-            daily={str(i):dict(ret5=4,trend_online=True) for i in range(count)}
+-            d=B.daily_result(list(map(str,range(10000))),daily,market,'2026-10-09')
+-            self.assertEqual(d['ready'],expected)
+-            current={str(i):dict(change_pct=3,source_at='2026-10-12 10:00:00') for i in range(count)}
+-            q=B.current_result(list(map(str,range(10000))),current,{},dict(R0=0,quote_ready=True))
+-            self.assertEqual(q['ready'],expected)
+-        s,q,p=fixture(count=8)
+-        missing=s['board_catalog'][0]['member_codes'][-2:]
+-        s['board_catalog'][0]['member_codes']+=['600099','600098']
+-        p.update({'600099':dict(board_type='sh_main'),'600098':dict(board_type='sh_main')})
+-        o=self.run_model(s,q,p);self.assertEqual(o['current']['coverage_pct'],80);self.assertTrue(o['current']['ready'])
+-        q.pop(missing[0]);o=self.run_model(s,q,p);self.assertEqual(o['current']['coverage_pct'],70);self.assertFalse(o['current']['ready'])
+-
+-    def test_five_members_never_form_qualification(self):
+-        s,q,p=fixture(count=5);o=self.run_model(s,q,p)
+-        self.assertFalse(o['current_opportunity']);self.assertFalse(o['current']['ready'])
+-
+-    def test_missing_returns_stale_quotes_unknown_trend_not_zero(self):
+-        s,q,p=fixture();r=s['stocks'][0];r['ret5']=None;r['trend_online']=None
+-        q[r['code']]['quote_at']='2026-10-12 09:00:00'
+-        o=self.run_model(s,q,p)
+-        self.assertEqual(o['daily']['valid_count'],5);self.assertEqual(o['current']['valid_count'],5)
+-        self.assertEqual(o['expected_count'],6)
+-        s['stocks']=[];o=self.run_model(s,{},p)
+-        for key in ('R5','E5','T','median5'):self.assertIsNone(o['daily'][key])
+-        for key in ('R0','E0','A0','B0','median0'):self.assertIsNone(o['current'][key])
+-
+-    def test_unscored_quotes_affect_price_but_not_daily_or_events(self):
+-        s,q,p=fixture();r=s['stocks'].pop(0);r['coverage_only']=True;s['coverage_catalog']=[r]
+-        o=self.run_model(s,q,p)
+-        self.assertEqual(o['current']['valid_count'],6);self.assertEqual(o['daily']['valid_count'],5)
+-        self.assertNotIn(r['code'],o['current']['event_codes'])
+-
+-    def test_event_excludes_stale_unknown_basis_risk_and_restriction(self):
+-        s,q,p=fixture();s['stocks'][0]['intraday_price_basis_comparable']=None
+-        s['stocks'][1]['intraday_serious_weakness']=True
+-        s['stocks'][2]['intraday_trade_restriction']='一字涨停'
+-        s['stocks'][3]['intraday_judgment_at']='2026-10-12 09:55:00'
+-        s['stocks'][4]['live_attack_status']='历史观察，当前阶段未重新判断'
+-        s['stocks'][5]['live_attack_event']='其他事件'
+-        o=self.run_model(s,q,p);self.assertEqual(o['current']['B0'],0)
+-
+-    def test_close_and_auction_never_top_up_confirmation(self):
+-        s,q,p=fixture(r5=-1);self.run_model(s,q,p);old=copy.deepcopy(s)
+-        advance(s,q,'2026-10-12 15:00:00','尾盘');self.run_model(s,q,p,old);old=copy.deepcopy(s)
+-        advance(s,q,'2026-10-12 15:05:00','已收盘')
+-        for item in q.values():item['quote_at']='2026-10-12 15:00:00'
+-        for row in s['stocks']:row.update(intraday_quote_at='2026-10-12 15:00:00',intraday_judgment_at='2026-10-12 15:00:00')
+-        o=self.run_model(s,q,p,old);self.assertEqual(o['startup_confirmation']['count'],1)
+-        self.assertFalse(o['qualifications']['startup']);self.assertTrue(o['close_review']['startup_conditions'])
+-        advance(s,q,'2026-10-13 09:25:00','竞价结束');o=self.run_model(s,q,p,old)
+-        self.assertEqual(o['startup_confirmation']['count'],0);self.assertFalse(o['current_opportunity'])
+-
+-    def setup_background(self, r5=1):
+-        s,q,p=fixture(r5=r5)
+-        days=[];d=datetime(2026,6,1)
+-        while d.strftime('%Y-%m-%d')<='2026-10-09':
+-            if d.weekday()<5:days.append(d.strftime('%Y-%m-%d'))
+-            d+=timedelta(days=1)
+-        b=s['board_catalog'][0];s['board_trend_model']['calendar']=days
+-        base=dict(ready=True,code='881001',name='测试',asof='2026-10-09',observing=True,episode_start='2026-09-01',weak=False)
+-        b['index_trend']=base
+-        b['index_current']=dict(base,mode='current',asof='2026-10-12',close=100,ma5=99,ma10=98,
+-                                trend_online=True,weakening=False,pullback=True,pullback_start='2026-10-08')
+-        bars=[dict(date=d,open=100,close=100,high=101,low=99,volume=100,amount=10000) for d in days]
+-        record=dict(id=b['id'],asof='2026-10-07',members_hash='historical-members',member_codes=['old-real-member'],daily=dict(qualified=True))
+-        (self.folder/'2026-10-07.json').write_text(json.dumps(dict(version=B.VERSION,records=[record])),encoding='utf-8')
+-        return s,q,p,bars
+-
+-    def test_pullback_recovery_preserves_segment_without_r5_floor(self):
+-        s,q,p,bars=self.setup_background();o=self.run_model(s,q,p,loader=lambda code:bars)
+-        self.assertTrue(o['restart_raw']);self.assertFalse(o['daily_mainline'])
+-        old=copy.deepcopy(s);advance(s,q,'2026-10-12 10:05:00')
+-        s['board_catalog'][0]['index_current'].update(pullback=False,pullback_start=None,state='强势推进')
+-        o=self.run_model(s,q,p,old,loader=lambda code:bars)
+-        self.assertTrue(o['qualifications']['restart']);self.assertEqual(o['primary_label'],'回踩再启动')
+-        self.assertEqual(o['background']['evidence_members_hash'],'historical-members')
+-
+-    def test_no_background_rebound_and_post_pullback_attack_not_used(self):
+-        s,q,p,bars=self.setup_background();(self.folder/'2026-10-07.json').unlink()
+-        for r in bars:
+-            if r['date']>='2026-10-08':r.update(close=150,open=150,low=149,high=151)
+-        o=self.run_model(s,q,p,loader=lambda code:bars)
+-        self.assertFalse(o['background']['ready']);self.assertFalse(o['restart_raw'])
+-
+-    def test_index_historical_attack_distinguished_from_member_background(self):
+-        s,q,p,bars=self.setup_background();(self.folder/'2026-10-07.json').unlink()
+-        for r in bars:
+-            if r['date']=='2026-09-30':r.update(close=106,open=106,low=105,high=107)
+-        o=self.run_model(s,q,p,loader=lambda code:bars)
+-        self.assertTrue(o['background']['ready']);self.assertEqual(o['background']['source'],'指数历史进攻背景')
+-
+-    def test_new_episode_and_weakness_clear_old_background(self):
+-        s,q,p,bars=self.setup_background();self.run_model(s,q,p,loader=lambda code:bars);old=copy.deepcopy(s)
+-        advance(s,q,'2026-10-12 10:05:00');b=s['board_catalog'][0]
+-        b['index_current'].update(pullback=False,pullback_start=None,episode_start='2026-10-12')
+-        o=self.run_model(s,q,p,old,loader=lambda code:bars)
+-        self.assertFalse(o['qualifications']['restart']);self.assertIsNone(o['background']['pullback_start'])
+-        b['index_current']['weak']=True;o=self.run_model(s,q,p,old,loader=lambda code:bars)
+-        self.assertFalse(o['background']['ready']);self.assertFalse(o['qualifications']['restart'])
+-
+-    def test_multiple_qualifications_dedup_and_priority(self):
+-        s,q,p,bars=self.setup_background(r5=6)
+-        for minute in (0,5,10):
+-            old=copy.deepcopy(s);advance(s,q,'2026-10-12 10:%02d:00'%minute);o=self.run_model(s,q,p,old,loader=lambda code:bars)
+-        self.assertTrue(all(o['qualifications'][k] for k in ('mainline','startup','restart')))
+-        self.assertEqual(o['primary_label'],'回踩再启动')
+-        self.assertEqual(s['board_opportunity_model']['lists']['current'],['industry:测试'])
+-
+-    def test_frozen_input_preserves_stocks_members_and_index_fields(self):
+-        s,q,p=fixture();before=copy.deepcopy(s);self.run_model(s,q,p)
+-        self.assertEqual(before['stocks'],s['stocks'])
+-        self.assertEqual(before['coverage_catalog'],s['coverage_catalog'])
+-        for b,a in zip(before['board_catalog'],s['board_catalog']):
+-            self.assertEqual(b,{k:v for k,v in a.items() if k!='opportunity'})
+-
+-    def test_payload_summary_pack_details_and_offline_are_projection(self):
+-        s,q,p=fixture();self.run_model(s,q,p,persist=True);before=copy.deepcopy(s)
+-        files={f.name:f.read_bytes() for f in self.folder.glob('*.json')}
+-        page=self.folder/'dashboard.html';tpl='var DATA = /*__DATA__*/null;'
+-        packet,token=ui_payload.prepare(s,tpl,page)
+-        brief=ui_payload.unpack(packet)
+-        self.assertEqual(brief['board_catalog'][0]['opportunity'],s['board_catalog'][0]['opportunity'])
+-        self.assertEqual(ui_payload.detail(token,'board','industry:测试',page)['opportunity'],s['board_catalog'][0]['opportunity'])
+-        with patch.object(ui_payload,'store_root',return_value=self.folder/'cache'/'ui_payloads'):
+-            for _ in range(2):
+-                html=ui_payload.offline_html(token).decode();self.assertIn(B.VERSION,html)
+-        self.assertEqual(files,{f.name:f.read_bytes() for f in self.folder.glob('*.json')})
+-        self.assertEqual(s,before)
+-
+-    def test_market_coverage_shortfall_leaves_relative_qualification_pending(self):
+-        s,q,p=fixture()
+-        for r in s['stocks'][6:16]:q.pop(r['code'])
+-        o=self.run_model(s,q,p)
+-        self.assertFalse(s['board_opportunity_model']['market']['quote_ready'])
+-        self.assertFalse(o['current']['ready']);self.assertIsNone(o['startup_raw'])
+-        self.assertFalse(o['current_opportunity'])
+-
+-    def test_small_sample_requires_two_advance_members(self):
+-        s,q,p=fixture(count=6,r5=0,r0=1.5)
+-        q[s['stocks'][0]['code']]['change_pct']=3.
+-        o=self.run_model(s,q,p);self.assertFalse(o['startup_raw'])
+-        q[s['stocks'][1]['code']]['change_pct']=3.
+-        o=self.run_model(s,q,p);self.assertTrue(o['startup_raw'])
+-        self.assertEqual(o['current']['trimmed_count'],1)
+-
+-    def test_ten_members_trim_three_and_require_three_advancing(self):
+-        s,q,p=fixture(count=10,r5=0,r0=1.5)
+-        for r in s['stocks'][:2]:q[r['code']]['change_pct']=3
+-        o=self.run_model(s,q,p);self.assertFalse(o['startup_raw']);self.assertEqual(o['current']['trimmed_count'],3)
+-        q[s['stocks'][2]['code']]['change_pct']=3
+-        o=self.run_model(s,q,p);self.assertTrue(o['startup_raw'])
+-
+-    def test_invalid_data_interrupts_and_duplicate_after_failure_stays_zero(self):
+-        state=B.confirmation(None,True,'2026-10-12 10:00:00','2026-10-12','a','早盘',3,600)
+-        state=B.confirmation(state,False,'2026-10-12 10:05:00','2026-10-12','a','早盘',3,600)
+-        state=B.confirmation(state,True,'2026-10-12 10:05:00','2026-10-12','a','早盘',3,600)
+-        self.assertEqual(state['count'],0)
+-        state=B.confirmation(state,True,'2026-10-12 10:10:00','2026-10-12','a','早盘',3,600)
+-        self.assertEqual(state['count'],1)
+-
+-    def test_resume_same_version_but_backwards_source_never_counts(self):
+-        state=B.confirmation(None,True,'2026-10-12 10:00:00','2026-10-12','a','早盘',3,600)
+-        restored=json.loads(json.dumps(state))
+-        state=B.confirmation(restored,True,'2026-10-12 10:05:00','2026-10-12','a','早盘',3,600)
+-        self.assertEqual(state['count'],2)
+-        state=B.confirmation(state,True,'2026-10-12 10:04:00','2026-10-12','a','早盘',3,600)
+-        self.assertEqual(state['count'],0)
+-
+-    def test_quote_date_future_batch_and_invalid_ohlc_not_valid(self):
+-        for update in (dict(quote_at='2026-10-09 10:00:00'),dict(quote_at='2026-10-12 10:02:00'),
+-                       dict(quote_at='2026-10-12 09:54:59'),dict(price=15),dict(change_pct=None)):
+-            s,q,p=fixture();q[s['stocks'][0]['code']].update(update)
+-            o=self.run_model(s,q,p);self.assertEqual(o['current']['valid_count'],5)
+-            self.assertEqual(o['expected_count'],6)
+-
+-    def test_explicit_exclusions_counted_and_missing_not_dropped(self):
+-        s,q,p=fixture(count=8);q[s['stocks'][0]['code']]['name']='ST测试'
+-        q[s['stocks'][1]['code']].update(amount_wan=0,volume_shou=0)
+-        q.pop(s['stocks'][2]['code'])
+-        o=self.run_model(s,q,p);self.assertEqual(o['excluded_count'],2)
+-        self.assertEqual(o['expected_count'],6);self.assertEqual(o['current']['valid_count'],5)
+-
+-    def test_historical_pullback_trace_survives_repair_without_altering_state(self):
+-        from test_board_trend import sample
+-        bars,days=sample([100+i for i in range(28)]+[124,132,134])
+-        before=board_trend.replay(bars,days)
+-        trace=B.index_trace('test-trace',bars,days)
+-        self.assertEqual(before,board_trend.replay(bars,days))
+-        self.assertTrue(any(r['start'] for r in trace))
+-
+-    def test_online_daily_records_are_immutable_and_members_changes_append(self):
+-        s,q,p=fixture();self.run_model(s,q,p,persist=True)
+-        path=self.folder/'2026-10-09.json';before=path.read_bytes();old=copy.deepcopy(s)
+-        s['stocks'][0]['ret5']=-10
+-        self.run_model(s,q,p,old,persist=True);self.assertEqual(path.read_bytes(),before)
+-        s['board_catalog'][0]['member_codes'].append(s['stocks'][6]['code'])
+-        self.run_model(s,q,p,old,persist=True)
+-        records=json.loads(path.read_text(encoding='utf-8'))['records']
+-        self.assertEqual(len(records),2);self.assertEqual(records[0]['member_codes'],old['board_catalog'][0]['member_codes'])
+-
+-    def test_validate_current_snapshot_and_deterministic_order(self):
+-        s,q,p=fixture();self.run_model(s,q,p)
+-        self.assertEqual(B.validate(s)['boards'],1)
+-        o=s['board_catalog'][0]['opportunity'];b=copy.deepcopy(s['board_catalog'][0]);b.update(name='另一个',id='theme:另一个')
+-        b['opportunity']['current']['E0']=o['current']['E0']+.000001
+-        self.assertEqual(sorted([s['board_catalog'][0],b],key=B.sort_key)[0]['id'],b['id'])
+-
+-    def test_index_weakness_clears_background_until_new_segment(self):
+-        s,q,p,bars=self.setup_background();self.run_model(s,q,p,loader=lambda code:bars)
+-        old=copy.deepcopy(s);s['board_catalog'][0]['index_current']['weak']=True
+-        self.run_model(s,q,p,old,loader=lambda code:bars);old=copy.deepcopy(s)
+-        s['board_catalog'][0]['index_current'].update(weak=False,strong_advance=True,pullback=False,pullback_start=None)
+-        o=self.run_model(s,q,p,old,loader=lambda code:bars)
+-        self.assertFalse(o['background']['ready']);self.assertFalse(o['restart_raw'])
+-
+-    def test_invalid_index_retains_context_but_interrupts_confirmation(self):
+-        s,q,p,bars=self.setup_background();self.run_model(s,q,p,loader=lambda code:bars);old=copy.deepcopy(s)
+-        s['board_catalog'][0]['index_current']['ready']=False
+-        o=self.run_model(s,q,p,old,loader=lambda code:bars)
+-        self.assertIsNone(o['background']['ready']);self.assertEqual(o['restart_confirmation']['count'],0)
+-        self.assertEqual(o['background']['pullback_start'],'2026-10-08')
+-
+-    def test_post_close_source_is_valid_but_never_advances_confirmation(self):
+-        s,q,p=fixture(r5=-1)
+-        for at in ('2026-10-12 14:50:00','2026-10-12 14:55:00','2026-10-12 15:00:00'):
+-            old=copy.deepcopy(s);advance(s,q,at,'尾盘');self.run_model(s,q,p,old)
+-        old=copy.deepcopy(s);advance(s,q,'2026-10-12 17:15:00','已收盘')
+-        for item in q.values():item['quote_at']='2026-10-12 16:14:45'
+-        for r in s['stocks']:r.update(intraday_quote_at='2026-10-12 16:14:45',intraday_judgment_at='2026-10-12 16:14:45')
+-        o=self.run_model(s,q,p,old)
+-        self.assertTrue(o['current']['ready']);self.assertEqual(o['startup_confirmation']['count'],3)
+-        self.assertEqual(o['startup_confirmation']['last_sample_at'],'2026-10-12 15:00:00')
+-        self.assertTrue(o['qualifications']['startup'])
+-
+-    def test_lunch_member_change_cannot_add_new_opportunity_or_mix_retained_basis(self):
+-        s,q,p=fixture();b=copy.deepcopy(s['board_catalog'][0]);b.update(id='theme:同成员',name='同成员',type='theme')
+-        s['board_catalog'].append(b);self.run_model(s,q,p);old=copy.deepcopy(s)
+-        advance(s,q,'2026-10-12 12:00:00','午间休市')
+-        for v in q.values():v['change_pct']+=1
+-        s['board_catalog'][0]['member_codes'].append(s['stocks'][6]['code'])
+-        o=self.run_model(s,q,p,old)
+-        self.assertFalse(o['current_opportunity']);self.assertEqual(o['startup_confirmation']['count'],0)
+-        retained=s['board_catalog'][1]['opportunity']
+-        self.assertTrue(retained['retained'])
+-        self.assertEqual(retained['current']['market'],old['board_catalog'][1]['opportunity']['current']['market'])
+-        B.validate(s)
+-
+-
+-if __name__=='__main__':
+-    unittest.main()
++        for q in self.q.values():q.update(price=100.,open=100.,high=101.,low=99.,change_pct=0.)
++        self.s['board_catalog'][0]['index_quote']=dict(valid=True,change_pct=10.)
++        self.assertFalse(self.model()['focus'])
++    def test_axis_no_intersection_required(self):
++        for c in self.h:self.h[c]=[]
++        m=self.model();self.assertIsNone(m['trend_score']);self.assertTrue(m['emotion_strong'])
++    def test_missing_member_kept_in_expected(self):
++        del self.q[next(iter(self.q))];m=self.model();self.assertEqual(m['expected'],10);self.assertEqual(m['emotion_parts']['valid'],9)
++    def test_coverage_exact_80(self):
++        for c in list(self.q)[:2]:del self.q[c]
++        m=self.model();self.assertEqual(m['emotion_parts']['coverage_pct'],80.);self.assertIsNotNone(m['emotion_score'])
++    def test_coverage_below_80(self):
++        for c in list(self.q)[:3]:del self.q[c]
++        self.assertIsNone(self.model()['emotion_score'])
++    def test_five_members_no_conclusion(self):
++        self.s['board_catalog'][0]['member_codes']=list(self.q)[:5];m=self.model();self.assertIsNone(m['trend_score']);self.assertIsNone(m['emotion_score'])
++    def test_explicit_no_trade_excluded_missing_not_excluded(self):
++        self.q[list(self.q)[0]].update(amount_wan=0.,volume_shou=0.);del self.q[list(self.q)[1]]
++        m=self.model();self.assertEqual(m['expected'],9);self.assertEqual(m['emotion_parts']['valid'],8)
++    def test_duplicate_members_no_bonus(self):
++        self.s['board_catalog'][0]['member_codes']*=2;m=self.model();self.assertEqual(m['expected'],10);self.assertEqual(len(self.s['board_catalog'][0]['members']),10)
++    def test_member_risk_no_exclusion(self):
++        for r in self.s['stocks']:r.update(intraday_serious_weakness=True,intraday_trade_restriction='涨停')
++        self.assertTrue(self.model()['focus'])
++    def test_trim_is_ten_percent_each_side(self):
++        values={str(i):float(i) for i in range(20)};r,removed=M.trim(values);self.assertEqual(r,9.5);self.assertEqual(removed,['0','1','18','19'])
++    def test_hot_share_uses_untrimmed_members(self):
++        self.model();self.assertEqual(self.s['board_catalog'][0]['market_strength']['emotion_parts']['B'],100.)
++    def test_member_scores_identical_to_stock(self):
++        self.model();by={r['code']:r['market_strength'] for r in self.s['stocks']}
++        for r in self.s['board_catalog'][0]['members']:self.assertEqual(r['market_strength'],M.brief(by[r['code']]))
++    def test_raw_members_and_index_unchanged(self):
++        self.s['board_catalog'][0]['index_quote']=dict(valid=True,change_pct=-1.,source='THS')
++        before=copy.deepcopy((self.q,self.p,self.h,self.s['board_catalog'][0]['member_codes'],self.s['board_catalog'][0]['index_quote']))
++        m=self.model();self.assertIn('指数/主板成员分歧',m['reasons']);self.assertEqual(before,(self.q,self.p,self.h,self.s['board_catalog'][0]['member_codes'],self.s['board_catalog'][0]['index_quote']))
++    def test_next_round_both_weak_exit(self):
++        self.model()
++        for q in self.q.values():q.update(price=100.,open=100.,high=101.,low=99.,change_pct=0.)
++        run(self.f);self.assertFalse(self.s['board_catalog'][0]['market_strength']['focus'])
++    def test_stale_quotes_no_strength(self):
++        for q in self.q.values():q['quote_at']=str(self.now-timedelta(hours=1))
++        m=self.model();self.assertIsNone(m['trend_score']);self.assertIsNone(m['emotion_score'])

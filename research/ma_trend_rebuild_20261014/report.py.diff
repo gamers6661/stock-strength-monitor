@@ -1,0 +1,29 @@
+--- before/report.py
++++ after/report.py
+@@ -135,6 +135,26 @@
+     for c in candidates[:30]:
+         gap=round(c['gap_atr'],2) if c['gap_atr'] is not None else '待核验'
+         lines.append(f"| {c['name']} {c['code']} | {c.get('current_label') or c['label']} | {c.get('structure_state') or '口径待核验'} | {c['quote_at']} | {c.get('setup_state') or '待核验'} | {(c.get('history_evidence') or {}).get('count',0)} | {gap} | {'；'.join(c['risks']) or '当前未触发'} |")
++    if snap.get('ma_trend'):
++        mt=snap['ma_trend'];lookup={row['code']:row for row in visible_rows}
++        lead=['# 均线趋势三阶段观察 · '+mt['version'],'',
++              '行情截至：'+str(mt.get('source_at'))+'；当前阶段：'+str(mt.get('mode'))+'。',
++              '先核验强势起点，再按MA5推进、MA10承接、MA20横盘分别观察。底部企稳反弹即可进入再启动观察。',
++              '支撑失守15个交易分钟未修复退出，明显破位提前退出；分钟缺口显示待核验。','']
++        for n,label in ((5,'MA5初期推进'),(10,'MA10承接整理'),(20,'MA20横盘再启动')):
++            ids=mt['lists'][str(n)]
++            lead += ['## '+label+' · '+str(len(ids))+'只','',
++                     '阶段内前30项；完整名单见看板与CSV。','',
++                     '| 股票 | 当前状态 | 本阶段支撑 | 距支撑ATR | 强势起点 | 逐股报价 |',
++                     '|---|---|---:|---:|---|---|']
++            for code in ids[:30]:
++                row=lookup[code];m=row['ma_trend'];o=m.get('origin') or {}
++                lead.append(f"| {row.get('name')} {code} | {m['status']} | {m['support_price']:.4f} | {m['distance_atr']} | {o.get('date')} {o.get('kind')} | {m['quote_at']} |")
++            if not ids:lead.append('| 暂无合格观察 | — | — | — | — | — |')
++            lead.append('')
++        lead += [f"修复观察 {len(mt['repair'])} 只；已退出 {len(mt['exited'])} 只；数据待核验 {len(mt['pending'])} 只。",'',
++                 '<details><summary>旧日线研究与情绪参考口径</summary>','']
++        return '\n'.join(lead+lines+['','</details>'])+'\n'
+     return "\n".join(lines) + "\n"
+ 
+ 

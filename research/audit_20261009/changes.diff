@@ -1,0 +1,934 @@
+--- before/config.py
++++ after/config.py
+@@ -5,10 +5,82 @@
+ """
+ from pathlib import Path
+ import os
++from contextlib import contextmanager
++from functools import wraps
++import json
++import tempfile
++import threading
+ 
+ ROOT = Path(__file__).resolve().parent
+ CACHE_DIR = ROOT / "cache"
+ CACHE_DIR.mkdir(exist_ok=True)
++
++_PIPELINE_LOCK = threading.RLock()
++_PIPELINE_LOCAL = threading.local()
++
++
++class PipelineBusy(RuntimeError):
++    """另一更新任务正在写入；本轮跳过，不能排队覆盖更新后的结果。"""
++
++
++@contextmanager
++def pipeline_guard():
++    """线程及进程共同串行化扫描、分类更新与发布；嵌套入口复用同一把锁。"""
++    if getattr(_PIPELINE_LOCAL, 'active', False):
++        yield
++        return
++    if not _PIPELINE_LOCK.acquire(blocking=False):
++        raise PipelineBusy('已有更新任务正在运行，本轮保留当前结果')
++    stream = None
++    locked = False
++    try:
++        CACHE_DIR.mkdir(parents=True, exist_ok=True)
++        stream = (CACHE_DIR / 'pipeline.lock').open('a+b')
++        if stream.seek(0, os.SEEK_END) == 0:
++            stream.write(b'0'); stream.flush()
++        stream.seek(0)
++        try:
++            if os.name == 'nt':
++                import msvcrt
++                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
++            else:
++                import fcntl
++                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except OSError as exc:
++            raise PipelineBusy('另一个程序正在更新，本轮保留当前结果') from exc
++        locked = True
++        _PIPELINE_LOCAL.active = True
++        yield
++    finally:
++        _PIPELINE_LOCAL.active = False
++        if stream is not None:
++            try:
++                if locked:
++                    stream.seek(0)
++                    if os.name == 'nt':
++                        import msvcrt
++                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
++                    else:
++                        import fcntl
++                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
++            finally:
++                stream.close()
++        _PIPELINE_LOCK.release()
++
++
++def single_writer(function):
++    @wraps(function)
++    def wrapped(*args, **kwargs):
++        with pipeline_guard():
++            return function(*args, **kwargs)
++    return wrapped
++
++
++def script_json(value):
++    """JSON嵌入script时转义HTML边界，解码后原始数据完全保留。"""
++    text = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
++    return (text.replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
++            .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
+ 
+ 
+ def atomic_write_text(path, text, encoding="utf-8"):
+@@ -21,7 +93,9 @@
+     读到的要么是旧版本、要么是新版本，永远不是半截。
+     """
+     path = Path(path)
+-    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
++    fd, name = tempfile.mkstemp(prefix=f'{path.name}.tmp', dir=str(path.parent))
++    os.close(fd)
++    tmp = Path(name)
+     try:
+         tmp.write_text(text, encoding=encoding)
+         os.replace(tmp, path)
+--- before/daily.py
++++ after/daily.py
+@@ -13,15 +13,22 @@
+ import json
+ import sys
+ import time
++from datetime import datetime
+ 
+ import config
+ 
+ 
++@config.single_writer
+ def main():
+     args = sys.argv[1:]
+     full = "--full" in args
+     quiet = "--quiet" in args
+-    mode = "full" if full else "quick"
++    import serve
++    try:
++        previous = json.loads(config.SNAPSHOT_JSON.read_text(encoding='utf-8'))
++    except (OSError, ValueError):
++        previous = {}
++    mode = "full" if full else serve.pick_mode(datetime.now(), snapshot=previous)
+ 
+     t0 = time.time()
+     print(f"=== 股票强势监测 · 日更（{mode}）===", flush=True)
+@@ -42,15 +49,18 @@
+     # 2. 看板
+     try:
+         import make_dashboard
+-        make_dashboard.build()
++        page = make_dashboard.build()
++        if page is None or not page.exists():
++            raise RuntimeError('看板页面未生成')
+     except Exception as e:
+-        print(f"[WARN] 看板生成失败：{type(e).__name__}: {e}")
++        print(f"[FAIL] 看板生成失败：{type(e).__name__}: {e}")
++        return 1
+ 
+     # 3. 报告
+     try:
+         import report
+         text = report.build(snap)
+-        (config.ROOT / "snapshot_report.md").write_text(text, encoding="utf-8")
++        config.atomic_write_text(config.ROOT / "snapshot_report.md", text)
+     except Exception as e:
+         print(f"[FAIL] 报告生成失败：{type(e).__name__}: {e}")
+         return 1
+@@ -60,7 +70,6 @@
+     print(f"--- 摘要 ---")
+     print(f"数据时间: {snap.get('generated_at')}")
+     print(f"股票池: {snap.get('pool_size')} 只 | 有效样本: {snap.get('stock_count')} 只")
+-    print(f"资金口径: {snap.get('fund_source')}")
+     print(f"回踩反弹观察: {len(al)} 条")
+     print(f"耗时: {time.time()-t0:.1f}s")
+     print()
+@@ -73,4 +82,8 @@
+ 
+ 
+ if __name__ == "__main__":
+-    sys.exit(main())
++    try:
++        sys.exit(main())
++    except config.PipelineBusy as exc:
++        print(f'[SKIP] {exc}')
++        sys.exit(2)
+--- before/intraday.py
++++ after/intraday.py
+@@ -367,7 +367,12 @@
+         lines = [line for line in chunk.splitlines() if line.strip()]
+         if len(lines) >= 2 and size > 2_000_000:
+             lines = lines[1:]
+-        return json.loads(lines[-1]) if lines else None
++        for line in reversed(lines):
++            try:
++                return json.loads(line)
++            except ValueError:
++                continue
++        return None
+     except (OSError, ValueError, IndexError):
+         return None
+ 
+@@ -381,16 +386,8 @@
+         return None
+     for path in paths:
+         try:
+-            with path.open("rb") as f:
+-                f.seek(0, 2)
+-                size = f.tell()
+-                f.seek(max(0, size - 2_000_000))
+-                chunk = f.read().decode("utf-8", errors="replace")
+-            lines = [line for line in chunk.splitlines() if line.strip()]
+-            if len(lines) >= 2 and size > 2_000_000:
+-                lines = lines[1:]
+-            if lines:
+-                record = json.loads(lines[-1])
++            record = _latest_record(path.stem)
++            if record:
+                 if any(intraday_path.observed(r) for r in record.get('rows', []) if isinstance(r, list)):
+                     return record
+                 valid_record = intraday_path.load(HISTORY_DIR, path.stem).get('last_valid_record')
+--- before/intraday_path.py
++++ after/intraday_path.py
+@@ -4,6 +4,7 @@
+ import json
+ import math
+ from pathlib import Path
++import config
+ 
+ _CACHE = {}
+ 
+@@ -41,7 +42,7 @@
+     try: stat = path.stat()
+     except OSError: return {'points': {}, 'latest_rows': {}}
+     cached = _CACHE.get(key)
+-    if cached and cached['size'] == stat.st_size and cached['mtime'] == stat.st_mtime_ns:
++    if cached and cached.get('file_size', cached['size']) == stat.st_size and cached['mtime'] == stat.st_mtime_ns:
+         return cached
+     if cached and cached['size'] < stat.st_size:
+         result, offset = cached, cached['size']
+@@ -49,7 +50,11 @@
+         result, offset = {'points': {}, 'latest_rows': {}}, 0
+     with path.open('rb') as stream:
+         stream.seek(offset)
+-        for line in stream:
++        # 固定本次文件边界；半行留待下一轮补齐，不能把读取位置推进到半行中间。
++        for line in stream.read(stat.st_size-offset).splitlines(keepends=True):
++            if not line.endswith(b'\n'):
++                break
++            offset += len(line)
+             try: record = json.loads(line)
+             except ValueError: continue
+             if record.get('day') != day: continue
+@@ -59,15 +64,20 @@
+             for r in record.get('rows', []):
+                 if not isinstance(r, list) or len(r) < 13: continue
+                 p = point(r, record.get('scan_at'))
++                if record.get('rule_version') != config.INTRADAY_RULE_VERSION:
++                    p.update(score=None, attack_score=None, attack_tier=None, attack=False,
++                             state='旧规则报价参考，进攻资格不复用')
+                 if record.get('price_basis_version') != '统一盘中价格口径2':
+-                    p.update(ma10=None,ma5_boundary=None,ma20=None,atr20=None)
++                    p.update(ma10=None,ma5=None,ma5_boundary=None,ma20=None,atr20=None,
++                             score=None,attack_score=None,attack_tier=None,attack=False,
++                             state='旧价格口径报价参考，均线及进攻资格待核验')
+                 old = result['latest_rows'].get(r[0])
+                 if old and p['at'] and effective(old) and p['at'] < effective(old):
+                     p.update(valid=False, state='迟到报价，不覆盖较新判断')
+                 result['points'].setdefault(r[0], []).append(p)
+                 if p['valid'] and record.get('price_basis_version') == '统一盘中价格口径2':
+                     result['latest_rows'][r[0]] = r
+-    result.update(size=stat.st_size, mtime=stat.st_mtime_ns)
++    result.update(size=offset, file_size=stat.st_size, mtime=stat.st_mtime_ns)
+     _CACHE[key] = result
+     return result
+ 
+--- before/make_dashboard.py
++++ after/make_dashboard.py
+@@ -55,6 +55,7 @@
+     return snap
+ 
+ 
++@config.single_writer
+ def build():
+     if not config.SNAPSHOT_JSON.exists():
+         print("[ERR] 还没有数据快照，请先运行：python scoring.py full")
+@@ -62,6 +63,11 @@
+     snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+     import price_only
+     price_only.sanitize(snap)
++    import scoring
++    import attack_model
++    snap['runtime_contract'] = dict(code_close_refresh_version=scoring.CLOSE_REFRESH_VERSION,
++                                   code_fund_reference_version=price_only.VERSION,
++                                   code_attack_model_version=attack_model.LIVE_VERSION)
+     attach_klines(snap)
+     import board_trend
+     board_trend.attach(snap, fetch=False)
+@@ -69,7 +75,7 @@
+     if PLACEHOLDER not in tpl:
+         print("[ERR] 模板缺少数据占位符")
+         return None
+-    payload = json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
++    payload = config.script_json(snap)
+     html = tpl.replace(PLACEHOLDER, payload)
+     config.atomic_write_text(OUT, html)   # 原子写：避免浏览器读到半截页面
+     print(f"[OK] 看板已生成：{OUT}  ({len(html)/1024:.0f} KB)")
+@@ -77,4 +83,4 @@
+ 
+ 
+ if __name__ == "__main__":
+-    build()
++    sys.exit(0 if build() is not None else 1)
+--- before/rebuild_strength.py
++++ after/rebuild_strength.py
+@@ -11,9 +11,11 @@
+ import scoring
+ import strength
+ import attack_model
++import close_monitor
+ from replay_strength import local_data
+ 
+ 
++@config.single_writer
+ def run():
+     snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+     price_only.sanitize(snap)
+@@ -26,6 +28,8 @@
+     rows, meta = strength.build(snap["stocks"], series, strength.industry_map(profiles, members))
+     if not rows:
+         raise RuntimeError("本地重建无有效个股；未覆盖快照")
++    if meta.get('asof') != (snap.get('strength_model') or {}).get('asof'):
++        raise RuntimeError('本地日线日期已变化，不能沿用旧榜单和盘中判断；请运行正常收盘更新')
+     snap["market_emotion"] = {"state": "离线未核验", "scope": "需要全池当时报价才能重建情绪"}
+     snap["emotion_candidates"] = []
+     emotion.enrich_stocks(rows, {}, {"active_count": 0, "traded": 0})
+@@ -44,6 +48,7 @@
+     snap["daily_advice"] = strength.daily_advice(snap)
+     # 离线迁移只核验完成日线，不能保留旧版盘中进攻结论为新信号。
+     attack_model.enrich(snap, {}, {})
++    snap['close_strong_board'] = close_monitor.build_close_board(snap)
+     price_only.sanitize(snap)
+     config.atomic_write_text(config.SNAPSHOT_JSON, json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
+     strength.save_observation(snap)
+--- before/refresh_classification.py
++++ after/refresh_classification.py
+@@ -20,6 +20,7 @@
+     return path.exists() and path.stat().st_mtime >= started
+ 
+ 
++@config.single_writer
+ def main():
+     backups = {path: path.read_text(encoding="utf-8") if path.exists() else None
+                for path in FILES}
+--- before/scoring.py
++++ after/scoring.py
+@@ -33,7 +33,7 @@
+ import theme_assist
+ import radar
+ 
+-CLOSE_REFRESH_VERSION = '收盘价格优先发布2'
++CLOSE_REFRESH_VERSION = '收盘价格优先发布3'
+ 
+ 
+ class DataNotReady(RuntimeError):
+@@ -905,6 +905,7 @@
+     return snap["intraday_close_confirmation"]
+ 
+ 
++@config.single_writer
+ def run(mode="quick", rebuild_pool=False, progress=True, boundary=None):
+     t_start = time.time()
+     scan_started_at = datetime.now()
+--- before/serve.py
++++ after/serve.py
+@@ -15,12 +15,14 @@
+        python serve.py --no-loop    # 只起服务，不自动刷新
+ """
+ import json
++import html as html_module
+ import os
+ import sys
+ import threading
+ import time
+ import traceback
+ import urllib.request
++from urllib.parse import urlsplit
+ import webbrowser
+ from datetime import datetime
+ from functools import partial
+@@ -110,6 +112,7 @@
+ _SCAN_LOCK = threading.Lock()
+ 
+ 
++@config.single_writer
+ def publish_outputs():
+     """后台每次完成扫描后同步发布看板和文字日报。"""
+     snapshot = None
+@@ -220,21 +223,33 @@
+     return (9 * 60 + 15 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60 + 5)
+ 
+ 
+-def close_review_done(now):
++def close_review_done(now, snapshot=None):
+     day = now.date().isoformat()
+-    return (SNAPSHOT_META.get('snapshot_daily_asof') == day
+-            and SNAPSHOT_META.get('snapshot_close_board_asof') == day
+-            and str(SNAPSHOT_META.get('snapshot_close_daily_verified_at') or '').startswith(day)
+-            and SNAPSHOT_META.get('snapshot_close_refresh_version') == scoring.CLOSE_REFRESH_VERSION)
+-
+-
+-def pick_mode(now=None):
++    meta = SNAPSHOT_META if snapshot is None else dict(
++        snapshot_daily_asof=(snapshot.get('strength_model') or {}).get('asof'),
++        snapshot_close_board_asof=(snapshot.get('close_strong_board') or {}).get('asof'),
++        snapshot_close_daily_verified_at=snapshot.get('close_daily_verified_at'),
++        snapshot_close_refresh_version=snapshot.get('close_refresh_version'))
++    return (meta.get('snapshot_daily_asof') == day
++            and meta.get('snapshot_close_board_asof') == day
++            and str(meta.get('snapshot_close_daily_verified_at') or '').startswith(day)
++            and meta.get('snapshot_close_refresh_version') == scoring.CLOSE_REFRESH_VERSION)
++
++
++def pick_mode(now=None, snapshot=None):
+     """收盘正式榜未完成时更新一次；完成后不重复拉全量历史。"""
+     now = now or datetime.now()
+     hm = now.hour * 60 + now.minute
+-    if now.weekday() < 5 and 15 * 60 + 5 <= hm < 16 * 60 and not close_review_done(now):
++    if now.weekday() < 5 and hm >= 15 * 60 + 5 and not close_review_done(now, snapshot):
+         return "close"
+     return "quick"
++
++
++@config.single_writer
++def scan_and_publish(mode, **kwargs):
++    """扫描至页面/日报发布始终持有跨进程锁，避免读到其他轮次的快照。"""
++    scoring.run(mode=mode, **kwargs)
++    publish_outputs()
+ 
+ 
+ def boundary_capture_done(now, boundary):
+@@ -300,8 +315,7 @@
+                                  "midday": "11:30 午间", "afternoon_open": "13:00 午后开盘",
+                                  "close": "15:00 收盘", "close_review": "15:05 正式收盘复盘"}[boundary]
+                         print(f"[BOUNDARY] {datetime.now():%H:%M:%S} 获取 {label}价格 ...")
+-                        scoring.run(mode=mode, boundary='close' if boundary == 'close_review' else boundary)
+-                        publish_outputs()
++                        scan_and_publish(mode, boundary='close' if boundary == 'close_review' else boundary)
+                         INIT["phase"] = "ready"
+                         INIT["needs_model_refresh"] = False
+                         INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+@@ -341,7 +355,7 @@
+             mode = pick_mode()
+             if not always and (now.hour, now.minute) in ((9, 15), (9, 20), (9, 25), (9, 30), (11, 30), (13, 0), (15, 0)):
+                 continue  # 收市节点交给定点任务，避免与常规刷新重叠
+-            if not trading and not always and mode == "quick":
++            if not trading and not always and (mode == "quick" or now.hour >= 16):
+                 print(f"[LOOP] {datetime.now():%H:%M:%S} 非交易时段，跳过")
+                 continue
+ 
+@@ -355,8 +369,7 @@
+                         scan_mode=mode)
+             try:
+                 print(f"[LOOP] {datetime.now():%H:%M:%S} 开始 {mode} 扫描 ...")
+-                scoring.run(mode=mode)
+-                publish_outputs()
++                scan_and_publish(mode)
+                 INIT["phase"] = "ready"
+                 INIT["needs_model_refresh"] = False
+                 INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
+@@ -392,7 +405,8 @@
+     """后台初始化：先监听再扫描，等待期由等待页兜住浏览器请求"""
+     t0 = time.time()
+     try:
+-        with _SCAN_LOCK:
++        with _SCAN_LOCK, config.pipeline_guard():
++            snapshot = {}
+             try:
+                 snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+                 close_confirmation = snapshot.get("intraday_close_confirmation")
+@@ -424,9 +438,12 @@
+             except (OSError, ValueError):
+                 matches = False
+             INIT["needs_model_refresh"] = not matches
+-            if not matches:
++            now = datetime.now()
++            close_pending = (now.weekday() < 5 and now.hour*60+now.minute >= 15*60+5
++                             and not close_review_done(now, snapshot if matches else {}))
++            if not matches or close_pending:
+                 print("[INIT] 本地快照与已加载模型不一致，先完成一次新版扫描 ...")
+-                scoring.run(mode="quick" if config.SNAPSHOT_JSON.exists() else "full")
++                scoring.run(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")
+             publish_outputs()
+             INIT["needs_model_refresh"] = False
+         INIT["phase"] = "ready"
+@@ -453,8 +470,7 @@
+         close_missing = (now.weekday() < 5 and now.hour >= 15
+                          and not boundary_capture_done(now, 'close')
+                          and boundary_trading_evidence(now))
+-        scoring.run(mode=mode, **({'boundary': 'close'} if close_missing else {}))
+-        publish_outputs()
++        scan_and_publish(mode, **({'boundary': 'close'} if close_missing else {}))
+         INIT["phase"] = "ready"
+         INIT["needs_model_refresh"] = False
+         REFRESH["ok"] = True
+@@ -549,6 +565,22 @@
+ 
+ 
+ class Handler(SimpleHTTPRequestHandler):
++    def _local_request_allowed(self, mutation=False):
++        try:
++            host = urlsplit('//' + self.headers.get('Host', ''))
++            port = self.server.server_port
++            if host.hostname not in ('127.0.0.1', 'localhost') or host.port != port or host.username:
++                return False
++            origin = self.headers.get('Origin')
++            if mutation and origin:
++                source = urlsplit(origin)
++                if (source.scheme != 'http' or source.hostname not in ('127.0.0.1', 'localhost')
++                        or source.port != port or source.username):
++                    return False
++            return not mutation or self.headers.get('Sec-Fetch-Site') != 'cross-site'
++        except ValueError:
++            return False
++
+     def end_headers(self):
+         self.send_header("Cache-Control", "no-store, must-revalidate")
+         super().end_headers()
+@@ -569,6 +601,9 @@
+         self.wfile.write(body)
+ 
+     def do_GET(self):
++        if not self._local_request_allowed():
++            self.send_error(403, 'Local requests only')
++            return
+         path = self.path.split("?")[0]
+         if path == "/__ping":
+             self._send_body(b"pong", "text/plain; charset=utf-8")
+@@ -595,6 +630,9 @@
+         super().do_GET()
+ 
+     def do_POST(self):
++        if not self._local_request_allowed(mutation=True):
++            self.send_error(403, 'Local requests only')
++            return
+         # 看板「刷新数据」按钮：主动触发一次扫描并重建看板。
+         # 用 POST 而不是 GET：它有副作用（会去抓数据源），不能被浏览器预取/缓存命中
+         if self.path.split("?")[0] == "/__refresh":
+@@ -616,7 +654,7 @@
+ .dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#0071e3;
+ margin-right:8px;vertical-align:middle}}</style></head>
+ <body><div class="box"><h1><span class="dot"></span>系统初始化中 …</h1>
+-<p>{err}</p><p style="color:#86868b">本页每 5 秒自动刷新，请勿关闭</p>
++<p>{html_module.escape(err)}</p><p style="color:#86868b">本页每 5 秒自动刷新，请勿关闭</p>
+ </div></body></html>""".encode("utf-8")
+         self._send_body(html, "text/html; charset=utf-8")
+ 
+--- before/smoke_test.py
++++ after/smoke_test.py
+@@ -1,4 +1,4 @@
+-"""在真实无头Chrome中核对默认入口、候选筛选与跨视图一致性。"""
++"""在真实无头Chrome中核对现行全部样本入口、报价时效、导出与后台版本一致性。"""
+ import json
+ import re
+ import subprocess
+@@ -7,160 +7,85 @@
+ 
+ import config
+ import intraday
++import price_only
+ 
+ ROOT = Path(__file__).resolve().parent
+ CHROME = Path(r'C:\Program Files\Google\Chrome\Application\chrome.exe')
+-PROBE = r'''
++PROBE = r"""
+ <script>
+-window.onerror=function(msg,src,line){var e=document.getElementById('__err')||document.createElement('pre');e.id='__err';e.textContent=String(msg)+' @'+line;document.body.appendChild(e);};
++window.onerror=function(msg){window.__smokeError=String(msg);};
+ setTimeout(async function(){
+  var checks={};function check(k,v){checks[k]=!!v;}
++ async function capture(fn){var result=null,oldURL=URL.createObjectURL,oldClick=HTMLAnchorElement.prototype.click;
++  try{URL.createObjectURL=function(b){result=b;return 'blob:audit';};HTMLAnchorElement.prototype.click=function(){};fn();}
++  finally{URL.createObjectURL=oldURL;HTMLAnchorElement.prototype.click=oldClick;}
++  return result?await result.text():'';}
++ function codes(csv){return csv.trim().split(/\r?\n/).slice(1).map(function(line){var m=line.match(/^"([^"]*)"/);return m?m[1]:'';});}
++ function width(line){var q=false,n=1;for(var i=0;i<line.length;i++){if(line[i]==='"'){if(q&&line[i+1]==='"'){i++;continue;}q=!q;}else if(line[i]===','&&!q)n++;}return n;}
+  try{
+-  check('model_version_v3',DATA.intraday_model.version==='盘中观察初版3'
+-    &&DATA.intraday_model.rule_version==='盘中规则2026-09-28.3');
+-  check('close_confirmation_matches_active_rule',!DATA.intraday_close_confirmation
+-    ||DATA.intraday_close_confirmation.model_version===DATA.intraday_model.version
+-      &&DATA.intraday_close_confirmation.rule_version===DATA.intraday_model.rule_version);
+-  check('default_filter_is_clear',STATE.filters.states.length===0
+-    &&STATE.filters.industries.length===0&&STATE.filters.themes.length===0
+-    &&STATE.filters.boards.length===0&&activeFilterCount()===0);
+-  check('three_dimension_scores_are_complete',DATA.stocks.every(function(s){
+-    return s.intraday_score==null||s.intraday_score_available_components===3;}));
+-  check('current_strong_uses_all_qualification_gates',DATA.stocks.concat(DATA.coverage_catalog||[]).every(function(s){
+-    return s.current_strong_candidate!==true||Object.keys(s.current_strong_qualification||{}).length===10
+-      &&Object.keys(s.current_strong_qualification||{}).every(function(k){return s.current_strong_qualification[k]===true;});}));
+-  check('five_stock_views',document.querySelectorAll('#intraday-views button').length===5
+-    &&STOCK_VIEW==='strong');
+-  check('after_close_opens_factor_board',WORK_MODE==='close'
+-    &&document.getElementById('ov-work-close').classList.contains('on')
+-    &&document.getElementById('work-close-table').innerText.indexOf(DATA.close_strong_board.stocks[0].code)>=0);
+-  check('close_board_uses_existing_factor_membership_and_order',
+-    JSON.stringify(DATA.close_strong_board.stocks.map(function(s){return s.code;}))===
+-    JSON.stringify(DATA.stocks.filter(function(s){return s.persistent_strong===true;})
+-      .sort(function(a,b){return b.stock_strength_score-a.stock_strength_score||a.code.localeCompare(b.code);})
+-      .map(function(s){return s.code;})));
+-  var closeBlob=null,closeOldURL=URL.createObjectURL,closeOldClick=HTMLAnchorElement.prototype.click;
+-  URL.createObjectURL=function(blob){closeBlob=blob;return 'blob:close-smoke';};
+-  HTMLAnchorElement.prototype.click=function(){};exportCloseBoard();
+-  URL.createObjectURL=closeOldURL;HTMLAnchorElement.prototype.click=closeOldClick;
+-  var closeCSV=closeBlob?await closeBlob.text():'';
+-  check('close_export_matches_main_board',JSON.stringify(closeCSV.trim().split(/\r?\n/).slice(1)
+-    .map(function(line){var m=line.match(/^"([^"]*)"/);return m?m[1]:'';}))===
+-    JSON.stringify(DATA.close_strong_board.stocks.map(function(s){return s.code;})));
++  check('active_model_and_rule',DATA.intraday_model.version===__ACTIVE_MODEL__&&DATA.intraday_model.rule_version===__ACTIVE_RULE__);
++  check('fresh_scores_have_all_components',DATA.stocks.every(function(s){return s.intraday_score==null||s.intraday_score_stale||s.intraday_score_available_components===3;}));
++  check('all_entry_has_no_hidden_filter',STOCK_VIEW==='all'&&activeFilterCount()===0);
++  check('close_mode_button_and_content_agree',WORK_MODE==='close'&&document.getElementById('ov-work-close').classList.contains('on')
++   &&document.querySelector('#work-switch button.on').dataset.work==='close');
++  var members=DATA.close_strong_board.stocks.map(function(s){return s.code;});
++  check('close_membership_and_order',JSON.stringify(members)===JSON.stringify(DATA.stocks.filter(function(s){return s.persistent_strong===true;})
++   .sort(function(a,b){return b.stock_strength_score-a.stock_strength_score||a.code.localeCompare(b.code);}).map(function(s){return s.code;})));
++  check('close_export_matches_board',JSON.stringify(codes(await capture(exportCloseBoard)))===JSON.stringify(members));
+   document.querySelector('#work-switch button[data-work="live"]').click();
+-  check('manual_live_view_opens',WORK_MODE==='live'&&document.getElementById('ov-work-live').classList.contains('on'));
++  check('manual_live_switch_consistent',WORK_MODE==='live'&&document.getElementById('ov-work-live').classList.contains('on')&&document.querySelector('#work-switch button.on').dataset.work==='live');
+   document.querySelector('#work-switch button[data-work="close"]').click();
+-  check('manual_close_view_opens',WORK_MODE==='close'&&document.getElementById('ov-work-close').classList.contains('on'));
+-  DATA.coverage_catalog=DATA.coverage_catalog||[];
+-  DATA.intraday_model.max_quote_age_seconds=600;
+-  DATA.intraday_model.max_quote_future_seconds=90;
+-  var smokeNow=new Date();smokeNow.setHours(13,5,0,0);var simulatedSession='午盘';
+-  var pad=function(v){return String(v).padStart(2,'0');};
+-  var quoteStamp=smokeNow.getFullYear()+'-'+pad(smokeNow.getMonth()+1)+'-'+pad(smokeNow.getDate())
+-    +' '+pad(smokeNow.getHours())+':'+pad(smokeNow.getMinutes())+':00';
+-  Date.now=function(){return smokeNow.getTime();};
+-  sessionNow=function(){return simulatedSession;};
+-  var oldLatest=DATA.intraday_model.latest_valid_quote_at;
+-  DATA.intraday_model.latest_valid_quote_at=quoteStamp;
+-  check('valid_same_day_quote_opens_live_during_session',autoWorkMode()==='live');
+-  DATA.intraday_model.latest_valid_quote_at='2026-09-25 15:00:00';
+-  check('nontrading_or_stale_day_keeps_close_board',autoWorkMode()==='close');
+-  DATA.intraday_model.latest_valid_quote_at=oldLatest;
+-  DATA.coverage_catalog.push({code:'TEST001',name:'入口验收启动样本',coverage_only:true,traded:1,
+-    boards:['验收题材'],industry:['验收行业'],primary_industry:'验收行业',board_name:'沪主板',
+-    startup_candidate:true,current_strong_candidate:false,watch_candidate:false,trend_online:0,
+-    intraday_quote_fresh:true,intraday_quote_at:quoteStamp,intraday_score:86,intraday_score_available_components:3,
+-    intraday_trend_ok:true,intraday_observation_state:'初步转强，待收盘确认',change_pct:1,
+-    stock_strength_score:80,stock_strength_percentile:82,ret5:1,turnover:1,volume_ratio_closed:1,
+-    float_mcap:100,position60:50,live_dist_atr:0,fund_today_yi:null});
+-  DATA.coverage_catalog.push({code:'TEST002',name:'待评分异常验收样本',coverage_only:true,traded:0,
+-    boards:[],industry:[],primary_industry:'',board_name:'未知',startup_candidate:false,
+-    current_strong_candidate:false,watch_candidate:false,trend_online:null,
+-    intraday_quote_fresh:false,intraday_score:null,intraday_score_available_components:0,
+-    intraday_quote_status:'现价超出日内高低区间',change_pct:500,stock_strength_score:null,
+-    ret5:999,turnover:150,volume_ratio_closed:300,float_mcap:200000,position60:150,
+-    live_dist_atr:null,fund_today_yi:null});
+-  goPane('stocks');
+-  check('initial_entry_has_no_hidden_filter',STOCK_VIEW==='strong'&&activeFilterCount()===0
+-    &&STATE.filters.states.length===0);
+-  setStockView('startup');
+-  var startupRows=stockViewRows('startup',true);
+-  check('startup_visible_without_clearing',startupRows.some(function(s){return s.code==='TEST001';})
+-    &&document.getElementById('tb-stocks').innerText.indexOf('TEST001')>=0
+-    &&document.getElementById('stk-res').innerText.indexOf('另有')<0);
+-  check('fresh_intraday_candidate_uses_quote_time',currentCandidateActive(
+-    DATA.coverage_catalog[0],'startup_candidate')&&quoteFreshAtClientNow(DATA.coverage_catalog[0]));
+-  smokeNow=new Date(smokeNow.getTime()+3600000);simulatedSession='已收盘';
+-  check('expired_quote_leaves_current_entry_but_stays_in_all_samples',
+-    !currentCandidateActive(DATA.coverage_catalog[0],'startup_candidate')
+-    &&!stockViewRows('startup',true).some(function(s){return s.code==='TEST001';})
+-    &&stockViewRows('all',true).some(function(s){return s.code==='TEST001';}));
+-  smokeNow=new Date(smokeNow.getTime()-3600000);simulatedSession='午盘';
+-  STATE.filters.industries=['验收行业'];setStockView('startup');
+-  check('entry_switch_keeps_user_filters',STATE.filters.industries[0]==='验收行业'
+-    &&activeFilterCount()===1&&document.getElementById('stk-res').innerText.indexOf('另有 1 项筛选')>=0);
+-  onlyCurrentStockView();
+-  check('only_this_entry_clears_filters',STOCK_VIEW==='startup'&&activeFilterCount()===0
+-    &&stockViewRows('startup',true).some(function(s){return s.code==='TEST001';}));
+-  var startupExpected=stockViewRows('startup',true).map(function(s){return s.code;});
+-  var startupExportBlob=null,startupOldURL=URL.createObjectURL,startupOldClick=HTMLAnchorElement.prototype.click;
+-  URL.createObjectURL=function(blob){startupExportBlob=blob;return 'blob:startup-smoke';};
+-  HTMLAnchorElement.prototype.click=function(){};exportCSV();
+-  URL.createObjectURL=startupOldURL;HTMLAnchorElement.prototype.click=startupOldClick;
+-  var startupCSV=startupExportBlob?await startupExportBlob.text():'';
+-  var startupCodes=startupCSV.trim().split(/\r?\n/).slice(1).map(function(line){
+-    var m=line.match(/^"([^"]*)"/);return m?m[1]:'';});
+-  check('startup_export_uses_same_candidate_and_order',JSON.stringify(startupCodes)===JSON.stringify(startupExpected));
+-  renderOverview();
+-  var overviewRows=[].slice.call(document.querySelectorAll('#ov-stocks tbody tr'));
+-  check('overview_uses_same_startup_order',document.getElementById('ov-stock-title').innerText==='初步启动'
+-    &&overviewRows.length===Math.min(10,startupExpected.length)
+-    &&overviewRows.every(function(tr,i){return tr.innerText.indexOf(startupExpected[i])>=0;}));
+-  var outside=stockPoolRows().filter(function(s){return s.code==='TEST002';})[0];
+-  STATE.q='TEST002';renderStocks();
+-  check('search_outside_is_separate_and_not_counted',document.getElementById('search-outside').innerText.indexOf('TEST002')>=0
+-    &&document.getElementById('search-outside').innerText.indexOf('不计入')>=0
+-    &&document.getElementById('stk-res').innerText.indexOf('命中 0 只')>=0);
+-  STATE.q='';var allRows=stockViewRows('all',true);
+-  var anomalyIndex=allRows.findIndex(function(s){return s.code==='TEST002';});
+-  var lastScoredIndex=-1;allRows.forEach(function(s,i){
+-    if(s.stock_strength_score!=null||(s.intraday_score!=null&&!s.intraday_score_stale))lastScoredIndex=i;});
+-  check('all_samples_keeps_unscored_anomalies',anomalyIndex>=0
+-    &&allRows.length===stockPoolRows().length
+-    &&allRows[anomalyIndex].intraday_quote_status.indexOf('现价超出日内高低区间')>=0);
+-  check('all_samples_places_unscored_after_scored',anomalyIndex>lastScoredIndex);
+-  setStockView('all');renderOverview();
+-  var expected=stockViewRows('all',true).map(function(s){return s.code;});
+-  var exported=null,oldURL=URL.createObjectURL,oldClick=HTMLAnchorElement.prototype.click;
+-  URL.createObjectURL=function(blob){exported=blob;return 'blob:smoke';};
+-  HTMLAnchorElement.prototype.click=function(){};exportCSV();
+-  URL.createObjectURL=oldURL;HTMLAnchorElement.prototype.click=oldClick;
+-  var csv=exported?await exported.text():'';
+-  var csvLines=csv.trim().split(/\r?\n/);
+-  function csvWidth(line){var quoted=false,count=1;for(var i=0;i<line.length;i++){
+-    if(line[i]==='"'){if(quoted&&line[i+1]==='"'){i++;continue;}quoted=!quoted;}
+-    else if(line[i]===','&&!quoted)count++;}return count;}
+-  var csvCodes=csvLines.slice(1).map(function(line){var m=line.match(/^"([^"]*)"/);return m?m[1]:'';});
+-  check('export_uses_same_all_sample_order',JSON.stringify(csvCodes)===JSON.stringify(expected));
+-  check('export_columns_are_rectangular',csvLines.every(function(line){return csvWidth(line)===csvWidth(csvLines[0]);}));
+-  var sample=DATA.stocks[0];
+-  if(sample){showStock(sample.code);var detail=document.getElementById('dr-b').innerText;
+-    check('detail_shows_ma_and_quote_basis',detail.indexOf('日线MA10固定')>=0
+-      &&detail.indexOf('盘中MA10暂态')>=0&&detail.indexOf('历史价格口径')>=0);
+-    closeDrawer();}
+-  renderFresh();
+-  check('static_file_warning',document.getElementById('fresh-txt').innerText.indexOf('静态快照')>=0);
+-  check('no_page_error',!document.getElementById('__err'));
++  check('manual_close_switch_consistent',WORK_MODE==='close'&&document.getElementById('ov-work-close').classList.contains('on')&&document.querySelector('#work-switch button.on').dataset.work==='close');
++  var sample={code:'TEST001',name:'中文搜索验收',coverage_only:true,traded:1,boards:['验收题材'],industry:['验收行业'],primary_industry:'验收行业',board_name:'沪主板',stock_strength_score:null,
++   startup_candidate:true,current_strong_candidate:false,intraday_quote_fresh:true,intraday_score:86,intraday_score_stale:false,intraday_score_available_components:3,change_pct:1};
++  DATA.coverage_catalog.push(sample);
++  goPane('stocks');STATE.q='中文搜索验收';renderStocks();
++  check('chinese_search_returns_exact_sample',stockViewRows('all',true).length===1&&document.getElementById('tb-stocks').innerText.indexOf('TEST001')>=0);
++  STATE.q='';STATE.filters.industries=['验收行业'];renderStocks();
++  check('industry_filter_is_effective',stockViewRows('all',true).length===1&&stockViewRows('all',true)[0].code==='TEST001');
++  clearStockFilters();
++  check('clear_filters_restores_all_rows',activeFilterCount()===0&&stockViewRows('all',true).length===stockPoolRows().length);
++  var now=new Date();now.setHours(13,5,0,0);var originalNow=Date.now,originalSession=sessionNow;
++  var stamp=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0')+' 13:05:00';
++  Date.now=function(){return now.getTime();};sessionNow=function(){return '午盘';};
++  DATA.intraday_model.max_quote_age_seconds=600;DATA.intraday_model.max_quote_future_seconds=90;
++  sample.intraday_quote_at=stamp;
++  check('fresh_candidate_uses_source_time',currentCandidateActive(sample,'startup_candidate'));
++  now=new Date(now.getTime()+3600000);
++  check('expired_candidate_is_not_current_but_row_is_retained',!currentCandidateActive(sample,'startup_candidate')&&stockViewRows('all',true).some(function(s){return s.code==='TEST001';}));
++  DATA.intraday_model.latest_valid_quote_at='2000-01-01 10:00:00';
++  check('intraday_clock_stays_live_while_quotes_wait',autoWorkMode()==='live');
++  Date.now=originalNow;sessionNow=originalSession;
++  var expected=stockViewRows('all',true).map(function(s){return s.code;});var csv=await capture(exportCSV),lines=csv.trim().split(/\r?\n/);
++  check('export_matches_filtered_rows_and_order',JSON.stringify(codes(csv))===JSON.stringify(expected));
++  check('export_columns_are_rectangular',lines.length>1&&lines.every(function(line){return width(line)===width(lines[0]);}));
++  check('export_has_no_fund_columns',!(/主力净额|资金流|超大单/.test(lines[0])));
++  var production=DATA.stocks[0];showStock(production.code);
++  document.querySelectorAll('#dr-b details').forEach(function(el){el.open=true;});
++  var detail=document.getElementById('dr-b').innerText;
++  check('detail_keeps_price_basis_and_affiliation',/历史价格口径/.test(detail)&&/归属与数据来源/.test(detail));
++  check('detail_has_no_fund_reference',!(/历史资金|主力净额|超大单净额/.test(detail)));closeDrawer();
++  DATA.runtime_contract=__CONTRACT__;
++  renderUpdateState({snapshot_generated_at:DATA.generated_at});
++  check('legacy_backend_is_visible_and_refresh_disabled',document.getElementById('update-state').textContent==='后台待重启'&&document.getElementById('btn-refresh').disabled);
++  var good=Object.assign({snapshot_generated_at:DATA.scan_completed_at||DATA.generated_at,last_scan_ok:true,last_publish_ok:true},DATA.runtime_contract);
++  renderUpdateState(good);
++  check('matching_backend_is_synchronized',document.getElementById('update-state').textContent==='已同步'&&!document.getElementById('btn-refresh').disabled);
++  good.snapshot_generated_at='2000-01-01 00:00:00';renderUpdateState(good);
++  check('older_backend_snapshot_is_not_marked_synchronized',document.getElementById('update-state').textContent==='版本待核验');
++  renderFresh();check('static_file_warning',document.getElementById('fresh-txt').innerText.indexOf('静态快照')>=0);
++  check('no_page_error',!window.__smokeError);
+  }catch(e){checks.exception=String(e.stack||e);}
+  document.title='SMOKE_JSON:'+JSON.stringify(checks);
+ },500);
+ </script>
+-'''
++"""
+ 
+ 
+ def run():
+     template = (ROOT / 'dashboard_template.html').read_text(encoding='utf-8')
+     snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding='utf-8'))
++    price_only.sanitize(snapshot)
+     # Keep the real template and representative production rows, while trimming
+     # large board/member arrays that do not participate in these UI assertions.
+     snapshot['stocks'] = (snapshot.get('stocks') or [])[:2]
+@@ -180,13 +105,17 @@
+     snapshot['close_strong_board']['count'] = len(snapshot['close_strong_board']['stocks'])
+     snapshot['prior_close_monitor'] = {'rows': [], 'reason': '测试无昨日留档'}
+     snapshot['intraday_new_strength'] = {'rows': []}
+-    payload = json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'))
++    payload = config.script_json(snapshot)
+     html = template.replace('/*__DATA__*/null', payload)
+     if '/*__DATA__*/null' in html:
+         raise RuntimeError('dashboard data placeholder was not replaced')
+     with tempfile.TemporaryDirectory(prefix='strength-smoke-') as tmp:
+         page = Path(tmp) / 'smoke.html'
+-        page.write_text(html.replace('</body>', PROBE + '</body>'), encoding='utf-8')
++        probe=PROBE.replace('__ACTIVE_MODEL__',json.dumps(intraday.VERSION,ensure_ascii=False))
++        probe=probe.replace('__ACTIVE_RULE__',json.dumps(config.INTRADAY_RULE_VERSION,ensure_ascii=False))
++        import scoring, attack_model
++        probe=probe.replace('__CONTRACT__',config.script_json(dict(code_close_refresh_version=scoring.CLOSE_REFRESH_VERSION,code_fund_reference_version=price_only.VERSION,code_attack_model_version=attack_model.LIVE_VERSION)))
++        page.write_text(html.replace('</body>', probe + '</body>'), encoding='utf-8')
+         result = subprocess.run([str(CHROME), '--headless=new', '--disable-gpu', '--no-first-run',
+                                  '--user-data-dir=' + str(Path(tmp) / 'chrome'), '--virtual-time-budget=6000',
+                                  '--dump-dom', page.as_uri()], capture_output=True, timeout=60)
+--- before/weekly_members.py
++++ after/weekly_members.py
+@@ -36,6 +36,7 @@
+     return now.weekday() >= 5 or now.hour*60+now.minute >= 15*60+15
+ 
+ 
++@config.single_writer
+ def run_if_due(scan_lock, now=None, updater=None):
+     now = now or datetime.now()
+     if not outside_market(now) or not status(now.timestamp())['due']:
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -1726,13 +1726,13 @@
+    所以服务端 60 秒内只接受一次请求，前端把剩余秒数如实告诉用户。 */
+  var RF={busy:false,t0:0,poll:null,hard:null,warned:false,
+           followBackground:false,versionChanged:false};
+- var PAGE_VERSION=null;
++ var PAGE_VERSION=null,SERVER_VERSION_MISMATCH=false;
+ function rfLabel(txt,busy){
+   var b=document.getElementById('btn-refresh'); if(!b)return;
+   var t=document.getElementById('rf-txt');
+   if(t)t.textContent=txt;
+   b.classList[busy?'add':'remove']('busy');
+-  b.disabled=!!busy;
++  b.disabled=!!busy||SERVER_VERSION_MISMATCH;
+ }
+  function rfDone(){
+    RF.busy=false; RF.followBackground=false; RF.versionChanged=false;
+@@ -1805,6 +1805,7 @@
+   },1200000);
+ }
+ function refreshData(){
++  if(SERVER_VERSION_MISMATCH){toast('后台版本待更新，请停止服务后重新打开看板');return;}
+   if(RF.busy){ toast('正在刷新中，请等它跑完'); return; }
+   if(location.protocol!=='http:'&&location.protocol!=='https:'){
+     toast('当前是双击 html 本地打开，没有服务端可抓数据 —— 用「打开看板.bat」启动服务后再点这里');
+@@ -1836,13 +1837,29 @@
+     只读 /__status 的文件版本，不重复抓行情。 */
+  function renderUpdateState(s){
+    var el=document.getElementById('update-state');if(!el)return;
++   var expected=DATA.runtime_contract||{
++     code_close_refresh_version:DATA.close_refresh_version,
++     code_fund_reference_version:DATA.fund_reference_version,
++     code_attack_model_version:(DATA.attack_monitor||{}).version};
++   var mismatch=Object.keys(expected).some(function(k){return expected[k]&&s[k]!==expected[k];});
++   SERVER_VERSION_MISMATCH=!!(mismatch||s.needs_model_refresh);
++   var refresh=document.getElementById('btn-refresh');
++   if(mismatch||s.needs_model_refresh){
++     el.textContent=mismatch?'后台待重启':'新版准备中';
++     el.title='后台与页面版本尚未一致；请停止服务后重新打开看板，再继续更新。';
++     if(refresh){refresh.disabled=true;refresh.title=el.title;}
++     return;
++   }
++   if(refresh&&!RF.busy){refresh.disabled=false;refresh.title='获取最新数据';}
+    var loaded=DATA.scan_completed_at||DATA.generated_at;
+    var started=s.scan_started_at?new Date(s.scan_started_at):null;
+    var seconds=started&&!isNaN(started.getTime())?Math.max(0,Math.floor((Date.now()-started.getTime())/1000)):0;
+    var error=s.last_scan_error||s.last_publish_error||'';
++   var published=s.snapshot_generated_at;
++   var different=published&&loaded&&published!==loaded;
+    el.textContent=s.scan_active?'更新中 '+seconds+'s':s.last_publish_ok===false?'发布失败':
+      s.last_scan_ok===false?(error.indexOf('尚未更新')>=0||error.indexOf('门槛')>=0?'报价待更新':'采集失败'):
+-     s.snapshot_generated_at&&loaded&&s.snapshot_generated_at>loaded?'待载入':'已同步';
++     different?'版本待核验':'已同步';
+    el.title=s.scan_active?'后台正在获取行情并计算，完成后自动载入；当前价格仍以显示的源时间为准':error||'页面已载入最近发布的数据';
+  }
+  function watchDataVersion(){
+@@ -1851,6 +1868,7 @@
+      var v=s&&s.data_version;
+      if(!v)return;
+      renderUpdateState(s);
++     if(SERVER_VERSION_MISMATCH)return;
+      var loaded=DATA.scan_completed_at||DATA.generated_at;
+      var newer=s.snapshot_generated_at&&loaded&&s.snapshot_generated_at>loaded;
+      if(PAGE_VERSION===null&&!newer){PAGE_VERSION=v;return;}
+@@ -1860,7 +1878,10 @@
+        toast('数据已更新，正在载入…');
+        setTimeout(function(){location.reload();},300);
+      }
+-   }).catch(function(){});
++   }).catch(function(){
++     var el=document.getElementById('update-state');
++     if(el){el.textContent='后台连接中断';el.title='无法核验后台更新状态，当前页面为已载入的快照';}
++   });
+  }
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)watchDataVersion();});
+  window.addEventListener('focus',watchDataVersion);
+--- before/README.md
++++ after/README.md
+@@ -6,24 +6,24 @@
+ 
+ 最近一期完整恢复备份为 `backups/latest_before_wyckoff_round1/`，压缩源码不参与运行。未使用的旧副本已按 [清理清单](research/wyckoff_20261008/cleanup_manifest.json) 删除；历史研究仍实际读取的冻结源码、输入和旧版v5研究缓存保留，仅供对照，不进入新版判断。
+ 
+-面向当前沪深主板股票池。盘中首页左侧为“进攻监测”，右侧为 MA5／MA10／MA20 趋势观察；收盘后看最新完成日线强势主榜。完整主力净额按15%参与盘中进攻分，当前新浪超大单参考按7.5%；其余为价格进攻，资金缺失或过期沿用价格分。资金不能将价格非A抬成A，也不回填完成日线。位置偏热仅使用现价距盘中MA5严格超过3.5 ATR的条件，其他破线、跌幅、冲高回落风险独立保留。参数为当前研究设定，未声称收益最优。对照与证据见 [资金及MA5调整验收](research/attack_funds_20260930/验收报告.md)。
++面向当前沪深主板股票池。盘中首页显示“进攻监测”“强股整理”和“转强后跟踪”，收盘后看最新完成日线强势主榜。2026-10-09 起停用资金流参考及历史资金补采；盘中进攻分仅使用价格，旧资金字段不参与评分、排序、筛选或展示。MA5／MA10／MA20 回踩位置放在存在趋势的个股标签及详情中，首页不再单列近线名单。位置偏热仅使用现价距盘中MA5严格超过3.5 ATR的条件，其他风险独立保留。参数为当前研究设定，未声称收益最优；旧资金研究报告仅保留当时结论。
+ 
+ ## 首页两种视图
+ 
+ 9:15起自动切换当日竞价观察，每分钟补取竞价报价，将昨日完成日线和真实收盘主榜结合当前价格，给出承接、回踩、平台越界和均线失守判断。竞价价格判断不冒充成交量确认；9:30后衔接连续交易观察。个股详情和CSV共享这份衔接判断。
+ 
+-历史参考已补取最近20个完成日并保存在独立目录 `cache/historical_reference_v6`，真实日线留档优先，缺失日期使用明确标注的历史重算。全池同源日级资金保存在 `cache/fund_history/sina_main.json`，按完成日累积；失败保留旧数据与原因，30分钟后可重试。日线正式完成后生成下一日参考，历史重算使用当前股票池，不等于当时实测名单。
++历史参考已补取最近20个完成日并保存在独立目录 `cache/historical_reference_v6`，真实日线留档优先，缺失日期使用明确标注的历史重算。历史资金库仅为旧记录，不读取为现行判断依据，也不继续补采。日线正式完成后生成下一日参考，历史重算使用当前股票池，不等于当时实测名单。
+ 
+ ATR使用ATR20-SMA，包含跳空真实波幅；威科夫为量价特征观察，SOS需量增幅扩及价格推进，LPS需突破后的量缩幅窄回测并再上行。完整A-E阶段及点数图目标尚未验证。本轮最近备份 `backups/latest_before_session_context` 为压缩源码与快照，不参与运行；上一轮备份仍是已有验收的固定输入。
+ 
+ 11:30自动获取午间收市报价，行情源尚未更新时重试；午休所有观察卡片必须优先使用当日11:30缓存显示价格和涨幅。缺失个股回退到上午最后有效报价并显示实际时间。13:00新报价到达前保留11:30参考，新报价到达后切换。报价截至时间与评分截至时间独立显示，休盘不代表报价不可查看。进攻列表的这条契约由 `node research/lunch_attack_20260930/test_lunch.cjs` 验证。
+ 
+-- **盘中监控**：上午、下午和午休有当日有效报价后默认显示。左侧“进攻监测”展示价格进攻A档且当日上涨达到3%或出现反包/突破、无严重转弱的股票；盘中综合分加入资金确认，过热及成交限制另列。右侧“趋势观察”可在 MA5、MA10、MA20 间切换：从上一完成日趋势成立且收盘站上所选均线的股票中，观察今日最低价低于昨收、现价高于所选暂态均线且距离不超过 1% 的股票；各组先按风险提示排序，再按贴线距离由近到远排列。所选线日内未破者列在主组；曾跌破但在 15 个**交易分钟**内收回者单列。榜单只展示所选均线的状态，不提示其他均线的失守；大跌、冲高回落等个股风险仍单独提示。午休不计入观察时间。跌破核验使用东财 1 分钟开高低收，故障时尝试新浪同口径数据；分钟行情缺口、报价过期或历史价格口径异常时不生成快速收回结论。收盘后手动切回盘中页显示最后一次有效盘中观察及时间，不把它当正式收盘确认。
++- **盘中监控**：9:15 起显示当日观察。进攻、强股整理及转强后跟踪共享有效报价与判断时点，风险独立展示。午间以实际上午收市报价为参考，午后逐股到齐后更新。收盘后手动切回可查看最后有效盘中留档与时间。均线回踩位置在个股标签与详情展示，不再设首页近线列表。
+ - **收盘复盘**：收盘后、盘前与非交易日默认显示。只展示最近正式完成日线中符合现有强势因子资格的股票，按日线基础分排序。今日收盘日线还没生成时，明确保留上一完成日及其日期。收盘主榜按交易日留档；次日 MA5／MA10／MA20 趋势观察独立从全部完成日趋势股中筛选。收盘后手动切回盘中页可查看当天最后一次有效记录。
+ - 盘中两张观察卡片直接显示股票的所属行业和前两项同花顺概念，更多概念可悬停查看或点进个股详情；卡片只纵向滚动，不需要左右滑动。
+ - 首页将市场、题材和其他详细分析收在“展开市场、题材与完整分析”中；个股、板块等下钻页仍可使用。收盘主榜的“导出本榜”与首页显示使用同一份留档名单和顺序。
+ 
+-日线趋势资格为 **MA5＞MA10＞MA20、MA20 较前一完成日上升，完成日收盘不低于 MA10**。日线进攻分按5/10/20日推进50/30/20评分，每项60%绝对推进加40%相对速度；盘中价格分用相同三周期，资金只参与盘中综合进攻分。
++日线趋势资格为 **MA5＞MA10＞MA20、MA20 较前一完成日上升，完成日收盘不低于 MA10**。日线进攻分按5/10/20日推进50/30/20评分，每项60%绝对推进加40%相对速度；盘中价格分用相同三周期，资金不参与任何现行评分。
+ 
+ ## 看什么
+ 
+@@ -81,17 +81,17 @@
+ 
+ - 默认双击 `打开看板.bat`，通过本地服务打开持续更新的看板。直接打开 [dashboard.html](dashboard.html) 只会看到静态快照，不会接收后台发布；页面显示数据生成、扫描完成、日线判断日和逐股报价时间。“刷新数据”会请求服务扫描，发布成功后页面自动载入新版本。
+ - `python daily.py --quiet`：更新行情、看板和日报。
+-- 同花顺概念目录、行业目录、成员名单和概念指数映射固定使用本地已保存版本；看板“刷新数据”与每日扫描只更新行情、日线、板块价格及相关观察结果，不自动重抓分类。明确要求更新分类时才运行 `python refresh_classification.py`，完成后下一轮行情扫描使用新成员。个股 F10 归属核对也不在每日扫描中自动重抓；没有本地核对记录时显示待核对。
++- 同花顺目录与成员名单每7天检查一次，在盘后更新；未完整通过时恢复旧名单。常规五分钟扫描只更新行情及判断。主动更新分类可运行 `python refresh_classification.py`，下一轮行情扫描使用新成员。个股 F10 归属核对不在每日扫描中自动重抓；没有本地记录时显示待核对。
+ - 概念浏览合并已保存的同花顺个股 F10 和概念详情成员，保留两路来源差异；日线因子和原有评分仍采用 F10 优先口径。点击概念进入“全部样本”查看当前覆盖的所有成员，包括待评分股票；概念人数表示当前覆盖成员，不表示强势股或全市场完整成员数。筛选面板的概念人数也按同一成员名单计算。
+ - 09:15—09:25 集合竞价定时或手动刷新会获取当日有效报价，成交额为零不妨碍展示；完成日线评分与收盘名单沿用上一份快照，竞价报价单独标注。09:25 的竞价结束报价按实际源时间保存，09:25—09:30 只展示竞价结束参考。09:30 后恢复正常盘中报价和成交有效性检查；正式报价未就绪时先显示竞价参考价。竞价时间或价格无效时保留上一份结果。
+-- `python rebuild_strength.py`：只用本地日线重建，沿用原报价时间，不联网补资金。
++- `python rebuild_strength.py`：只允许同一完成日的本地重建，沿用原报价时间并重建收盘主榜；日线日期变化时拒绝沿用旧派生结果，请运行正常收盘更新。
+ - `python -m unittest test_close_monitor test_strength test_emotion test_stock_strength test_intraday test_intraday_volume test_coverage test_radar_strength test_theme_assist test_classification -v`、`python check_dashboard.py`、`python smoke_test.py`、`python check_live_service.py` 是原有规则的验证入口。MA5／MA10／MA20 趋势观察按目标线独立计算，功能正确性与评分是否带来额外区分能力分开统计。
+ 
+ 本地服务启动时会核对已加载的日线趋势、日线强度、盘中模型版本和快照字段；不一致时先更新快照，等待期间页面显示初始化状态，不会展示旧榜单。每轮后台扫描同时发布看板与 `snapshot_report.md`。`/__status` 提供当前服务进程、三个模型版本、扫描状态和已发布快照时间；修改计算代码后仍须重新启动服务，不能只重建静态页面。
+ 
+-个股页默认展示全部样本，股票名称旁显示主要观察标签；主表收成股票、今日、日线分、盘中分、关键状态、行业／概念六列，复杂的相对评分变化、风险原因和趋势依据移到个股详情。A/B/C 按日线基础强度分层，只代表日线关注级别。详情同时展示日线四项分数、盘中分及相对评分变化、日线确认与暂态均线、报价有效性与风险、逐股报价时间、行业/题材、资金来源与覆盖；CSV 与总览采用同一筛选条件和排序。角色中的“20日领涨”表示当前覆盖同行的20日涨幅名次。
++个股页默认展示全部样本，股票名称旁显示主要观察标签；主表收成股票、今日、日线分、盘中分、关键状态、行业／概念六列，复杂的相对评分变化、风险原因和趋势依据移到个股详情。A/B/C 按日线基础强度分层，只代表日线关注级别。详情展示现行价格评分、日线确认与暂态均线、报价有效性与风险、逐股报价时间、行业/题材及可核验来源；CSV 与总览采用同一筛选条件和排序。角色中的“20日领涨”表示当前覆盖同行的20日涨幅名次。
+ 
+-情绪状态与助攻阈值只是首版描述标签，尚未据此收紧趋势池。行业自身的持续扩散、初步扩散或收缩，与个股相对同行的领先或落后分开显示；“核心独强”必须有强度、绝对上涨和同行超额共同支持。涨停使用报价接近涨停价的近似判定，盘中标为暂态；现有日线与单次报价无法判定封板时刻、开板次数、个股带动板块的先后关系。行业比较只覆盖当前主板有效日线样本，题材助攻只覆盖主榜有效成员，不能代表完整题材。资金覆盖不足时继续显示未知，不进入自身强度分。
++情绪状态与助攻阈值只是首版描述标签，尚未据此收紧趋势池。行业自身的持续扩散、初步扩散或收缩，与个股相对同行的领先或落后分开显示；“核心独强”必须有强度、绝对上涨和同行超额共同支持。涨停使用报价接近涨停价的近似判定，盘中标为暂态；现有日线与单次报价无法判定封板时刻、开板次数、个股带动板块的先后关系。行业比较只覆盖当前主板有效日线样本，题材助攻只覆盖主榜有效成员，不能代表完整题材。资金参考已停用。
+ 
+ ## 验证边界
+ 
+@@ -111,4 +111,10 @@
+ 
+ 25日窗口扩大了比较池，日线基础强度研究版5另存于 `cache/stock_strength_daily/v5/`；35/25/20/20权重不变，旧版分位不与新版直接相减。
+ 
++## 2026-10-09 完整性排查
++
++扫描、分类周更、离线重建和看板发布共用跨进程锁，避免不同入口并发覆盖。单文件原子写使用独立临时文件；历史半行记录等待补齐后读取。旧规则进攻资格不复用，报价及可比均线事实仍保留。发布失败返回非零状态，不能报告更新成功。
++
++自动收盘补取在15:05至16:00间运行；晚于16:00启动或手动刷新时，若当日正式日线未完成仍会补取。完成日、主榜日期及核验时间一致后不再重复全量采集。页面对比后台实际代码版本，不一致时显示“后台待重启”并停用刷新入口。消息面模块取消实施。源码、测试、真实数据及在线验收状态见[排查报告](research/audit_20261009/排查报告.md)。
++
+ 第五项的规则、数据和算法源码冻结在 `research/rules_20260929/`，比较共同趋势池及持续强势池中的20日涨幅、四项强度和四个删项版本。结果见[排序对照报告](research/rules_20260929/排序对照报告.md)，逐笔记录见 `events.csv`；同时统计5/10日后续表现、路径回撤、名单保留率、成交限制与未结事件。本次研究不调权重。

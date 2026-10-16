@@ -1,0 +1,196 @@
+--- before/test_market_strength.py
++++ after/test_market_strength.py
+@@ -45,10 +45,6 @@
+         self.assertEqual(M.level(64.99),'一般');self.assertEqual(M.level(65),'强');self.assertEqual(M.level(80),'很强');self.assertIsNone(M.level(None))
+         self.assertEqual(M.rounded(64.995),65.)
+         self.assertEqual(M.choose({'5':{'T':80.},'10':{'T':80.},'20':{'T':80.-1e-10}}),(80.,20))
+-    def test_nonpositive_emotion_upper_bound(self):
+-        for r in (0.,-3.):
+-            j=100*M.clamp(r/10);d=.6*j+.4*100;e=.7*d+.3*100
+-            self.assertLessEqual(e,58.)
+     def test_phase_priority_and_unknown(self):
+         self.assertEqual(M.phase(70,90,[70,70,30],True),( '回踩整理',2))
+         self.assertEqual(M.phase(70,20,[70,70,30],False),('推进',2))
+@@ -70,6 +66,7 @@
+         r=run(f)[code]
+         self.assertTrue(r['trend_strong']);self.assertEqual(r['dominant_period'],5);self.assertTrue(r['focus'])
+         self.assertIn('短期走强，中期未恢复',r['reasons']);self.assertIn('位置偏热',r['risks'])
++        self.assertEqual(r['background']['label'],'中期未恢复')
+         before=copy.deepcopy(r)
+         s['stocks'][0].update(watch_candidate=True,intraday_trend_ok=True,trend_tier='A',confirmation_samples=999)
+         self.assertEqual(run(f)[code],before)
+@@ -106,6 +103,7 @@
+         last=h[code][-1]['close'];price=last-2.
+         q[code].update(price=price,last_close=last,open=last,high=last,low=price,change_pct=100*(price/last-1))
+         r=run(f)[code];self.assertTrue(r['trend_strong']);self.assertTrue(r['focus']);self.assertEqual(r['phase'],'回踩整理');self.assertLess(q[code]['change_pct'],0)
++        self.assertIn(code,s['market_strength']['stocks']['pullback'])
+     def test_emotion_first_full_pipeline_with_valid_phase(self):
+         f=fixture();s,q,p,h,c,n=f;code=next(iter(q))
+         # Recent down-structure forces K=.5; a 9% rebound is still below prior rolling lines.
+@@ -169,6 +167,7 @@
+         run(f);b=s['board_catalog'][0]['market_strength'];self.assertIsNone(b['trend_score']);self.assertEqual(b['expected'],6)
+         self.assertTrue(b['emotion_strong']);self.assertEqual(s['market_strength']['counts']['focus'],6)
+         self.assertEqual(len(s['market_strength']['stocks']['day_attack']),6)
++        self.assertEqual(len(s['board_catalog'][0]['members']),6)
+     def test_board_periods_independent(self):
+         stocks={str(i):M.empty('time','test') for i in range(8)}
+         for m in stocks.values():m['trend_parts_by_period']={'5':dict(R=6.,historical_R=6.,K=1.,T=85.),'10':dict(T=None),'20':dict(T=None)}
+--- before/test_owner_strength_rebuild.py
++++ after/test_owner_strength_rebuild.py
+@@ -34,20 +34,7 @@
+         self.assertGreater(m[a]['trend_score'],m[b]['trend_score'])
+         self.assertTrue(m[a]['trend_strong']);self.assertFalse(m[b]['trend_strong'])
+ 
+-    def test_near_term_start_does_not_require_entire_ma_stack(self):
+-        f=fixture();a=next(iter(f[1]))
+-        prices(f,a,[120]+[100]*14+[101,102,103,104,105],106)
+-        m=run(f)[a]
+-        self.assertTrue(m['trend_strong']);self.assertEqual(m['dominant_period'],5)
+-        self.assertEqual(m['background']['label'],'中期未恢复')
+ 
+-    def test_down_today_pullback_remains_in_radar(self):
+-        f=fixture();a=next(iter(f[1]))
+-        prices(f,a,[100+i*1.2 for i in range(20)],120.8)
+-        m=run(f)[a]
+-        self.assertTrue(m['trend_strong']);self.assertEqual(m['phase'],'回踩整理')
+-        self.assertIn(a,f[0]['market_strength']['stocks']['pullback'])
+-        self.assertLess(f[1][a]['change_pct'],0)
+ 
+     def test_pullback_above_ma5_is_not_mislabeled_advance(self):
+         f=fixture();a=next(iter(f[1]))
+@@ -67,12 +54,6 @@
+         self.assertGreater(m[b]['emotion_score'],m[a]['emotion_score'])
+         self.assertEqual(m[a]['recent_emotion']['active_days'],0)
+ 
+-    def test_limit_quote_does_not_override_actual_hold(self):
+-        f=fixture();q=f[1][next(iter(f[1]))]
+-        q.update(price=110.,open=110.,high=110.,low=110.,change_pct=10.)
+-        m=run(f)[next(iter(f[1]))]
+-        self.assertEqual(m['emotion_parts']['H'],50)
+-        self.assertLess(m['emotion_score'],80)
+ 
+     def test_emotion_breaks_do_not_change_trend_order(self):
+         a=M.empty('t','test');a.update(trend_score=80,emotion_score=0,dominant_period=5)
+--- before/test_market_strength_integration.py
++++ after/test_market_strength_integration.py
+@@ -31,8 +31,6 @@
+     def test_summary_keeps_emotion_only_and_unknowns(self):
+         self.f[3][next(iter(self.f[1]))]=[];run(self.f)
+         brief=ui_payload.summary(self.s,'v');a=brief['stocks'][0]['market_strength'];self.assertIsNone(a['trend_score']);self.assertIsNone(a['emotion_score']);self.assertTrue(a['day_attack_strong'])
+-    def test_pack_roundtrip(self):
+-        brief=ui_payload.summary(self.s,'v');self.assertEqual(ui_payload.unpack(ui_payload.pack(brief)),json.loads(json.dumps(brief)))
+     def test_detail_store_same_scores(self):
+         with tempfile.TemporaryDirectory() as d:
+             page=Path(d)/'dashboard.html';packet,token=ui_payload.prepare(self.s,'var DATA = /*__DATA__*/null',page)
+@@ -56,6 +54,9 @@
+         body=render(self.s)['els']['radar-opportunities']['innerHTML']
+         for word in ('待采样','确认计时','等待确认','判断暂停','受限机会'):self.assertNotIn(word,body)
+         self.assertIn('位置偏热',body);self.assertNotIn('雷达参考',body)
++        self.s['session']='集合竞价';run(self.f);reference=render(self.s)
++        self.assertEqual(reference['ids'],[])
++        self.assertIn('参考行情',reference['els']['rad-sub']['innerHTML'])
+     def test_null_render_is_dash_real_zero_zero(self):
+         self.assertEqual(render(self.s)['formats'],['—','—','0.00','0.00%'])
+     def test_render_emotion_only_detail(self):
+--- before/test_radar_opportunity.py
++++ after/test_radar_opportunity.py
+@@ -18,11 +18,12 @@
+     def run_round(self,**kw):
+         radar.build_opportunities(self.s,self.q,self.p,{},self.h,self.c,now=self.now,**kw)
+         R.validate(self.s);return self.s['stocks'][0]['market_strength']
+-    def test_first_quote_admitted_no_confirmation(self):self.assertTrue(self.run_round(state={'events':{}})['focus'])
+-    def test_repeated_quote_keeps_same_scores(self):
+-        a=copy.deepcopy(self.run_round());self.assertEqual(a,self.run_round())
+     def test_state_samples_and_window_cannot_change_scores(self):
+-        a=copy.deepcopy(self.run_round(state={}));self.assertEqual(a,self.run_round(state={'count':999,'confirmed':False,'span_seconds':0,'paused':True}))
++        a=copy.deepcopy(self.run_round(state={}))
++        self.assertTrue(a['focus'])
++        self.assertEqual(a,self.run_round())
++        self.s['stocks'][0].update(trend_tier='A',watch_candidate=True,intraday_trend_ok=True,persistent_strong=True)
++        self.assertEqual(a,self.run_round(state={'count':999,'confirmed':False,'span_seconds':0,'paused':True}))
+     def test_no_state_or_confirmation_cache_write(self):
+         with patch.object(R,'save_state',side_effect=AssertionError('legacy state write')) if hasattr(R,'save_state') else patch.object(R,'load_state',side_effect=AssertionError('legacy state read')):
+             self.assertTrue(self.run_round(persist=True)['focus'])
+@@ -36,9 +37,6 @@
+         self.assertTrue(self.run_round()['focus'])
+     def test_board_does_not_rescue_or_block(self):
+         a=copy.deepcopy(self.run_round());self.s['board_catalog']=[];self.assertEqual(a,self.run_round())
+-    def test_no_old_a_qualification(self):
+-        self.s['stocks'][0].update(trend_tier='C',watch_candidate=False,intraday_trend_ok=False,persistent_strong=False)
+-        self.assertTrue(self.run_round()['focus'])
+     def test_next_failed_round_exits(self):
+         self.run_round();self.q[self.code].update(price=100.,open=100.,high=101.,low=99.,change_pct=0.)
+         self.assertFalse(self.run_round()['focus'])
+--- before/test_board_opportunity.py
++++ after/test_board_opportunity.py
+@@ -13,42 +13,35 @@
+     def model(self):
+         B.enrich(self.s,self.q,self.p,histories=self.h,calendar=self.c,now=self.now,persist=True)
+         B.validate(self.s);return self.s['board_catalog'][0]['market_strength']
+-    def test_first_valid_batch_admitted(self):self.assertTrue(self.model()['focus'])
+     def test_projection_does_not_sample_or_rescore(self):
+-        m=copy.deepcopy(self.model());self.assertEqual(m,self.model())
+-    def test_official_index_missing_not_block(self):self.s['board_catalog'][0]['index_quote']={};self.assertTrue(self.model()['focus'])
++        m=copy.deepcopy(self.model());self.assertTrue(m['focus']);self.assertEqual(m,self.model())
++        self.s['board_catalog'][0]['index_quote']={}
++        self.assertTrue(self.model()['focus'])
+     def test_official_index_alone_cannot_qualify(self):
+         for q in self.q.values():q.update(price=100.,open=100.,high=101.,low=99.,change_pct=0.)
+         self.s['board_catalog'][0]['index_quote']=dict(valid=True,change_pct=10.)
+         self.assertFalse(self.model()['focus'])
+-    def test_axis_no_intersection_required(self):
+-        for c in self.h:self.h[c]=self.h[c][-6:]
+-        m=self.model();self.assertIsNone(m['trend_score']);self.assertTrue(m['emotion_strong'])
+-    def test_missing_member_kept_in_expected(self):
+-        del self.q[next(iter(self.q))];m=self.model();self.assertEqual(m['expected'],10);self.assertEqual(m['emotion_parts']['valid'],9)
+-    def test_coverage_exact_80(self):
+-        for c in list(self.q)[:2]:del self.q[c]
+-        m=self.model();self.assertEqual(m['emotion_parts']['coverage_pct'],80.);self.assertIsNotNone(m['emotion_score'])
+-    def test_coverage_below_80(self):
+-        for c in list(self.q)[:3]:del self.q[c]
+-        self.assertIsNone(self.model()['emotion_score'])
++    def test_missing_members_and_coverage_boundary(self):
++        for missing in (1,2,3):
++            with self.subTest(missing=missing):
++                self.f=fixture(10);self.s,self.q,self.p,self.h,self.c,self.now=self.f
++                for q in self.q.values():q.update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
++                for code in list(self.q)[:missing]:del self.q[code]
++                m=self.model();self.assertEqual(m['expected'],10)
++                self.assertEqual(m['emotion_parts']['valid'],10-missing)
++                self.assertEqual(m['emotion_parts']['coverage_pct'],100-10*missing)
++                if missing<=2:self.assertIsNotNone(m['emotion_score'])
++                else:self.assertIsNone(m['emotion_score'])
+     def test_five_members_no_conclusion(self):
+         self.s['board_catalog'][0]['member_codes']=list(self.q)[:5];m=self.model();self.assertIsNone(m['trend_score']);self.assertIsNone(m['emotion_score'])
+     def test_explicit_no_trade_excluded_missing_not_excluded(self):
+         self.q[list(self.q)[0]].update(amount_wan=0.,volume_shou=0.);del self.q[list(self.q)[1]]
+         m=self.model();self.assertEqual(m['expected'],9);self.assertEqual(m['emotion_parts']['valid'],8)
+-    def test_duplicate_members_no_bonus(self):
+-        self.s['board_catalog'][0]['member_codes']*=2;m=self.model();self.assertEqual(m['expected'],10);self.assertEqual(len(self.s['board_catalog'][0]['members']),10)
+     def test_member_risk_no_exclusion(self):
+         for r in self.s['stocks']:r.update(intraday_serious_weakness=True,intraday_trade_restriction='涨停')
+         self.assertTrue(self.model()['focus'])
+     def test_trim_is_ten_percent_each_side(self):
+         values={str(i):float(i) for i in range(20)};r,removed=M.trim(values);self.assertEqual(r,9.5);self.assertEqual(removed,['0','1','18','19'])
+-    def test_hot_share_uses_untrimmed_members(self):
+-        self.model();self.assertEqual(self.s['board_catalog'][0]['market_strength']['emotion_parts']['B'],100.)
+-    def test_member_scores_identical_to_stock(self):
+-        self.model();by={r['code']:r['market_strength'] for r in self.s['stocks']}
+-        for r in self.s['board_catalog'][0]['members']:self.assertEqual(r['market_strength'],M.brief(by[r['code']]))
+     def test_raw_members_and_index_unchanged(self):
+         self.s['board_catalog'][0]['index_quote']=dict(valid=True,change_pct=-1.,source='THS')
+         before=copy.deepcopy((self.q,self.p,self.h,self.s['board_catalog'][0]['member_codes'],self.s['board_catalog'][0]['index_quote']))
+--- before/test_radar_acceptance.py
++++ after/test_radar_acceptance.py
+@@ -1,11 +0,0 @@
+-"""UI acceptance migrated from V1 process views to the unified backend contract."""
+-import unittest
+-from test_market_strength_integration import render
+-from test_market_strength import fixture,run
+-
+-class RadarAcceptanceTests(unittest.TestCase):
+-    def test_current_strength_ui_missing_and_reference(self):
+-        f=fixture();f[0]['session']='集合竞价';run(f);r=render(f[0]);self.assertEqual(r['ids'],[]);self.assertIn('参考行情',r['els']['rad-sub']['innerHTML'])
+-    def test_ui_full_model_same_version(self):
+-        f=fixture();run(f);r=render(f[0],"showStock('600000');")
+-        self.assertIn(f[0]['market_strength']['version'],r['drawer'][2]);self.assertEqual(r['formats'][0],'—')

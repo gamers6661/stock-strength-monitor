@@ -1,0 +1,635 @@
+"""冻结V1：独立机会入口、真实源采样及不可漂移的事件。无行情请求。"""
+import copy
+import hashlib
+import json
+import math
+from pathlib import Path
+from datetime import datetime
+from statistics import mean, median
+
+import config
+import intraday
+import board_opportunity
+
+VERSION = config.RADAR_OPPORTUNITY['version']
+IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+DIRECTORY = config.CACHE_DIR / 'radar_opportunity_v1'
+_DEFAULT_DIRECTORY=DIRECTORY
+_DEFAULT_SNAPSHOT=config.SNAPSHOT_JSON
+LABELS = {'restart': '强势再启动', 'breakout': '突破启动', 'sustained': '持续进攻'}
+REPAIR_VERSION = '雷达验收修复2026-10-13.1'
+
+
+def presentation(session, sampling):
+    deferred=session in ('非交易日','盘前','集合竞价','竞价结束')
+    return dict(default_view='follow' if session in ('集合竞价','竞价结束') else 'close' if session=='已收盘' else 'daily' if session in ('非交易日','盘前') else 'current',
+                confirmation_enabled=sampling,market_enabled=not deferred,
+                market_reason='竞价阶段连续竞价基准尚未启用；E0及环境待核验' if session in ('集合竞价','竞价结束') else '连续竞价基准尚未启用' if deferred else None,
+                current_empty_message='暂无符合条件的股票，空池为有效结果。' if sampling else '当前非连续竞价，尚未进入确认时段；本时段不新增采样确认。')
+
+
+def close_bundle(snap, review, events):
+    """投影真实已计算收盘结果，不重新计算资格或回填历史成员。"""
+    names={r['code']:r.get('name') for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
+    identities={e['event_id']:e for e in events.values()}
+    records=[]
+    for identity,item in review.get('events',{}).items():
+        e=identities.get(identity)
+        if not e:raise ValueError('收盘记录缺少原事件身份：'+identity)
+        records.append(dict(item,event_id=identity,code=e['code'],name=names.get(e['code']),kind=e['kind'],label=LABELS[e['kind']],day=review['day'],
+                            platform=e.get('platform'),atr=e.get('atr'),background_date=e.get('background_date'),first_observed_at=e.get('first_observed_at'),first_confirmed_at=e.get('first_confirmed_at')))
+    grouped={}
+    for item in records:grouped.setdefault(item['code'],[]).append(item)
+    rows=[]
+    for code,items in grouped.items():
+        confirmed=[r for r in items if r['status']=='收盘确认']
+        if not confirmed:continue
+        labels=[LABELS[k] for k in LABELS if any(r['kind']==k for r in confirmed)]
+        rows.append(dict(code=code,name=names.get(code),day=review['day'],labels=labels,event_count=len(confirmed),R0=confirmed[0].get('R0'),E0=confirmed[0].get('E0'),M0=confirmed[0].get('M0'),events=items))
+    rows.sort(key=lambda r:(-r['E0'] if number(r['E0']) else math.inf,-r['R0'] if number(r['R0']) else math.inf,r['code']))
+    return dict(review,version=VERSION,generated_at=snap.get('generated_at'),records=records,stock_rows=rows,
+                event_counts={s:sum(r['status']==s for r in records) for s in ('收盘确认','收盘未确认','待收盘核验')},
+                stock_counts={s:len({r['code'] for r in records if r['status']==s}) for s in ('收盘确认','收盘未确认','待收盘核验')})
+
+
+def attach_close_archive(model, bundle=None, persist=False):
+    folder=directory()/'close_reviews'
+    if bundle and bundle.get('ready') and persist:
+        folder.mkdir(parents=True,exist_ok=True)
+        config.atomic_write_text(folder/(bundle['day']+'.json'),json.dumps(bundle,ensure_ascii=False,separators=(',',':')))
+    saved=[]
+    if folder.exists():
+        for path in sorted(folder.glob('*.json'),reverse=True):
+            try:item=json.loads(path.read_text(encoding='utf-8'))
+            except (OSError,ValueError):continue
+            if (item.get('version')==VERSION and item.get('ready') and item.get('day','')<=model['day']
+                    and (not model.get('judged_at') or item.get('generated_at','')<=model['judged_at'])):
+                saved.append(item);break
+    if bundle and bundle.get('ready'):saved.append(bundle)
+    if saved:model['last_close_review']=max(saved,key=lambda r:r['day'])
+
+
+def number(v):
+    return isinstance(v, (float, int)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def stamp(v):
+    return intraday.parse_quote_timestamp(v) if v else None
+
+
+def part(at):
+    if not at: return None
+    t=at.strftime('%H:%M:%S'); p=config.RADAR_OPPORTUNITY
+    if p['continuous_am'][0] <= t < p['continuous_am'][1]: return 'AM'
+    if p['continuous_pm'][0] <= t < p['continuous_pm'][1]: return 'PM'
+    return None
+
+
+def observation_part(at):
+    """14:57后仍可撤销/收盘复核，但不属于确认采样时段。"""
+    if not at:return None
+    t=at.strftime('%H:%M:%S');p=config.RADAR_OPPORTUNITY
+    if p['continuous_am'][0]<=t<=p['continuous_am'][1]:return 'AM'
+    if p['continuous_pm'][0]<=t<='15:00:00':return 'PM'
+    return None
+
+
+def check(key, actual, threshold, passed, reason=None):
+    return dict(key=key, actual=actual, threshold=threshold, passed=passed, reason=reason)
+
+
+def compare(key, value, floor, strict=False):
+    return check(key,value,('> ' if strict else '≥ ')+(str(floor) if number(floor) else '待核验'),
+                 (value > floor if strict else value >= floor) if number(value) and number(floor) else None)
+
+
+def verdict(checks):
+    # 数据未知优先；不能把缺失写成失败或转弱。
+    if any(c['passed'] is None for c in checks): return None
+    return all(c['passed'] for c in checks)
+
+
+def directory():
+    if DIRECTORY!=_DEFAULT_DIRECTORY:return DIRECTORY
+    return (config.SNAPSHOT_JSON.parent if config.SNAPSHOT_JSON!=_DEFAULT_SNAPSHOT else config.CACHE_DIR)/'radar_opportunity_v1'
+
+
+def load_state():
+    try: return json.loads((directory()/'state.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError): return {}
+
+
+def sample(old, at, eligible, now):
+    p=config.RADAR_OPPORTUNITY; old=copy.deepcopy(old or {})
+    sequence=dict(count=0,span_seconds=0,first_at=None,last_at=None,
+                  day=now.date().isoformat(),part=part(at),confirmed=False)
+    same=old.get('day')==sequence['day'] and old.get('part')==sequence['part']
+    if not eligible or not at or not part(at): return sequence
+    last=stamp(old.get('last_at'))
+    if same and last and at < last: return sequence
+    if same and last and at == last: return old
+    if same and last and 0 < (at-last).total_seconds() <= p['max_sample_gap_seconds']:
+        sequence=old
+    sequence['count']+=1
+    sequence['first_at']=sequence.get('first_at') or str(at)
+    sequence['last_at']=str(at)
+    sequence['span_seconds']=(at-stamp(sequence['first_at'])).total_seconds()
+    sequence['confirmed']=(sequence['count']>=p['confirmation_samples'] and
+                           sequence['span_seconds']>=p['confirmation_span_seconds'])
+    return sequence
+
+
+def scale_identity(context):
+    return '|'.join(str(context.get(k) or '') for k in
+                    ('version','quote_basis','quote_basis_source','history_basis','history_basis_source'))
+
+
+def history_check(context, bars, calendar, asof):
+    p=config.RADAR_OPPORTUNITY
+    dates=sorted(set(d for d in calendar if d<=str(asof)))[-p['core_bars']:]
+    prior=sorted((b for b in bars if b.get('date','')<=str(asof)),key=lambda b:b['date'])[-p['core_bars']:]
+    modes={(b.get('price_basis'),b.get('price_basis_source')) for b in prior}
+    valid=(context.get('valid') is True and len(dates)==p['core_bars'] and
+           [b['date'] for b in prior]==dates and
+           modes=={(context.get('history_basis'),context.get('history_basis_source'))} and
+           all(intraday._valid_historical_price_bar(b) for b in prior))
+    return check('核心完成日历史',len(prior),str(p['core_bars'])+'根应有完成日、同尺度',
+                 True if valid else None, None if valid else '窗口、日期或历史价格口径待核验')
+
+
+def background(row, context, asof):
+    c=row.get('trend_consolidation') or {}
+    accepted=(c.get('eligible') is True or c.get('phase') in ('initial','completed') or c.get('completion_confirmed') is True)
+    anchor=c.get('consolidation_start'); high=c.get('platform_high'); date=c.get('consolidation_asof') or c.get('baseline_asof')
+    valid=(accepted and not c.get('trend_exited') and not c.get('tracking_pending') and not c.get('pending')
+           and anchor and date and date<=str(asof) and number(high) and context.get('valid') is True)
+    checked=None if not c or c.get('pending') or c.get('tracking_pending') or context.get('valid') is not True else bool(valid)
+    return dict(valid=bool(valid),checked=checked,anchor=anchor,background_date=date,
+                high=high*context['scale_factor'] if valid else None,
+                reason=c.get('reason') or ('整理背景未核验' if not valid else '已保存的合格强势整理平台'))
+
+
+def event_new(code, kind, anchor, high, atr, context, at, asof, bg=None):
+    scale=scale_identity(context)
+    identity=hashlib.sha256('|'.join((code,kind,str(anchor),VERSION,scale)).encode()).hexdigest()[:24]
+    return dict(event_id=identity,code=code,kind=kind,anchor=anchor,platform=high,atr=atr,
+                background_date=asof,background=bg,version=VERSION,scale_identity=scale,
+                first_observed_at=str(at),first_formal_at=None,first_confirmed_at=None,
+                last_reconfirmed_at=None,sequence={},status='预警',ended_at=None,history=[])
+
+
+def boards_for(code, snap, quotes_valid, eligible, market, confirmed_boards=None):
+    p=config.RADAR_OPPORTUNITY; result=[]
+    for b in (snap.get('board_catalog') or []) if confirmed_boards is None else confirmed_boards:
+        members=set(str(c) for c in b.get('member_codes') or [])
+        if code not in members: continue
+        peers=(members & set(eligible))-{code}; values=[quotes_valid[c]['change_pct'] for c in peers if c in quotes_valid]
+        coverage=len(values)/len(peers)*100 if peers else None
+        up=sum(v>0 for v in values)/len(values)*100 if values else None
+        mid=median(values) if values else None
+        o=b.get('opportunity') or b.get('board_opportunity') or {}
+        same_day=o.get('day')==market['day'] and str(o.get('judgment_at') or '').startswith(market['day'])
+        board_at=stamp((o.get('current') or {}).get('sample_at'))
+        source_same=(observation_part(board_at) or ('PM' if board_at and board_at.date().isoformat()==market['day'] and board_at.hour>=15 else None))==market.get('part')
+        peer_same=market.get('ready') and bool(values) and all(quotes_valid[c].get('part')==market.get('part') for c in peers if c in quotes_valid)
+        checks=[compare('有效同行',len(values),p['peer_count']),compare('同行覆盖%',coverage,p['peer_coverage_pct']),
+                compare('同行上涨%',up,p['peer_up_pct']),compare('同行中位数高于M0',mid,market['M0'],True),
+                check('同行报价同日同半日',peer_same,'是',True if peer_same else None)]
+        result.append(dict(id=b.get('id'),name=b.get('name'),type=str(b.get('id') or '').split(':',1)[0],
+                           selected=bool(o.get('current_opportunity')) if same_day and source_same else None,
+                           peers_qualified=verdict(checks),checks=checks))
+    return result
+
+
+def sort_key(row):
+    def descending(v): return (v is None, -v if number(v) else 0)
+    return (descending(row.get('E0')),descending(row.get('live_attack_score')),
+            descending(row.get('R0')),row['code'])
+
+
+def list_record(row):
+    keys=('code','name','version','day','judged_at','source_at','R0','E0','M0','price','daily_tier','daily_asof',
+          'live_attack_score','risk','status','current','main_label','labels','trade_restriction','board_relation_status','display_label','opportunity_kinds','sort_rank')
+    result={k:row.get(k) for k in keys}
+    result['boards']=[{k:b.get(k) for k in ('name','type','selected','peers_qualified')} for b in row.get('boards',[])]
+    result['first_observed_at']=min((v['event']['first_observed_at'] for v in row.get('categories',{}).values() if v.get('event')),default=None)
+    return result
+
+
+def _archived_v1_build(snap, quotes, pool, contexts, histories, calendar, previous=None, state=None, persist=False, now=None):
+    """仅此入口推进事件；页面/离线生成只投影快照。传入state可冻结重放。"""
+    p=config.RADAR_OPPORTUNITY; now=now or stamp(snap.get('generated_at')) or datetime.now()
+    lock=directory()/'rules_frozen.json'
+    if lock.exists():
+        frozen=json.loads(lock.read_text(encoding='utf-8'))
+        if frozen.get('version')==VERSION and json.loads(json.dumps(p))!=frozen['parameters']:
+            raise ValueError('雷达V1参数已冻结；修改规则须使用新版本并开启新的观察期')
+    day=now.date().isoformat(); session=snap.get('session'); asof=(snap.get('strength_model') or {}).get('asof')
+    state=copy.deepcopy(load_state() if state is None else state)
+    if state.get('version')!=VERSION:
+        for e in (state.get('events') or {}).values(): e['sequence']={}
+        state['environment']={}
+    rows={str(r['code']):r for r in (snap.get('coverage_catalog') or [])+(snap.get('stocks') or [])}
+    previous_model=(previous or {}).get('radar_opportunity') or {}
+    if previous_model.get('version')==VERSION:
+        saved=state.setdefault('events',{})
+        for r in (previous or {}).get('stocks',[])+(previous or {}).get('coverage_catalog',[]):
+            for kind,c in (r.get('radar_opportunity') or {}).get('categories',{}).items():
+                e=c.get('event');key=str(r['code'])+'|'+kind
+                if e and e.get('version')==VERSION and key not in saved:saved[key]=copy.deepcopy(e)
+    if session=='午间休市' and previous_model.get('version')==VERSION and previous_model.get('day')==day:
+        model=copy.deepcopy(previous_model);model.update(phase='午休冻结上午结果',frozen=True,presentation=presentation(session,False))
+        attach_close_archive(model)
+        prior_rows={r['code']:r for r in (previous or {}).get('stocks',[])+(previous or {}).get('coverage_catalog',[])}
+        for code in model.get('by_code',{}):
+            if code in rows: rows[code]['radar_opportunity']=copy.deepcopy(prior_rows[code]['radar_opportunity'])
+        snap['radar_opportunity']=model
+        return model
+    universe=state.get('universe') if state.get('universe_day')==day else sorted(pool)
+    universe_pool={c:pool.get(c,{}) for c in universe}
+    eligible, excluded, _, current, _, audit=board_opportunity.collect(snap,quotes,universe_pool,now,session)
+    # 主板基准只核验纯报价，不被评分/历史/候选资格截断。
+    valid={}
+    for code, value in current.items():
+        if session in ('非交易日','盘前','集合竞价','竞价结束'):continue
+        q=quotes.get(code) or {}; at=stamp(value['source_at'])
+        quote_part='PM' if session=='已收盘' and at and at.strftime('%H:%M:%S')>='15:00:00' else observation_part(at)
+        wanted=observation_part(now) or ('PM' if session=='已收盘' else None)
+        if (session in ('早盘','午盘','尾盘') and quote_part != wanted) or not quote_part:
+            continue
+        if q.get('last_close_semantics')!='previous_trade_day_raw_close' or q.get('price_basis')!='raw' or q.get('price_basis_source') not in intraday._RAW_QUOTE_SOURCES:
+            continue
+        valid[code]=dict(value,part=quote_part)
+    market_enabled=session not in ('非交易日','盘前','集合竞价','竞价结束')
+    coverage=len(valid)/len(eligible)*100 if eligible and market_enabled else None
+    market_ready=bool(valid and coverage>=p['market_coverage_pct'])
+    m0=mean(v['change_pct'] for v in valid.values()) if market_ready else None
+    up=sum(v['change_pct']>0 for v in valid.values())/len(valid)*100 if market_ready else None
+    market=dict(day=day,part=observation_part(now) or ('PM' if session=='已收盘' else None),M0=m0,U0=up,valid_count=len(valid),expected_count=len(eligible),eligible_codes=sorted(eligible),valid_codes=sorted(valid),
+                coverage_pct=coverage,excluded=excluded,ready=market_ready,
+                source_at=min((v['source_at'] for v in valid.values()),default=None),
+                latest_source_at=max((v['source_at'] for v in valid.values()),default=None))
+    raw_environment=('偏强' if m0>=p['market_strong_r0_pct'] and up>=p['market_strong_up_pct'] else
+                     '偏弱' if m0<=p['market_weak_r0_pct'] and up<=p['market_weak_up_pct'] else '分化') if market_ready else '未知'
+    old_env=state.get('environment') or {}
+    env_seq=sample(old_env.get('sequence') if old_env.get('target')==raw_environment else {},stamp(market['source_at']),market_ready,now)
+    environment=dict(target=raw_environment,sequence=env_seq,
+                     label=raw_environment if env_seq.get('confirmed') else old_env.get('label','未知') if market_ready and old_env.get('day')==day and old_env.get('part')==market['part'] else '未知',
+                     day=day,part=market['part'])
+    if not market_ready: environment['label']='未知'
+    market['environment']=environment; events=state.get('events') or {}; outputs={}; transitions=[]
+    board_index={}
+    for b in snap.get('board_catalog') or []:
+        for code in set(b.get('member_codes') or []):board_index.setdefault(str(code),[]).append(b)
+    sampling=bool(part(now) and session in ('早盘','午盘','尾盘'))
+    market['enabled']=presentation(session,sampling)['market_enabled']
+    market['reason']=presentation(session,sampling)['market_reason']
+    for code,row in rows.items():
+        q=quotes.get(code) or {}; context=contexts.get(code) or {}; bars=histories.get(code) or []
+        auction=session in ('盘前','集合竞价','竞价结束')
+        auction_at=stamp(q.get('quote_at') or q.get('ts'))
+        auction_valid=bool(auction and auction_at and auction_at.date()==now.date() and
+                           -config.INTRADAY['max_quote_future_seconds']<=(now-auction_at).total_seconds()<=config.INTRADAY['max_quote_age_seconds'] and
+                           number(q.get('price')) and q['price']>0)
+        if auction_valid:context=intraday.align_price_basis(q,bars,calendar,day)
+        at=stamp((valid.get(code) or {}).get('source_at')); price=q.get('price') if at else None
+        if auction_valid:at=auction_at;price=q.get('price')
+        r0=q.get('change_pct') if at and number(q.get('change_pct')) else None; e0=r0-m0 if number(r0) and number(m0) else None
+        opening=q.get('open') if intraday._positive(q.get('open')) else None
+        core=history_check(context,bars,calendar,asof)
+        atr=context.get('atr20') if context.get('valid') is True else None
+        ma=context.get('provisional_ma') or {}; bg=background(row,context,asof)
+        common=[check('本轮有效有成交报价',audit.get(code,{}).get('reason'),'有效',True if code in valid else None),core,
+                check('当前价格尺度',context.get('valid'),'明确可比',True if context.get('valid') is True else None,context.get('reason')),
+                check('严重转弱',row.get('intraday_serious_weakness'),'明确为否',
+                      False if row.get('intraday_serious_weakness') is True else True if row.get('intraday_serious_weakness') is False else None),
+                check('恢复成交等待',row.get('trade_status'),'非无成交/恢复等待',False if row.get('trade_status') in ('no_trade','trade_recovered_wait_daily') else True),
+                compare('主板报价覆盖%',coverage,p['market_coverage_pct']),
+                check('同半日有效基准',market_ready,'是',True if market_ready else None)]
+        result=dict(code=code,name=row.get('name'),version=VERSION,day=day,judged_at=str(now),source_at=str(at) if at else None,
+                    R0=r0,E0=e0,M0=m0,price=price,open=opening,MA=ma,ATR=atr,
+                    daily_tier=row.get('trend_tier'),daily_asof=row.get('signal_date') or asof,
+                    live_attack_score=row.get('live_attack_score') if number(row.get('live_attack_score')) else None,boards=[],risk=[],categories={},labels=[],current=False,
+                    trade_restriction=row.get('intraday_trade_restriction'),status='未入选',admission_checks=copy.deepcopy(common))
+        ma5=ma.get(5,ma.get('5'))
+        if number(price) and number(ma5) and number(atr) and atr>0 and price-ma5>p['heat_atr']*atr: result['risk'].append('位置偏热')
+        if '触板未封' in (row.get('intraday_risk_flags') or []):result['risk'].append('触板未封')
+        result['data_gaps']=['缺盘口及同时间量能序列，未完成成交/量能确认','缺完整事件源，消息风险未核验']
+        for kind in LABELS:
+            key=code+'|'+kind; event=events.get(key); previous_status=(event or {}).get('status')
+            h=None; anchor=None
+            if kind=='breakout' and context.get('valid') and core['passed'] is True:
+                preceding=[b for b in bars if b.get('date','')<=str(asof)][-p['platform_days']:]
+                if len(preceding)==p['platform_days']:
+                    h=max(b['high'] for b in preceding)*context['scale_factor']
+                    anchor=max(preceding,key=lambda b:(b['high'],b['date']))['date']
+            elif kind=='restart': h=bg['high'];anchor=bg['anchor']
+            else:anchor='daily-A'
+            frozen_scale_ready=True
+            scale_changed=bool(event and context.get('valid') and event['scale_identity']!=scale_identity(context))
+            if event and context.get('valid') and event.get('reference_date') and number(event.get('reference_price')):
+                references=[b for b in bars if b.get('date')==event['reference_date']]
+                tick=q.get('price_tick') if number(q.get('price_tick')) and q['price_tick']>0 else p['buffer_yuan']
+                if not references:
+                    frozen_scale_ready=None
+                elif round(references[0]['close']*context['scale_factor']/tick)!=round(event['reference_price']/tick):
+                    # 只比较已核验转换副本的报价精度，不以小价差证明价格尺度。
+                    scale_changed=True
+            if scale_changed:
+                old=copy.deepcopy(event);old['status']='新版本/尺度观察';transitions.append(old);event=None
+            if event and event.get('version')!=VERSION:
+                transitions.append(copy.deepcopy(event));event=None;scale_changed=True
+            # 经济事件不按asof重建。新突破须旧事件结束后至少两个完成收盘回到旧H。
+            if event and kind=='breakout' and not event.get('active') and event.get('ended_at') and number(event.get('platform')) and context.get('valid'):
+                after=[b for b in bars if b.get('date','')>event['ended_at'][:10]]
+                returned=[b for b in after if b['close']*context['scale_factor']<=event['platform']]
+                if len(returned)>=p['rebuild_close_days'] and anchor and anchor>returned[p['rebuild_close_days']-1]['date']:
+                    transitions.append(copy.deepcopy(event));event=None
+            if event and kind=='restart' and bg['valid'] and anchor!=event['anchor'] and anchor>str(event.get('first_observed_at',''))[:10]:
+                transitions.append(copy.deepcopy(event));event=None
+            if event: h=event.get('platform'); frozen_atr=event.get('atr')
+            else: frozen_atr=atr
+            buffer=max(p['buffer_yuan'],p['buffer_atr']*frozen_atr) if number(frozen_atr) and frozen_atr>=p['atr_min_yuan'] else None
+            background_ok=(bg['valid'] and (not event or bg['anchor']==event['anchor'])) if kind=='restart' else core['passed'] is True if kind=='breakout' else row.get('trend_tier')=='A' and row.get('signal_date')==asof
+            checks=copy.deepcopy(common)+[check('历史背景',bg if kind=='restart' else row.get('trend_tier') if kind=='sustained' else asof,
+                                                '已核验强势整理' if kind=='restart' else '最近完成日A' if kind=='sustained' else '25根核心历史',
+                                                bool(background_ok) if kind=='sustained' or bg['valid'] or kind=='breakout' and core['passed'] is True else bg['checked'] if kind=='restart' else None),
+                     check('冻结尺度锚点',frozen_scale_ready,'可核验',frozen_scale_ready)]
+            if kind!='sustained':
+                checks+=[compare('冻结ATR',frozen_atr,p['atr_min_yuan']),compare('价格突破冻结平台+缓冲',price,h+buffer if number(h) and number(buffer) else None,True)]
+            checks+=[compare('R0%',r0,p[kind]['r0_pct']),compare('E0百分点',e0,p[kind]['e0_pp']),compare('守开盘价',price,opening)]
+            checks += [compare('守MA'+str(n)+'*',price,ma.get(n,ma.get(str(n)))) for n in p[kind]['ma_periods']]
+            official=verdict(checks)
+            warning_checks=[c for c in checks if c['key'] not in ('R0%','E0百分点')]+[compare('预警R0%',r0,p['warning']['r0_pct']),compare('预警E0百分点',e0,p['warning']['e0_pp'])]
+            warning=kind=='breakout' and verdict(warning_checks) is True
+            price_alert=kind!='sustained' and number(h) and number(buffer) and number(price) and price>h+buffer and not market_ready
+            if not event and (official is True or warning or price_alert) and at:
+                event=event_new(code,kind,anchor,h,frozen_atr,context,at,asof,bg if kind=='restart' else None)
+                event['new_version_observation']=scale_changed
+                event['first_observed_price']=price
+                event['reference_date']=context.get('last_history_date')
+                event['reference_price']=(context.get('aligned_bars') or [{}])[-1].get('close')
+                if scale_changed:
+                    event['event_id']=hashlib.sha256((event['event_id']+'|scale|'+str(event['reference_price'])).encode()).hexdigest()[:24]
+            category=dict(qualified=official,checks=checks[len(common):],warning=warning,price_alert=price_alert,event=copy.deepcopy(event))
+            if event:
+                if official is True and sampling:
+                    event['last_formal_daily_asof']=asof;event['last_formal_daily_tier']=row.get('trend_tier')
+                first=event.get('first_formal_at'); counted_calendar=calendar+([] if session=='非交易日' else [day])
+                passed_days=[d for d in sorted(set(counted_calendar)) if first and first[:10]<=d<=day]
+                expired=kind!='sustained' and len(passed_days)>p['event_window_days']
+                maintenance=copy.deepcopy(common)+[compare('维持R0%',r0,p['maintenance_r0_pct'],True),compare('维持E0百分点',e0,p['maintenance_e0_pp'],True),compare('守开盘价',price,opening)]+[compare('守MA'+str(n)+'*',price,ma.get(n,ma.get(str(n)))) for n in p[kind]['ma_periods']]
+                if kind!='sustained': maintenance.append(compare('守冻结平台',price,h,True))
+                maintenance.append(check('冻结尺度锚点',frozen_scale_ready,'可核验',frozen_scale_ready))
+                if kind=='restart':maintenance.append(check('原整理背景仍成立',bg,'原背景同锚点可核验',bg['checked'] if not bg['valid'] else bg['anchor']==event['anchor']))
+                maintain=verdict(maintenance)
+                seq=event.get('sequence') or {}; last=stamp(seq.get('last_at'))
+                same_period=seq.get('day')==day and seq.get('part')==part(at) and part(at)==part(now)
+                last_effective=stamp(event.get('last_source_at')) or last
+                contiguous=bool(last_effective and at and 0<=(at-last_effective).total_seconds()<=p['max_sample_gap_seconds'])
+                event['continuity']=dict(previous_source_at=str(last_effective) if last_effective else None,source_at=str(at) if at else None,
+                    gap_seconds=(at-last_effective).total_seconds() if at and last_effective else None,same_period=same_period,sampling=sampling,contiguous=contiguous)
+                reset_reason=None
+                active=False
+                if expired:
+                    reset_reason='事件分类窗口已结束'
+                    status='突破后跟踪' if kind=='breakout' else '再启动后跟踪';event['sequence']={}
+                    if maintain is False:event['ended_at']=event.get('ended_at') or str(at)
+                elif not sampling:
+                    reset_reason='本时段不新增连续竞价确认'
+                    status='竞价观察' if session in ('盘前','集合竞价','竞价结束') else '待收盘核验' if session=='已收盘' else '判断暂停'
+                    # 14:57后仅撤销，不能新确认；保留最后连续竞价事实。
+                    if session in ('尾盘','已收盘') and now.strftime('%H:%M:%S')>=p['continuous_pm'][1] and seq.get('confirmed') and seq.get('day')==day and contiguous and seq.get('part')=='PM' and maintain is True:
+                        status='当前已确认·待收盘核验';active=True;reset_reason=None
+                    elif session not in ('午间休市',): event['sequence']={}
+                elif row.get('intraday_serious_weakness') is True and code in valid:
+                    reset_reason='严重转弱'
+                    status='严重转弱';event['sequence']={};event['ended_at']=event.get('ended_at') or str(at)
+                elif scale_changed or any(c['passed'] is None for c in maintenance):
+                    status='判断暂停';event['sequence']={};reset_reason='数据或尺度待核验：'+'、'.join(c['key'] for c in maintenance if c['passed'] is None)
+                elif at and stamp(event.get('high_water_at')) and at < stamp(event['high_water_at']):
+                    status='判断暂停';event['sequence']={};reset_reason='源报价时间倒退'
+                elif seq.get('confirmed') and same_period and contiguous and maintain is True:
+                    status='当前已确认' if official is True else '已确认，进攻减速';active=True
+                elif official is True:
+                    if seq.get('count') and not same_period:reset_reason='跨日或跨半日重新确认'
+                    elif seq.get('count') and not contiguous:reset_reason='相邻源报价间隔超限或倒退'
+                    event['first_formal_at']=event.get('first_formal_at') or str(at)
+                    if not event.get('first_formal_price'):event['first_formal_price']=price
+                    can_sample=not event.get('high_water_at') or at>stamp(event['high_water_at']) or bool(seq.get('count'))
+                    event['sequence']=sample(seq,at,can_sample,now)
+                    active=event['sequence'].get('confirmed',False)
+                    status='当前已确认' if active else '待采样确认'
+                    if active:
+                        if not event.get('first_confirmed_at'):
+                            event['first_confirmed_at']=str(at);event['first_confirmed_price']=price
+                        event['last_reconfirmed_at']=str(at)
+                else:
+                    reset_reason='有效条件未成立：'+'、'.join(c['key'] for c in maintenance if c['passed'] is False)
+                    status='突破预警' if warning else '价格越界，超额待核验' if price_alert else '突破回落' if kind!='sustained' and number(price) and number(h) and price<=h else '进攻暂停'
+                    event['sequence']={}
+                    if not warning and not price_alert: event['ended_at']=event.get('ended_at') or str(at)
+                event.update(status=status,last_price=price,last_source_at=str(at) if at else None,
+                             last_M0=m0,last_E0=e0,active=active,expired=expired,reset_reason=reset_reason)
+                if code in valid and context.get('valid') is True:
+                    event['last_valid_price']=price;event['last_valid_quote_at']=str(at)
+                if active:event['ended_at']=None
+                if at and (not stamp(event.get('high_water_at')) or at>stamp(event['high_water_at'])):event['high_water_at']=str(at)
+                if len(event.get('history',[]))>p['history_in_state']:
+                    event['history']=event['history'][-p['history_in_state']:]
+                if previous_status!=status or not event.get('history'):
+                    point=dict(at=str(at) if at else str(now),status=status,price=price,M0=m0,E0=e0,
+                               reasons=[c['key'] for c in checks if c['passed'] is not True],reset_reason=reset_reason,continuity=copy.deepcopy(event['continuity']))
+                    event['history'].append(point)
+                    transitions.append(dict(event=copy.deepcopy(event),transition=point))
+                events[key]=event;category['event']=copy.deepcopy(event)
+                category['maintenance_checks']=maintenance[len(common):]
+                if active: result['labels'].append(LABELS[kind])
+            result['categories'][kind]=category
+        result['current']=bool(result['labels']); result['main_label']=next(iter(result['labels']),None)
+        states=[v['event']['status'] for v in result['categories'].values() if v.get('event')]
+        preferred=next((s for s in states if s=='待采样确认'),None) or next((s for s in states if s=='判断暂停'),None)
+        result['status']='进攻减速' if result['current'] and all('减速' in s for s in states if '确认' in s) else '当前已确认' if result['current'] else preferred or (states[0] if states else '判断暂停' if any(c['passed'] is None for c in common) else '未入选')
+        if row.get('intraday_serious_weakness') is True and code in valid:result['risk'].append('严重转弱：'+'、'.join(row.get('intraday_risk_flags') or []))
+        result['opportunity_kinds']=[LABELS[k] for k,v in result['categories'].items() if v.get('event') or v.get('warning') or v.get('price_alert')]
+        result['display_label']=result['main_label'] or next((LABELS[k] for k,v in result['categories'].items() if (v.get('event') or {}).get('status')=='待采样确认'),None) or next((LABELS[k] for k,v in result['categories'].items() if v.get('warning') or v.get('price_alert')),None) or next(iter(result['opportunity_kinds']),None)
+        result['boards']=boards_for(code,snap,valid,eligible,market,board_index.get(code,[]))
+        if any(v.get('event',{}).get('new_version_observation') for v in result['categories'].values() if v.get('event')):
+            result['risk'].append('新版本/尺度观察，不视为经济新启动')
+        result['board_relation_status']='已读取同花顺确认成员' if result['boards'] else '板块关系待核验'
+        result['reasons']={k:[c['key']+('：待核验' if c['passed'] is None else '：未通过') for c in v['checks'] if c['passed'] is not True] for k,v in result['categories'].items()}
+        outputs[code]=result
+    ordered=sorted(outputs.values(),key=sort_key)
+    for rank,item in enumerate(ordered,1):item['sort_rank']=rank
+    warning_codes={r['code'] for r in ordered if not r['current'] and r['status']!='待采样确认' and any(v.get('warning') or v.get('price_alert') for v in r['categories'].values())}
+    lists=dict(current=[r['code'] for r in ordered if r['current'] and not r['trade_restriction']],
+               limited=[r['code'] for r in ordered if r['current'] and r['trade_restriction']],
+               pending=[r['code'] for r in ordered if not r['current'] and r['status']=='待采样确认'],
+               warning=[r['code'] for r in ordered if r['code'] in warning_codes],
+               tracking=[r['code'] for r in ordered if not r['current'] and r['code'] not in warning_codes and any(v.get('event') for v in r['categories'].values()) and r['status']!='待采样确认'])
+    model=dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,parameters=copy.deepcopy(p),day=day,daily_asof=asof,judged_at=str(now),source_at=market['source_at'],phase=session,
+               market=market,by_code=outputs,lists=lists,counts={k:len(v) for k,v in lists.items()},frozen=False,presentation=presentation(session,sampling),repair_version=REPAIR_VERSION)
+    model['counts']['confirmed_total']=len(lists['current'])+len(lists['limited'])
+    snap['radar_opportunity']=model
+    review_close(snap,model,events,histories,calendar,contexts,quotes,day)
+    bundle=close_bundle(snap,model['close_review'],events) if model.get('close_review') else None
+    attach_close_archive(model,bundle,persist)
+    for row in (snap.get('stocks') or [])+(snap.get('coverage_catalog') or []):
+        row['radar_opportunity']=copy.deepcopy(outputs[str(row['code'])])
+    model['by_code']={code:list_record(item) for code,item in outputs.items()}
+    state.update(version=VERSION,universe_day=day,universe=universe,events=events,environment=environment)
+    if persist:
+        folder=directory();folder.mkdir(parents=True,exist_ok=True)
+        config.atomic_write_text(folder/'state.json',json.dumps(state,ensure_ascii=False,separators=(',',':')))
+        # Immutable transition observations, same generation/stock pool/relationships as this scan.
+        record=dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,repair_version=REPAIR_VERSION,day=day,generated_at=snap.get('generated_at'),market=market,transitions=transitions,
+                    original_lists={key:[r['code'] for r in rows.values() if r.get(key)] for key in ('attack_watch_candidate','startup_candidate')},
+                    daily_A=[r['code'] for r in rows.values() if r.get('trend_tier')=='A'],
+                    lists=lists,pool=sorted(eligible),board_members={b.get('id'):b.get('member_codes') for b in snap.get('board_catalog') or []},
+                    benchmark_prices={c:dict(price=quotes[c].get('price'),last_close=quotes[c].get('last_close'),
+                                             reference_date=(contexts.get(c) or {}).get('expected_history_date') or max((d for d in calendar if d<valid[c]['source_at'][:10]),default=None),
+                                             source_at=valid[c]['source_at']) for c in valid},
+                    observations=[dict(code=r['code'],source_at=r['source_at'],price=r['price'],R0=r['R0'],E0=r['E0'],status=r['status'],labels=r['labels'],
+                                       boards=r['boards'],risk=r['risk'],trade_restriction=r['trade_restriction'],
+                                       price_basis_comparable=(contexts.get(r['code']) or {}).get('valid') is True,
+                                       last_close=(quotes.get(r['code']) or {}).get('last_close'),
+                                       reference_date=(contexts.get(r['code']) or {}).get('expected_history_date') or max((d for d in calendar if r['source_at'] and d<r['source_at'][:10]),default=None),
+                                       events=[dict(event_id=v['event']['event_id'],kind=k,status=v['event']['status'],first_formal_at=v['event']['first_formal_at'],
+                                                    first_confirmed_at=v['event']['first_confirmed_at'],close_review=v.get('close_review'),sequence=v['event'].get('sequence'),continuity=v['event'].get('continuity'),reset_reason=v['event'].get('reset_reason')) for k,v in r['categories'].items() if v.get('event')])
+                                  for r in ordered if any(c.get('event') for c in r['categories'].values())])
+        with (folder/(day+'.jsonl')).open('a',encoding='utf-8') as stream:stream.write(json.dumps(record,ensure_ascii=False,separators=(',',':'))+'\n')
+    return model
+
+
+def record_publication(snapshot,generation,data_version):
+    """服务发布回执单独关联源扫描，不修改任何原事件或离线历史。"""
+    model=snapshot.get('radar_opportunity') or {}
+    if model.get('version')!=VERSION:return
+    folder=directory();folder.mkdir(parents=True,exist_ok=True)
+    record=dict(version=VERSION,generation=generation,data_version=data_version,
+                generated_at=snapshot.get('generated_at'),source_at=model.get('source_at'),counts=model.get('counts'))
+    with (folder/'publications.jsonl').open('a',encoding='utf-8') as stream:stream.write(json.dumps(record,ensure_ascii=False,separators=(',',':'))+'\n')
+
+
+def closing_risk(bar, r0, quote, lines):
+    """正式OHLC复核沿用现有严重转弱规则；不改写盘中风险字段。"""
+    if not intraday._valid_historical_price_bar(bar) or not number(r0):return None,[]
+    flags=[];cfg=config.INTRADAY_RISK
+    drop=intraday._drop_risk(r0,quote.get('limit_pct'))
+    if drop:flags.append(drop)
+    lock=intraday._limit_lock(dict(quote,price=bar['close'],high=bar['high'],low=bar['low']))
+    if lock=='一字跌停':flags.append(lock)
+    high,low,price=bar['high'],bar['low'],bar['close']
+    position=(price-low)/(high-low)*100 if high>low else None
+    if ((high/low-1)*100>=cfg['min_day_range_pct'] and (price/high-1)*100<=-cfg['high_pullback_min_pct']
+            and number(position) and position<=cfg['weak_day_position_max']*100):flags.append('明显冲高回落')
+    for n in (10,20):
+        if not number(lines.get(n)):return None,flags
+        if intraday.price_at_or_above_line(price,lines[n]) is False:flags.append('现价失守MA'+str(n))
+    return bool(flags),flags
+
+
+def review_close(snap,model,events,histories,calendar,contexts,quotes,day):
+    """只有正式完成K线与同日收市主板基准到库，才复核；不推进采样。"""
+    if snap.get('session')!='已收盘':return
+    p=config.RADAR_OPPORTUNITY;asof=(snap.get('strength_model') or {}).get('asof')
+    closing={}
+    for code in model['market'].get('eligible_codes',[]):
+        bars=sorted(histories.get(code) or [],key=lambda b:b['date'])
+        if len(bars)<2 or bars[-1]['date']!=day:continue
+        if not all(intraday._valid_historical_price_bar(b) for b in bars[-2:]):continue
+        if (bars[-1].get('price_basis'),bars[-1].get('price_basis_source'))!=(bars[-2].get('price_basis'),bars[-2].get('price_basis_source')):continue
+        closing[code]=100*(bars[-1]['close']/bars[-2]['close']-1)
+    expected=model['market']['expected_count'];daily_cover=len(closing)/expected*100 if expected else None
+    # M0仍是同批有效主板收市报价，不截断为有日线/可评分股票。
+    cover=model['market']['coverage_pct'];ready=asof==day and model['market']['ready']
+    m0=model['market']['M0'] if ready else None
+    reviews={}
+    for e in events.values():
+        if str(e.get('first_formal_at') or '')[:10]!=day and str(e.get('last_source_at') or '')[:10]!=day:continue
+        code=e['code'];bars=sorted(histories.get(code) or [],key=lambda b:b['date']);ctx=contexts.get(code) or {};q=quotes.get(code) or {}
+        if ctx.get('valid') is not True and code in model['market'].get('valid_codes',[]):
+            ctx=intraday.align_price_basis(q,bars,calendar,day)
+        if not ready or code not in closing or ctx.get('valid') is not True or e.get('scale_identity')!=scale_identity(ctx):
+            item=dict(status='待收盘核验',reason='同日正式日线、收市基准或价格尺度未齐备',checks=[])
+        else:
+            aligned=[dict(b,**{k:b[k]*ctx['scale_factor'] for k in ('open','high','low','close')}) for b in bars if b['date']<=day]
+            b=aligned[-1];r=closing[code];kind=e['kind'];h=e.get('platform');buf=max(p['buffer_yuan'],p['buffer_atr']*e['atr']) if number(e.get('atr')) else None
+            checks=[compare('收盘R0%',r,p[kind]['r0_pct']),compare('收盘E0百分点',r-m0,p[kind]['e0_pp']),
+                    compare('守正式开盘价',b['close'],bars[-1]['open']*ctx['scale_factor'])]
+            core=history_check(ctx,bars,calendar,ctx.get('expected_history_date'));checks.append(core)
+            ref=next((a for a in aligned if a['date']==e.get('reference_date')),None)
+            if e.get('reference_date'):
+                tick=q.get('price_tick') if number(q.get('price_tick')) and q['price_tick']>0 else p['buffer_yuan']
+                checks.append(check('冻结尺度锚点',ref['close'] if ref else None,e.get('reference_price'),
+                    round(ref['close']/tick)==round(e['reference_price']/tick) if ref and number(e.get('reference_price')) else None))
+            for n in p[kind]['ma_periods']:checks.append(compare('守正式MA'+str(n),b['close'],mean(a['close'] for a in aligned[-n:])))
+            if kind!='sustained':checks.append(compare('收盘突破冻结平台+缓冲',b['close'],h+buf if number(h) and number(buf) else None,True))
+            row=model['by_code'].get(code,{})
+            risk,flags=closing_risk(b,r,q,{n:mean(a['close'] for a in aligned[-n:]) for n in (10,20)})
+            checks.append(check('收盘严重转弱',risk,'明确为否',not risk if risk is not None else None,'、'.join(flags) or None))
+            if kind=='restart':
+                original=next((a for a in (snap.get('stocks') or [])+(snap.get('coverage_catalog') or []) if a['code']==code),{})
+                bg=e.get('background') or {};ended=(original.get('trend_consolidation') or {}).get('trend_exited')
+                # 收盘按事前真实保存的背景复核，不把“盘后不新增整理判断”当成背景缺失。
+                checks.append(check('事前合格整理背景',bg,'冻结合格整理、同锚点、未明确结束',
+                    False if ended is True else bg.get('anchor')==e['anchor'] if bg.get('valid') is True else None))
+            if kind=='sustained':
+                # 同版本首次正式触发只可能在事前A背景通过时保存。兼容本轮早期真实记录，
+                # 只证明其首次触发当天；不能借该记录推定随后交易日仍为A。
+                prior_asof=e.get('last_formal_daily_asof')
+                actual_a=e.get('last_formal_daily_tier')=='A' if prior_asof else None
+                if not prior_asof and str(e.get('first_formal_at') or '')[:10]==day:
+                    prior_asof=e.get('background_date');actual_a=True if prior_asof else None
+                checks.append(check('盘中真实完成日A背景',dict(asof=prior_asof,tier='A' if actual_a else None),'事前完成日A',
+                    actual_a and str(prior_asof)<day if prior_asof else None))
+            item=dict(status='收盘确认' if verdict(checks) is True else '收盘未确认' if verdict(checks) is False else '待收盘核验',
+                      checks=checks,R0=r,E0=r-m0,M0=m0,close=b['close'],day=day)
+        reviews[e['event_id']]=item;e['close_review']=item
+        if code in model['by_code'] and e['kind'] in model['by_code'][code]['categories']:
+            model['by_code'][code]['categories'][e['kind']]['close_review']=item
+    counts={status:sum(r['status']==status for r in reviews.values()) for status in ('收盘确认','收盘未确认','待收盘核验')}
+    model['close_review']=dict(day=day,ready=ready,M0=m0,coverage_pct=cover,daily_coverage_pct=daily_cover,counts=counts,events=reviews)
+
+
+def _archived_v1_validate(snap):
+    """验收为只读；核对完整/摘要/详情共同使用的后端名单。"""
+    model=snap['radar_opportunity'];assert model['version']==VERSION
+    assert json.loads(json.dumps(model['parameters']))==json.loads(json.dumps(config.RADAR_OPPORTUNITY))
+    rows={r['code']:r for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
+    for code,brief in model['by_code'].items():
+        item=rows[code]['radar_opportunity']
+        assert list_record(item)==brief
+        if number(item['R0']) and number(item['M0']):assert item['E0']==item['R0']-item['M0']
+        assert item['main_label']==next(iter(item['labels']),None)
+        for kind,category in item['categories'].items():
+            assert category['qualified']==verdict(item['admission_checks']+category['checks'])
+            event=category.get('event')
+            if event and event.get('active'):
+                seq=event['sequence'];assert seq['confirmed'] and seq['count']>=config.RADAR_OPPORTUNITY['confirmation_samples']
+                assert seq['span_seconds']>=config.RADAR_OPPORTUNITY['confirmation_span_seconds']
+                assert event['first_confirmed_at']
+                assert LABELS[kind] in item['labels']
+    ordered=sorted(model['by_code'].values(),key=sort_key)
+    assert model['lists']['current']==[r['code'] for r in ordered if r['current'] and not r['trade_restriction']]
+    assert model['lists']['limited']==[r['code'] for r in ordered if r['current'] and r['trade_restriction']]
+    for key,codes in model['lists'].items():assert len(codes)==len(set(codes)) and len(codes)==model['counts'][key]
+    if model.get('last_close_review'):
+        review=model['last_close_review'];confirmed=[r for r in review['records'] if r['status']=='收盘确认']
+        assert review['day']<=model['day'] and review['version']==VERSION
+        assert len(confirmed)==review['event_counts']['收盘确认']
+        assert len({r['code'] for r in confirmed})==review['stock_counts']['收盘确认']==len(review['stock_rows'])
+        assert len({r['event_id'] for r in review['records']})==len(review['records'])
+    return model['counts']
+
+
+def build(snap, quotes, pool, contexts, histories, calendar, previous=None, state=None, persist=False, now=None):
+    """Current production projection; legacy sampling state is intentionally unused."""
+    import market_strength
+    market_strength.attach(snap,quotes,pool,histories,calendar,contexts=contexts,now=now,previous=previous)
+    return snap['radar_opportunity']
+
+
+def validate(snap):
+    import market_strength
+    return market_strength.validate(snap)

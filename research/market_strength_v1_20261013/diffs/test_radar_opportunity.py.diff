@@ -1,0 +1,445 @@
+--- before/test_radar_opportunity.py
++++ after/test_radar_opportunity.py
+@@ -1,387 +1,63 @@
++"""Current radar contract, replacing V1 confirmation/timer/window expectations.
++Old implementation and tests are preserved in the pre-change source backup.
++Price-basis, missing values and immutable history still have dedicated regression suites.
++"""
+ import copy
+ import json
+-import tempfile
+ import unittest
+-from datetime import datetime,timedelta
+-from pathlib import Path
+ from unittest.mock import patch
+-
+-import config
+-import intraday
+ import radar
+-import radar_opportunity as ro
+-import ui_payload
+-
++import radar_opportunity as R
++import market_strength as M
++from test_market_strength import fixture
+ 
+ class RadarOpportunityTests(unittest.TestCase):
+     def setUp(self):
+-        self.folder=tempfile.TemporaryDirectory();self.addCleanup(self.folder.cleanup)
+-        self.patch=patch.object(ro,'DIRECTORY',Path(self.folder.name));self.patch.start();self.addCleanup(self.patch.stop)
+-        self.codes=['600%03d'%i for i in range(10)]
+-        self.code=self.codes[0];self.at=datetime(2026,10,12,10)
+-        self.calendar=[];d=datetime(2026,7,1)
+-        while d<=datetime(2026,10,9):
+-            if d.weekday()<5:self.calendar.append(d.date().isoformat())
+-            d+=timedelta(days=1)
+-        self.history={c:[dict(date=d,open=10.,high=10.05,low=9.95,close=10.,volume=100,
+-                            price_basis='raw',price_basis_source=next(iter(intraday._RAW_HISTORY_SOURCES)),price_precision_digits=2) for d in self.calendar[-45:]] for c in self.codes}
+-        self.rows=[dict(code=c,name=c,trend_tier='C',signal_date='2026-10-09',intraday_serious_weakness=False,
+-                        intraday_risk_flags=[],intraday_trade_restriction=None,trade_status='trading') for c in self.codes]
+-        self.snap=dict(stocks=self.rows[:5],coverage_catalog=self.rows[5:],session='早盘',generated_at=str(self.at),strength_model={'asof':'2026-10-09'},board_catalog=[])
+-        self.pool={c:{'board_type':'sh_main'} for c in self.codes}
+-        self.quotes={c:dict(price=10.5 if c==self.code else 10.,open=10.,high=11.,low=9.9,last_close=10.,
+-                            change_pct=5. if c==self.code else 0.,amount_wan=100,quote_at=str(self.at),
+-                            price_basis='raw',price_basis_source=next(iter(intraday._RAW_QUOTE_SOURCES)),last_close_semantics='previous_trade_day_raw_close',
+-                            last_close_precision_digits=2) for c in self.codes}
+-
+-    def run_round(self,seconds=0,session=None,advance=True):
+-        self.at+=timedelta(seconds=seconds)
+-        if session:self.snap['session']=session
+-        self.snap['generated_at']=str(self.at)
+-        if advance:
+-            for q in self.quotes.values():q['quote_at']=str(self.at)
+-        ctx={c:intraday.align_price_basis(q,self.history.get(c,[]),self.calendar, self.at.date().isoformat()) for c,q in self.quotes.items()}
+-        result=radar.build_opportunities(self.snap,self.quotes,self.pool,ctx,self.history,self.calendar,state=ro.load_state(),persist=True,now=self.at)
+-        ro.validate(self.snap)
+-        return next(r['radar_opportunity'] for r in self.rows if r['code']==self.code)
+-
+-    def confirm(self):
+-        self.run_round();return self.run_round(300)
+-
+-    def test_non_a_and_yesterday_a_breakout_both_allowed(self):
+-        result=self.confirm();self.assertTrue(result['current']);self.assertIn('突破启动',result['labels'])
+-        self.rows[0]['trend_tier']='A';result=self.run_round(300);self.assertIn('持续进攻',result['labels']) if result['categories']['sustained']['event']['sequence']['confirmed'] else self.assertEqual(result['categories']['sustained']['event']['status'],'待采样确认')
+-        result=self.run_round(300);self.assertEqual(result['labels'],['突破启动','持续进攻'])
+-
+-    def test_down_a_keeps_daily_background_not_opportunity(self):
+-        self.rows[0]['trend_tier']='A';self.quotes[self.code].update(price=9.9,change_pct=-1)
+-        r=self.run_round();self.assertFalse(r['current']);self.assertEqual(r['daily_tier'],'A')
+-
+-    def test_non_a_qualified_completed_consolidation_restart(self):
+-        self.rows[0]['trend_consolidation']=dict(eligible=False,phase='completed',completion_confirmed=True,consolidation_start='2026-10-01',consolidation_asof='2026-10-08',platform_high=10.05)
+-        r=self.confirm();self.assertEqual(r['main_label'],'强势再启动');self.assertIn('突破启动',r['labels'])
+-
+-    def test_repair_without_platform_break_not_restart(self):
+-        self.rows[0]['trend_consolidation']=dict(eligible=True,consolidation_start='2026-10-01',baseline_asof='2026-10-09',platform_high=11.)
+-        r=self.confirm();self.assertNotIn('强势再启动',r['labels'])
+-
+-    def test_repeated_quote_generation_never_confirms(self):
+-        self.run_round();r=self.run_round(30,advance=False);r=self.run_round(30,advance=False)
+-        self.assertFalse(r['current']);self.assertEqual(r['categories']['breakout']['event']['sequence']['count'],1)
+-
+-    def test_short_span_three_samples_still_pending(self):
+-        self.run_round();self.run_round(100);r=self.run_round(100);self.assertEqual(r['status'],'待采样确认')
+-
+-    def test_missing_data_pause_recovery_requires_two_new_quotes(self):
+-        self.confirm();self.quotes[self.code].pop('open');r=self.run_round(300)
+-        self.assertEqual(r['categories']['breakout']['event']['status'],'判断暂停')
+-        self.quotes[self.code]['open']=10.;r=self.run_round(300);self.assertFalse(r['current'])
+-        self.assertTrue(self.run_round(300)['current'])
+-
+-    def test_same_quote_after_data_pause_not_counted(self):
+-        self.run_round();self.quotes[self.code].pop('open');self.run_round(0,advance=False)
+-        self.quotes[self.code]['open']=10.;r=self.run_round(0,advance=False)
+-        self.assertEqual(r['categories']['breakout']['event']['sequence']['count'],0)
+-
+-    def test_lunch_freeze_and_pm_reset(self):
+-        r=self.confirm();old=copy.deepcopy(self.snap);self.at=datetime(2026,10,12,12)
+-        self.snap['session']='午间休市';self.snap['generated_at']=str(self.at)
+-        m=ro.build(self.snap,self.quotes,self.pool,{},self.history,self.calendar,previous=old,state=ro.load_state(),persist=True,now=self.at)
+-        self.assertEqual(m['by_code'][self.code],ro.list_record(r))
+-        self.at=datetime(2026,10,12,13);r=self.run_round(session='午盘');self.assertFalse(r['current'])
+-        r=self.run_round(300);self.assertTrue(r['current']);self.assertEqual(r['categories']['breakout']['event']['first_confirmed_at'],'2026-10-12 10:05:00')
+-
+-    def test_gap_over_600_resets(self):
+-        self.run_round();r=self.run_round(601);self.assertFalse(r['current']);self.assertEqual(r['categories']['breakout']['event']['sequence']['count'],1)
+-
+-    def test_benchmark_full_universe_including_coverage(self):
+-        self.run_round();m=self.snap['radar_opportunity']['market'];self.assertEqual(m['valid_count'],10);self.assertEqual(m['M0'],.5)
+-
+-    def test_coverage_boundary_unrounded_and_null(self):
+-        for c in self.codes[-2:]:self.quotes[c].pop('open')
+-        self.run_round();self.assertEqual(self.snap['radar_opportunity']['market']['coverage_pct'],80.)
+-        self.quotes[self.codes[-3]].pop('open');r=self.run_round(300)
+-        self.assertIsNone(r['E0']);self.assertFalse(r['current']);self.assertTrue(r['categories']['breakout']['price_alert'])
+-
+-    def test_price_warning_lower_gate_not_confirmed(self):
+-        self.quotes[self.code].update(price=10.25,change_pct=2.5);r=self.confirm()
+-        self.assertFalse(r['current']);self.assertTrue(r['categories']['breakout']['warning'])
+-
+-    def test_deceleration_maintenance_platform_drop_immediate(self):
+-        original=self.confirm()['categories']['breakout']['event'];self.quotes[self.code].update(price=10.15,change_pct=1.5)
+-        r=self.run_round(300);self.assertTrue(r['current']);self.assertEqual(r['status'],'进攻减速')
+-        self.quotes[self.code].update(price=10.05,change_pct=.5);r=self.run_round(300)
+-        self.assertFalse(r['current']);self.assertEqual(r['categories']['breakout']['event']['status'],'突破回落')
+-        self.assertEqual(r['categories']['breakout']['event']['first_confirmed_at'],original['first_confirmed_at'])
+-
+-    def test_platform_atr_not_drift_with_today_high(self):
+-        r=self.confirm();old=r['categories']['breakout']['event'];self.quotes[self.code]['high']=20.
+-        r=self.run_round(300);new=r['categories']['breakout']['event']
+-        for key in ('event_id','platform','atr','first_observed_at','first_confirmed_at'):self.assertEqual(old[key],new[key])
+-
+-    def test_serious_unknown_not_zero_and_risk_cancels(self):
+-        self.confirm();self.rows[0]['intraday_serious_weakness']=None;r=self.run_round(300);self.assertFalse(r['current']);self.assertEqual(r['status'],'判断暂停')
+-        self.rows[0]['intraday_serious_weakness']=True;r=self.run_round(300);self.assertFalse(r['current']);self.assertEqual(r['status'],'严重转弱')
+-
+-    def test_limited_section_multilabel_no_duplicates(self):
+-        self.rows[0]['trend_tier']='A';self.rows[0]['intraday_trade_restriction']='一字涨停'
+-        r=self.confirm();self.assertTrue(r['current']);self.assertEqual(self.snap['radar_opportunity']['lists']['limited'],[self.code]);self.assertEqual(self.snap['radar_opportunity']['lists']['current'],[])
+-
+-    def test_board_cannot_rescue_stock_or_bonus_sort(self):
+-        self.snap['board_catalog']=[dict(id='industry:x',name='x',type='industry',member_codes=self.codes,opportunity=dict(day='2026-10-12',judgment_at=str(self.at),current_opportunity=True,current={'sample_at':str(self.at)}))]
+-        self.quotes[self.code].update(price=10.1,change_pct=1);r=self.confirm();self.assertFalse(r['current']);self.assertTrue(r['boards'][0]['selected'])
+-
+-    def test_core_missing_or_scale_unknown_no_qualification(self):
+-        self.history[self.code].pop(-3);r=self.run_round();self.assertFalse(r['current']);self.assertIsNone(r['categories']['breakout']['qualified'])
+-
+-    def test_new_day_and_three_trade_day_window(self):
+-        r=self.confirm();original=r['categories']['breakout']['event'];self.at=datetime(2026,10,15,10)
+-        # Construct subsequent completed bars; the event remains anchored to original H.
+-        for c in self.codes:
+-            for d in ['2026-10-12','2026-10-13','2026-10-14']:
+-                self.history[c].append(dict(self.history[c][-1],date=d))
+-        self.calendar+=['2026-10-12','2026-10-13','2026-10-14'];self.snap['strength_model']['asof']='2026-10-14'
+-        for row in self.rows:row['signal_date']='2026-10-14'
+-        r=self.run_round();self.assertFalse(r['current']);self.assertEqual(r['categories']['breakout']['event']['status'],'突破后跟踪');self.assertEqual(r['categories']['breakout']['event']['event_id'],original['event_id'])
+-
+-    def test_tail_no_new_confirmation(self):
+-        self.at=datetime(2026,10,12,14,55);self.run_round(session='尾盘');r=self.run_round(300)
+-        self.assertFalse(r['current']);self.assertFalse(r['categories']['breakout']['event']['sequence'].get('confirmed',False))
+-
+-    def test_restart_legacy_rows_and_raw_bars_unchanged(self):
+-        old=copy.deepcopy(self.snap);bars=copy.deepcopy(self.history);self.run_round()
+-        new=copy.deepcopy(self.snap)
+-        for r in new['stocks']+new['coverage_catalog']:r.pop('radar_opportunity')
+-        new.pop('radar_opportunity');self.assertEqual(old,new);self.assertEqual(bars,self.history)
+-
+-    def test_empty_and_no_disk_writes_on_offline_projection(self):
+-        self.quotes[self.code].update(price=10,change_pct=0);r=self.confirm();self.assertFalse(r['current'])
+-        state=(Path(self.folder.name)/'state.json').read_bytes();ui_payload.summary(self.snap,'a'*24)
+-        self.assertEqual(state,(Path(self.folder.name)/'state.json').read_bytes())
+-
+-    def test_restart_same_version_repeat_no_extra_confirmation(self):
+-        self.run_round();state=ro.load_state();r=self.run_round(0,advance=False);self.assertEqual(state['events'][self.code+'|breakout']['sequence'],r['categories']['breakout']['event']['sequence'])
+-
+-    def test_sort_uses_excess_then_existing_score_not_label(self):
+-        rows=[dict(code='2',E0=3,live_attack_score=None,R0=4),dict(code='1',E0=2,live_attack_score=99,R0=5),dict(code='3',E0=3,live_attack_score=10,R0=4)]
+-        self.assertEqual([r['code'] for r in sorted(rows,key=ro.sort_key)],['3','2','1'])
+-
+-    def test_market_environment_two_real_samples(self):
+-        self.run_round();self.assertEqual(self.snap['radar_opportunity']['market']['environment']['label'],'未知')
+-        self.run_round(300);self.assertEqual(self.snap['radar_opportunity']['market']['environment']['label'],'分化')
+-
+-    def test_quote_regression_is_paused(self):
+-        self.confirm();self.at-=timedelta(seconds=60);r=self.run_round();self.assertFalse(r['current']);self.assertEqual(r['status'],'判断暂停')
+-
+-    def test_coverage_7999_and_8000_of_10000(self):
+-        template=copy.deepcopy(self.quotes[self.code]);all_codes=['60%04d'%i for i in range(10000)]
+-        self.pool={c:{'board_type':'sh_main'} for c in all_codes}
+-        self.quotes={c:dict(template,change_pct=5. if c==self.code else 0.) for c in all_codes[:7999]}
+-        r=self.run_round();market=self.snap['radar_opportunity']['market'];self.assertAlmostEqual(market['coverage_pct'],79.99);self.assertIsNone(market['M0']);self.assertFalse(r['current'])
+-        self.quotes[all_codes[7999]]=dict(template,change_pct=0.)
+-        self.run_round(300);self.assertEqual(self.snap['radar_opportunity']['market']['coverage_pct'],80.);self.assertTrue(self.snap['radar_opportunity']['market']['ready'])
+-
+-    def test_scale_change_restarts_observation_not_economic_new_event(self):
+-        old=self.confirm()['categories']['breakout']['event']
+-        self.history[self.code][-1]['close']=9.99;self.quotes[self.code]['last_close']=9.99
+-        r=self.run_round(300);self.assertFalse(r['current']);e=r['categories']['breakout']['event']
+-        self.assertTrue(e['new_version_observation']);self.assertNotEqual(e['event_id'],old['event_id'])
+-
+-    def test_auction_independent_price_warning_no_confirmation(self):
+-        self.at=datetime(2026,10,12,9,25);r=self.run_round(session='竞价结束')
+-        self.assertFalse(r['current']);self.assertTrue(r['categories']['breakout']['price_alert']);self.assertEqual(r['categories']['breakout']['event']['sequence'],{})
+-
+-    def test_new_breakout_requires_old_end_two_closes_and_later_anchor(self):
+-        old=self.confirm()['categories']['breakout']['event'];self.quotes[self.code].update(price=10.,change_pct=0.)
+-        self.run_round(300)
+-        for c in self.codes:
+-            for d in ['2026-10-12','2026-10-13','2026-10-14','2026-10-15']:
+-                b=dict(self.history[c][-1],date=d)
+-                if d=='2026-10-15' and c==self.code:b.update(close=10.1,high=10.15)
+-                self.history[c].append(b)
+-        self.calendar+=['2026-10-12','2026-10-13','2026-10-14','2026-10-15'];self.snap['strength_model']['asof']='2026-10-15'
+-        for row in self.rows:row['signal_date']='2026-10-15'
+-        self.at=datetime(2026,10,16,10);self.quotes[self.code].update(price=10.6,last_close=10.1,change_pct=4.95)
+-        r=self.run_round();new=r['categories']['breakout']['event'];self.assertNotEqual(old['event_id'],new['event_id']);self.assertEqual(new['anchor'],'2026-10-15');self.assertEqual(new['first_formal_at'],'2026-10-16 10:00:00')
+-
+-    def test_withdrawn_consolidation_cannot_maintain_restart(self):
+-        self.rows[0]['trend_consolidation']=dict(eligible=True,consolidation_start='2026-10-01',baseline_asof='2026-10-09',platform_high=10.05)
+-        self.confirm();self.rows[0]['trend_consolidation'].update(trend_exited=True,eligible=False,phase='withdrawn')
+-        r=self.run_round(300);self.assertNotIn('强势再启动',r['labels'])
+-
+-    def test_empty_state_recovers_same_version_snapshot(self):
+-        original=self.run_round();old=copy.deepcopy(self.snap);self.at+=timedelta(seconds=300)
+-        for q in self.quotes.values():q['quote_at']=str(self.at)
+-        self.snap['generated_at']=str(self.at)
+-        ctx={c:intraday.align_price_basis(q,self.history[c],self.calendar,self.at.date().isoformat()) for c,q in self.quotes.items()}
+-        ro.build(self.snap,self.quotes,self.pool,ctx,self.history,self.calendar,previous=old,state={},now=self.at)
+-        e=self.rows[0]['radar_opportunity']['categories']['breakout']['event']
+-        self.assertEqual(e['first_observed_at'],original['categories']['breakout']['event']['first_observed_at']);self.assertTrue(e['sequence']['confirmed'])
+-
+-    def test_state_follows_test_snapshot_directory(self):
+-        with patch.object(ro,'DIRECTORY',ro._DEFAULT_DIRECTORY),patch.object(config,'SNAPSHOT_JSON',Path(self.folder.name)/'snapshot.json'):
+-            self.assertEqual(ro.directory(),Path(self.folder.name)/'radar_opportunity_v1')
+-
+-    def test_peer_reference_independent_of_board_opportunity_confirmation(self):
+-        self.snap['board_catalog']=[dict(id='industry:x',name='x',type='industry',member_codes=self.codes[:6],opportunity=dict(day='2026-10-12',judgment_at=str(self.at),current_opportunity=True,current={'sample_at':str(self.at)}))]
+-        self.quotes[self.code].update(price=10,change_pct=0)
+-        for c in self.codes[1:6]:self.quotes[c].update(price=10.2,change_pct=2.)
+-        self.at=datetime(2026,10,12,13);r=self.run_round(session='午盘')
+-        self.assertIsNone(r['boards'][0]['selected']);self.assertTrue(r['boards'][0]['peers_qualified']);self.assertFalse(r['current'])
+-
+-    def test_maintenance_uses_latest_valid_quote_not_original_confirm_time(self):
+-        self.confirm();self.quotes[self.code].update(price=10.15,change_pct=1.5)
+-        for i in range(4):self.assertTrue(self.run_round(300)['current'])
+-
+-    def test_yesterday_reset_timestamps_keep_confirmed_until_real_gap(self):
+-        self.at=datetime(2026,10,12,14,17,15)
+-        self.run_round(session='午盘');r=self.run_round(561)
+-        old=copy.deepcopy(r['categories']['breakout']['event'])
+-        self.assertTrue(r['current'])
+-        self.assertTrue(self.run_round(411)['current'])
+-        r=self.run_round(210);e=r['categories']['breakout']['event']
+-        self.assertTrue(r['current']);self.assertEqual(e['event_id'],old['event_id'])
+-        self.assertEqual(e['first_confirmed_at'],old['first_confirmed_at'])
+-        self.assertEqual(e['continuity']['gap_seconds'],210)
+-        self.assertIsNone(e['reset_reason'])
+-        r=self.run_round(601);e=r['categories']['breakout']['event']
+-        self.assertFalse(r['current']);self.assertEqual(e['sequence']['count'],1)
+-        self.assertIn('间隔超限',e['reset_reason'])
+-
+-    def test_auction_stage_explains_disabled_market_not_bad_coverage(self):
+-        self.at=datetime(2026,10,12,9,24);self.run_round(session='集合竞价')
+-        m=self.snap['radar_opportunity']
+-        self.assertEqual(m['presentation']['default_view'],'follow')
+-        self.assertIn('尚未进入确认时段',m['presentation']['current_empty_message'])
+-        self.assertFalse(m['market']['enabled']);self.assertIn('尚未启用',m['market']['reason'])
+-        self.assertIsNone(m['market']['M0'])
+-        self.assertIsNone(m['market']['coverage_pct'])
+-        coverage=next(c for c in self.rows[0]['radar_opportunity']['admission_checks'] if c['key']=='主板报价覆盖%')
+-        self.assertIsNone(coverage['actual']);self.assertIsNone(coverage['passed'])
+-
+-    def test_close_records_count_events_and_unique_stocks_and_survive_next_day(self):
+-        self.rows[0]['trend_tier']='A';self.confirm()
+-        self.calendar.append('2026-10-12')
+-        for c in self.codes:self.history[c].append(dict(self.history[c][-1],date='2026-10-12',close=10.5 if c==self.code else 10.,high=11.))
+-        self.snap['strength_model']['asof']='2026-10-12'
+-        for row in self.rows:row['signal_date']='2026-10-12'
+-        self.at=datetime(2026,10,12,15);self.run_round(session='已收盘')
+-        m=self.snap['radar_opportunity'];review=copy.deepcopy(m['last_close_review'])
+-        self.assertEqual(m['presentation']['default_view'],'close')
+-        self.assertEqual(review['event_counts']['收盘确认'],2)
+-        self.assertEqual(review['stock_counts']['收盘确认'],1)
+-        self.assertEqual(review['stock_rows'][0]['labels'],['突破启动','持续进攻'])
+-        self.at=datetime(2026,10,13,9,24);self.run_round(session='集合竞价')
+-        self.assertEqual(self.snap['radar_opportunity']['last_close_review'],review)
+-
+-    def test_unknown_admission_records_explicit_pause_reason(self):
+-        self.confirm();self.quotes[self.code].pop('open')
+-        r=self.run_round(300);e=r['categories']['breakout']['event']
+-        self.assertIn('数据或尺度待核验',e['reset_reason'])
+-        self.assertEqual(e['sequence'],{})
+-
+-    def test_nontrading_day_is_not_an_extra_window_day(self):
+-        for d in ['2026-10-12','2026-10-13']:
+-            self.calendar.append(d)
+-            for c in self.codes:self.history[c].append(dict(self.history[c][-1],date=d))
+-        self.at=datetime(2026,10,14,10);self.snap['strength_model']['asof']='2026-10-13'
+-        for row in self.rows:row['signal_date']='2026-10-13'
+-        self.confirm()
+-        for d in ['2026-10-14','2026-10-15','2026-10-16']:
+-            self.calendar.append(d)
+-            for c in self.codes:self.history[c].append(dict(self.history[c][-1],date=d))
+-        self.at=datetime(2026,10,18,10);self.snap['strength_model']['asof']='2026-10-16'
+-        for row in self.rows:row['signal_date']='2026-10-16'
+-        r=self.run_round(session='非交易日');self.assertFalse(r['current']);self.assertIsNone(r['M0']);self.assertFalse(r['categories']['breakout']['event']['expired'])
+-
+-    def test_close_waits_for_formal_daily_and_never_adds_samples(self):
+-        old=self.confirm()['categories']['breakout']['event'];self.at=datetime(2026,10,12,15)
+-        r=self.run_round(session='已收盘');review=self.snap['radar_opportunity']['close_review']
+-        self.assertFalse(review['ready']);self.assertEqual(review['events'][old['event_id']]['status'],'待收盘核验')
+-        self.assertEqual(r['categories']['breakout']['event']['first_confirmed_at'],old['first_confirmed_at']);self.assertFalse(r['current'])
+-
+-    def test_formal_close_uses_frozen_platform_and_same_day_market(self):
+-        old=self.confirm()['categories']['breakout']['event'];self.calendar.append('2026-10-12')
+-        for c in self.codes:self.history[c].append(dict(self.history[c][-1],date='2026-10-12',close=10.5 if c==self.code else 10.,high=11.))
+-        self.snap['strength_model']['asof']='2026-10-12'
+-        for row in self.rows:row['signal_date']='2026-10-12'
+-        self.at=datetime(2026,10,12,15);self.run_round(session='已收盘')
+-        review=self.snap['radar_opportunity']['close_review'];self.assertTrue(review['ready']);self.assertAlmostEqual(review['M0'],.5)
+-        self.assertEqual(review['events'][old['event_id']]['status'],'收盘确认')
+-
+-    def test_same_version_parameter_changes_are_blocked_after_freeze(self):
+-        p=copy.deepcopy(config.RADAR_OPPORTUNITY)
+-        (Path(self.folder.name)/'rules_frozen.json').write_text(json.dumps(dict(version=ro.VERSION,parameters=p)),encoding='utf-8')
+-        p['restart']['r0_pct']=2.01
+-        with patch.object(config,'RADAR_OPPORTUNITY',p),self.assertRaisesRegex(ValueError,'已冻结'):self.run_round()
+-
+-    def test_formal_close_without_intraday_context_reuses_verified_price_basis(self):
+-        old=self.confirm()['categories']['breakout']['event'];self.calendar.append('2026-10-12')
+-        for c in self.codes:self.history[c].append(dict(self.history[c][-1],date='2026-10-12',close=10.5 if c==self.code else 10.,high=11.))
+-        self.snap['strength_model']['asof']='2026-10-12';self.at=datetime(2026,10,12,15,20)
+-        for q in self.quotes.values():q['quote_at']='2026-10-12 15:00:00'
+-        self.snap.update(session='已收盘',generated_at=str(self.at));self.rows[0]['intraday_serious_weakness']=None
+-        radar.build_opportunities(self.snap,self.quotes,self.pool,{},self.history,self.calendar,state=ro.load_state(),persist=True,now=self.at)
+-        ro.validate(self.snap);item=self.snap['radar_opportunity']['close_review']['events'][old['event_id']]
+-        self.assertEqual(item['status'],'收盘确认');self.assertIsNone(self.rows[0]['intraday_serious_weakness'])
+-        self.assertEqual(self.rows[0]['radar_opportunity']['categories']['breakout']['event']['first_confirmed_at'],old['first_confirmed_at'])
+-        record=json.loads((Path(self.folder.name)/'2026-10-12.jsonl').read_text(encoding='utf-8').splitlines()[-1])
+-        self.assertEqual(record['benchmark_prices'][self.code]['reference_date'],'2026-10-09')
+-
+-    def test_formal_close_risk_uses_actual_high_pullback_and_ma_loss(self):
+-        b=dict(open=10.,high=11.,low=9.,close=9.2,volume=100)
+-        risk,flags=ro.closing_risk(b,-8.,{}, {10:10.,20:10.})
+-        self.assertTrue(risk);self.assertIn('明显冲高回落',flags);self.assertIn('现价失守MA10',flags)
+-
+-    def test_same_version_saved_formal_a_trigger_is_valid_only_on_its_trigger_day(self):
+-        self.rows[0]['trend_tier']='A';old=self.confirm()['categories']['sustained']['event']
+-        state=ro.load_state()
+-        for e in state['events'].values():e.pop('last_formal_daily_asof',None);e.pop('last_formal_daily_tier',None)
+-        self.calendar.append('2026-10-12')
+-        for c in self.codes:self.history[c].append(dict(self.history[c][-1],date='2026-10-12',close=10.5 if c==self.code else 10.,high=11.))
+-        self.snap['strength_model']['asof']='2026-10-12';self.at=datetime(2026,10,12,15,20)
+-        for q in self.quotes.values():q['quote_at']='2026-10-12 15:00:00'
+-        self.snap.update(session='已收盘',generated_at=str(self.at))
+-        radar.build_opportunities(self.snap,self.quotes,self.pool,{},self.history,self.calendar,state=state,now=self.at)
+-        self.assertEqual(self.snap['radar_opportunity']['close_review']['events'][old['event_id']]['status'],'收盘确认')
+-
+-    def test_restart_close_uses_saved_qualified_background_not_new_close_setup(self):
+-        self.rows[0]['trend_consolidation']=dict(eligible=True,consolidation_start='2026-10-01',baseline_asof='2026-10-09',platform_high=10.05)
+-        old=self.confirm()['categories']['restart']['event'];self.calendar.append('2026-10-12')
+-        for c in self.codes:self.history[c].append(dict(self.history[c][-1],date='2026-10-12',close=10.5 if c==self.code else 10.,high=11.))
+-        self.snap['strength_model']['asof']='2026-10-12';self.rows[0]['trend_consolidation'].update(pending=True,reason='收盘不新增盘中整理判断')
+-        self.at=datetime(2026,10,12,15,20)
+-        for q in self.quotes.values():q['quote_at']='2026-10-12 15:00:00'
+-        self.snap.update(session='已收盘',generated_at=str(self.at))
+-        radar.build_opportunities(self.snap,self.quotes,self.pool,{},self.history,self.calendar,state=ro.load_state(),now=self.at)
+-        self.assertEqual(self.snap['radar_opportunity']['close_review']['events'][old['event_id']]['status'],'收盘确认')
+-
+-    def test_json_frozen_context_preserves_price_heat(self):
+-        self.quotes[self.code].update(price=11.,change_pct=10.,high=12.)
+-        ctx={c:intraday.align_price_basis(q,self.history[c],self.calendar,self.at.date().isoformat()) for c,q in self.quotes.items()}
+-        ctx=json.loads(json.dumps(ctx))
+-        ro.build(self.snap,self.quotes,self.pool,ctx,self.history,self.calendar,state={},now=self.at)
+-        self.assertIn('位置偏热',self.rows[0]['radar_opportunity']['risk'])
+-
+-    def test_duplicate_stock_coverage_uses_scored_row_and_counts_once(self):
+-        duplicate=copy.deepcopy(self.rows[0]);duplicate['intraday_serious_weakness']=None
+-        self.snap['coverage_catalog'].append(duplicate);self.rows[0]['trend_tier']='A'
+-        r=self.confirm();self.assertIn('持续进攻',r['labels']);self.assertEqual(self.snap['radar_opportunity']['market']['valid_count'],10)
+-        self.assertEqual(duplicate['radar_opportunity'],self.rows[0]['radar_opportunity'])
+-
+-    def test_data_pause_retains_last_valid_quote_price_time(self):
+-        old=self.confirm()['categories']['breakout']['event'];self.quotes[self.code].pop('open')
+-        new=self.run_round(300)['categories']['breakout']['event']
+-        self.assertEqual(new['status'],'判断暂停');self.assertEqual(new['last_valid_price'],old['last_valid_price']);self.assertEqual(new['last_valid_quote_at'],old['last_valid_quote_at'])
+-
+-    def test_zero_open_is_unknown_position_not_a_pass(self):
+-        self.quotes[self.code]['open']=0.;r=self.run_round()
+-        self.assertIsNone(r['open']);self.assertIsNone(next(c for c in r['categories']['breakout']['checks'] if c['key']=='守开盘价')['passed'])
+-
+-    def test_verified_zero_atr_uses_one_cent_buffer(self):
+-        for bars in self.history.values():
+-            for b in bars:b.update(high=10.,low=10.)
+-        r=self.confirm();self.assertTrue(r['current']);self.assertEqual(r['categories']['breakout']['event']['atr'],0.)
+-
+-
+-if __name__=='__main__':unittest.main()
++        self.f=fixture();self.s,self.q,self.p,self.h,self.c,self.now=self.f;self.code=next(iter(self.q))
++        self.q[self.code].update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
++    def run_round(self,**kw):
++        radar.build_opportunities(self.s,self.q,self.p,{},self.h,self.c,now=self.now,**kw)
++        R.validate(self.s);return self.s['stocks'][0]['market_strength']
++    def test_first_quote_admitted_no_confirmation(self):self.assertTrue(self.run_round(state={'events':{}})['focus'])
++    def test_repeated_quote_keeps_same_scores(self):
++        a=copy.deepcopy(self.run_round());self.assertEqual(a,self.run_round())
++    def test_state_samples_and_window_cannot_change_scores(self):
++        a=copy.deepcopy(self.run_round(state={}));self.assertEqual(a,self.run_round(state={'count':999,'confirmed':False,'span_seconds':0,'paused':True}))
++    def test_no_state_or_confirmation_cache_write(self):
++        with patch.object(R,'save_state',side_effect=AssertionError('legacy state write')) if hasattr(R,'save_state') else patch.object(R,'load_state',side_effect=AssertionError('legacy state read')):
++            self.assertTrue(self.run_round(persist=True)['focus'])
++    def test_today_negative_can_be_trend_strong(self):
++        for b in self.h[self.code][-10:]:b.update(open=120.,close=120.,high=120.5,low=119.5)
++        # Twenty-day gain remains intact at 119, below last close 120.
++        self.q[self.code].update(price=119.,last_close=120.,open=120.,high=120.,low=118.,change_pct=-.83)
++        r=self.run_round();self.assertTrue(r['trend_strong']);self.assertFalse(r['emotion_strong']);self.assertTrue(r['focus'])
++    def test_risk_and_limit_do_not_hide(self):
++        self.s['stocks'][0].update(intraday_serious_weakness=True,intraday_trade_restriction='涨停',intraday_risk_flags=['位置偏热','冲高回落'])
++        self.assertTrue(self.run_round()['focus'])
++    def test_board_does_not_rescue_or_block(self):
++        a=copy.deepcopy(self.run_round());self.s['board_catalog']=[];self.assertEqual(a,self.run_round())
++    def test_no_old_a_qualification(self):
++        self.s['stocks'][0].update(trend_tier='C',watch_candidate=False,intraday_trend_ok=False,persistent_strong=False)
++        self.assertTrue(self.run_round()['focus'])
++    def test_next_failed_round_exits(self):
++        self.run_round();self.q[self.code].update(price=100.,open=100.,high=101.,low=99.,change_pct=0.)
++        self.assertFalse(self.run_round()['focus'])
++    def test_core_history_missing_not_zero(self):
++        self.h[self.code]=[];r=self.run_round();self.assertIsNone(r['trend_score']);self.assertTrue(r['emotion_strong'])
++    def test_price_basis_unknown_blocks_only_trend(self):
++        self.q[self.code]['price_basis']=None;r=self.run_round();self.assertIsNone(r['trend_score']);self.assertTrue(r['emotion_strong'])
++    def test_unknown_atr_not_zero_or_one_cent(self):
++        self.h[self.code]=self.h[self.code][-20:];r=self.run_round();self.assertIsNone(r['trend_score']);self.assertTrue(r['emotion_strong'])
++    def test_zero_open_emotion_unknown_trend_still_valid(self):
++        self.q[self.code]['open']=0.;r=self.run_round();self.assertIsNone(r['emotion_score']);self.assertTrue(r['trend_strong'])
++    def test_future_quote_invalid(self):
++        self.q[self.code]['quote_at']='2026-10-13 10:10:00';r=self.run_round();self.assertIsNone(r['trend_score']);self.assertIsNone(r['emotion_score'])
++    def test_missing_quote_cannot_use_carried_price(self):
++        del self.q[self.code];r=self.run_round();self.assertFalse(r['focus']);self.assertIsNone(r['trend_score'])
++    def test_snapshot_json_roundtrip(self):
++        self.run_round();self.s=json.loads(json.dumps(self.s));self.run_round()
++    def test_public_build_reads_same_model(self):
++        R.build(self.s,self.q,self.p,{},self.h,self.c,now=self.now);R.validate(self.s);self.assertEqual(self.s['radar_opportunity']['lists']['current'],self.s['market_strength']['stocks']['focus'])
++    def test_raw_histories_and_pool_not_changed(self):
++        before=copy.deepcopy((self.q,self.p,self.h,self.c,[b['member_codes'] for b in self.s['board_catalog']]))
++        self.run_round();self.assertEqual(before,(self.q,self.p,self.h,self.c,[b['member_codes'] for b in self.s['board_catalog']]))

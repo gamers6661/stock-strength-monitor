@@ -1,0 +1,174 @@
+--- before/radar_ui.js
++++ after/radar_ui.js
+@@ -1,103 +1,76 @@
+-var RADAR_VIEW=null,RADAR_AUTO_VIEW=true,RADAR_KIND='',RADAR_REFERENCE='',RADAR_QUERY='';
+-function radarEvidenceValue(value){if(value==null)return '未知';if(typeof value==='boolean')return value?'是':'否';if(typeof value==='object')return value.reason||JSON.stringify(value);return String(value);}
+-function setRadarView(view){RADAR_AUTO_VIEW=false;RADAR_VIEW=view;renderRadar();}
+-function radarOpportunityRows(section){
+-  var m=DATA.radar_opportunity||{},codes=(m.lists||{})[section]||[];
+-  if(RADAR_QUERY)codes=Object.keys(m.by_code||{}).sort(function(a,b){return m.by_code[a].sort_rank-m.by_code[b].sort_rank;});
+-  return codes.map(function(c){return (m.by_code||{})[c];}).filter(function(r){
+-    if(!r)return false;
+-    var view=RADAR_VIEW||((m.presentation||{}).default_view)||'current';
+-    var kinds=view==='current'&&!RADAR_QUERY?(r.labels||[]):(r.opportunity_kinds||r.labels||[]);
+-    if(RADAR_KIND&&kinds.indexOf(RADAR_KIND)<0)return false;
+-    if(RADAR_REFERENCE==='peers'&&!(r.boards||[]).some(function(b){return b.peers_qualified===true;}))return false;
+-    if(RADAR_REFERENCE==='hot'&&(r.risk||[]).indexOf('位置偏热')<0)return false;
+-    if(RADAR_REFERENCE==='divergence'&&(r.risk||[]).indexOf('触板未封')<0)return false;
+-    return !RADAR_QUERY||String(r.code+' '+r.name).indexOf(RADAR_QUERY)>=0;
++/* Shared rendering of immutable backend results. No client scoring or admission. */
++var MS_VIEW={radar:{scope:'focus',sort:'combined',phase:'',q:'',limit:100},stocks:{scope:'focus',sort:'combined',phase:'',q:'',limit:100},industry:{scope:'focus',sort:'combined',phase:'',q:'',limit:100},theme:{scope:'focus',sort:'combined',phase:'',q:'',limit:100},overview:{scope:'focus',sort:'combined',phase:'',q:'',limit:100}};
++function msModel(){return DATA.market_strength||{};}
++function msRows(key){
++  var v=MS_VIEW[key],boards=key==='industry'||key==='theme',src=boards?(DATA.board_catalog||[]):(DATA.stocks||[]).concat(DATA.coverage_catalog||[]),map={};
++  src.forEach(function(r){map[boards?r.id:r.code]=r;});
++  var lists=msModel()[boards?'boards':'stocks']||{},ids=(lists.sorts||{})[v.sort]||lists.all||[],included={};
++  (lists[v.scope]||[]).forEach(function(c){included[c]=true;});
++  return ids.map(function(c){return map[c];}).filter(function(r){
++    if(!r||!included[boards?r.id:r.code])return false;
++    if(boards&&r.type!==key)return false;
++    if(key==='stocks'&&STATE.boardFilterId){var b=boardById(STATE.boardFilterId);if(b&&(b.member_codes||[]).indexOf(r.code)<0)return false;}
++    var m=r.market_strength||{};
++    return (!v.phase||m.phase===v.phase)&&(!v.q||String((r.code||'')+' '+r.name).indexOf(v.q)>=0);
+   });
+ }
+-function radarOpportunityTable(rows,title){
+-  var h='<div class="detail-panel"><div class="detail-panel-title">'+esc(title)+' · '+rows.length+'只</div>';
+-  if(!rows.length)return h+'<p class="empty">'+esc(((DATA.radar_opportunity||{}).presentation||{}).current_empty_message||'暂无符合条件的股票，空池为有效结果。')+'</p></div>';
+-  h+='<div class="tw"><table><thead><tr><th class="l">代码名称</th><th class="l">机会与状态</th><th>R0%</th><th>E0百分点</th><th>盘中进攻分</th><th class="l">日线背景</th><th class="l">板块参考</th><th class="l">风险/限制</th><th class="l">源报价/首次观察</th></tr></thead><tbody>';
+-  rows.forEach(function(r){
+-    var peers=(r.boards||[]).filter(function(b){return b.peers_qualified===true;}).map(function(b){return b.name;});
+-    var selected=(r.boards||[]).filter(function(b){return b.selected===true;}).map(function(b){return b.name;});
+-    h+='<tr class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l">'+esc(r.name)+'<span class="cd">'+esc(r.code)+'</span></td>'
+-      +'<td class="l">'+esc((r.labels||[]).join(' / ')||r.display_label||r.main_label||'观察')+'<br>'+esc(r.status)+'</td><td>'+pct(r.R0)+'</td><td>'+fmt(r.E0,2)+'</td><td>'+fmt(r.live_attack_score,1)+'</td>'
+-      +'<td class="l">'+esc(r.daily_tier||'趋势未在线')+'<br>'+esc(r.daily_asof||'待核验')+'</td><td class="l">'+(selected.length?'所属板块入选：'+esc(selected.join('、'))+'<br>':'')+(peers.length?'剔除本股后同行共同走强：'+esc(peers.join('、')):esc(r.board_relation_status||'板块待核验'))+'</td>'
+-      +'<td class="l">'+esc((r.risk||[]).concat(r.trade_restriction?[r.trade_restriction]:[]).join('、')||'—')+'</td><td class="l">'+esc(r.source_at||'待核验')+'<br>'+esc(r.first_observed_at||'尚未触发')+'</td></tr>';
+-  });return h+'</tbody></table></div></div>';
++function msUpdate(key,field,value){MS_VIEW[key][field]=value;MS_VIEW[key].limit=100;msRender(key);}
++function msTools(key){var v=MS_VIEW[key];
++  function select(field,opts,label){return '<select aria-label="'+label+'" onchange="msUpdate(\''+key+'\',\''+field+'\',this.value)">'+opts.map(function(x){return '<option value="'+x[0]+'" '+(v[field]===x[0]?'selected':'')+'>'+x[1]+'</option>';}).join('')+'</select>';}
++  return '<div class="radar-tools">'+select('scope',[['focus','全部强势'],['trend','趋势强'],['emotion','情绪强'],['all','全量排行']],'强势范围')+' '+select('sort',[['combined','综合排序'],['trend','趋势排序'],['emotion','情绪排序']],'强势排序')+' '+select('phase',[['','全部阶段'],['启动','启动'],['推进','推进'],['回踩整理','回踩整理'],['转弱','转弱']],'强势阶段')+' <input aria-label="强势搜索" placeholder="代码/名称" value="'+esc(v.q)+'" oninput="msUpdate(\''+key+'\',\'q\',this.value)"> <button class="btn" onclick="msCSV(\''+key+'\')">导出全部筛选结果 CSV</button></div>';
+ }
+-function exportRadarCSV(){
+-  if(RADAR_VIEW==='close')return exportRadarCloseCSV();
+-  var sections=RADAR_VIEW==='current'?['current','limited']:['pending','warning','tracking'];
+-  var codes=[];sections.forEach(function(s){radarOpportunityRows(s).forEach(function(r){if(codes.indexOf(r.code)<0)codes.push(r.code);});});
+-  if(RADAR_VIEW==='daily')codes=radarItems().map(function(r){return r.code;});
+-  var all=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]),map={};all.forEach(function(s){map[s.code]=s;});
+-  return exportCSV(codes.map(function(c){return map[c];}).filter(Boolean),'选股雷达_'+RADAR_VIEW+'_'+DATA.ui_generation+'.csv');
++function msScore(m,axis){return m[axis+'_score']==null?'—':fmt(m[axis+'_score'],2)+' · '+esc(m[axis+'_level']||'—');}
++function msTable(rows,key,limit){var boards=key==='industry'||key==='theme',shown=limit?rows.slice(0,limit):rows;
++ var h='<div class="tw"><table class="market-strength-table"><thead><tr><th class="l">名称</th><th>当日涨幅</th><th>趋势强度</th><th>情绪强度</th><th>主导周期</th><th>阶段</th><th class="l">事件</th><th class="l">主要原因</th><th class="l">风险</th></tr></thead><tbody>';
++ shown.forEach(function(r){var m=r.market_strength||{},chg=boards?(m.emotion_parts||{}).R0:r.change_pct;
++ h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'"><td class="l">'+esc(r.name)+'<span class="cd">'+esc(r.code||r.type)+'</span></td><td>'+pct(chg,2)+'</td><td>'+msScore(m,'trend')+'</td><td>'+msScore(m,'emotion')+'</td><td>'+(m.dominant_period==null?'—':m.dominant_period+'日')+'</td><td>'+esc(m.phase||'—')+'</td><td class="l">'+esc((m.events||[]).slice(0,2).join('、')||'—')+'</td><td class="l">'+esc((m.reasons||[]).join('；')||'—')+'</td><td class="l">'+esc((m.risks||[]).slice(0,2).join('；')||'—')+'</td></tr>';
++ });return h+'</tbody></table></div>'+(rows.length>shown.length?'<button class="btn" onclick="MS_VIEW[\''+key+'\'].limit+=100;msRender(\''+key+'\')">加载更多（完整 '+rows.length+' 项）</button>':'')+(!rows.length?'<p class="empty">暂无符合条件的对象。</p>':'');
+ }
+-function radarCloseRows(){
+-  return (((DATA.radar_opportunity||{}).last_close_review||{}).stock_rows||[]).filter(function(r){return (!RADAR_KIND||r.labels.indexOf(RADAR_KIND)>=0)&&(!RADAR_QUERY||String(r.code+' '+r.name).indexOf(RADAR_QUERY)>=0);});
+-}
+-function radarCloseTable(){
+-  var review=(DATA.radar_opportunity||{}).last_close_review;
+-  if(!review)return '<div class="detail-panel"><p class="empty">尚无可核验的正式收盘复核记录；等待完成日线与同日基准。</p></div>';
+-  var rows=radarCloseRows(),h='<div class="detail-panel radar-close-list"><div class="detail-panel-title">'+esc(review.day)+' 收盘确认 · '+review.event_counts['收盘确认']+'项事件 / '+review.stock_counts['收盘确认']+'只去重股票</div><p>以下为该日正式收盘条件复核，同股多类别保留在一行。筛选结果 '+rows.length+'只；不表示今天当前入选。</p>';
+-  if(!rows.length)return h+'<p class="empty">该日期及筛选条件下无收盘确认股票。</p></div>';
+-  h+='<div class="tw"><table><thead><tr><th class="l">代码名称</th><th>复核日期</th><th class="l">确认类别</th><th>事件数</th><th>收盘R0%</th><th>收盘E0百分点</th><th>收市M0%</th><th>结果</th></tr></thead><tbody>';
+-  rows.forEach(function(r){h+='<tr class="clickable" onclick="showStock(\''+jsq(r.code)+'\')"><td class="l">'+esc(r.name)+'<span class="cd">'+esc(r.code)+'</span></td><td>'+esc(r.day)+'</td><td class="l">'+esc(r.labels.join(' / '))+'</td><td>'+r.event_count+'</td><td>'+pct(r.R0)+'</td><td>'+fmt(r.E0,2)+'</td><td>'+pct(r.M0)+'</td><td>收盘确认</td></tr>';});
+-  return h+'</tbody></table></div></div>';
+-}
+-function radarCloseDetail(code){
+-  var review=(DATA.radar_opportunity||{}).last_close_review;if(!review)return '';
+-  var items=(review.records||[]).filter(function(r){return r.code===code;});if(!items.length)return '';
+-  var h='<div class="detail-panel radar-opportunity-detail radar-close-detail"><div class="detail-panel-title">'+esc(review.day)+' 收盘复核依据</div><p>真实完成日线复核记录 · '+esc(review.version)+' · 页面数据版本 '+esc(DATA.ui_generation)+'</p>';
+-  items.forEach(function(r){h+='<details><summary>'+esc(r.label)+' · '+esc(r.status)+' · '+esc(r.day)+'</summary><p>原事件 '+esc(r.event_id)+' · 冻结平台 '+fmt(r.platform,4)+' · 首次确认 '+esc(r.first_confirmed_at||'尚未确认')+'</p><table class="radar-close-evidence"><thead><tr><th class="l">收盘条件</th><th>实际值</th><th>门槛</th><th>结果/原因</th></tr></thead><tbody>';(r.checks||[]).forEach(function(x){h+='<tr><td class="l">'+esc(x.key)+'</td><td>'+esc(radarEvidenceValue(x.actual))+'</td><td>'+esc(x.threshold)+'</td><td>'+esc(x.passed===true?'通过':x.passed===false?'未通过':'待核验')+' '+esc(x.reason||'')+'</td></tr>';});h+='</tbody></table></details>';});return h+'</div>';
+-}
+-function radarCloseCSVText(){
+-  function cell(v){return '"'+String(v==null?'':v).replace(/"/g,'""')+'"';}
+-  var review=(DATA.radar_opportunity||{}).last_close_review||{};
+-  var lines=[['复核日期','代码','名称','确认类别','确认事件数','收盘R0%','收盘E0百分点','收市M0%','结果','雷达规则版本','页面数据版本','源计算时间','完整收盘依据'].map(cell).join(',')];
+-  radarCloseRows().forEach(function(r){lines.push([r.day,r.code,r.name,r.labels.join(' / '),r.event_count,r.R0,r.E0,r.M0,'收盘确认',review.version,DATA.ui_generation,review.generated_at,JSON.stringify(r)].map(cell).join(','));});return '\ufeff'+lines.join('\n');
+-}
+-function exportRadarCloseCSV(){
+-  var review=(DATA.radar_opportunity||{}).last_close_review||{},blob=new Blob([radarCloseCSVText()],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
+-  a.href=URL.createObjectURL(blob);a.download='雷达收盘确认_'+(review.day||'暂无')+'_'+DATA.ui_generation+'.csv';a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},2000);
++function msStamp(){var m=msModel(),c=m.coverage||{},n=m.counts||{};return esc(m.version||'等待新模型发布')+' · '+esc(m.mode||'')+' · 判断 '+esc(m.at||'—')+' · UI '+esc(DATA.ui_generation||'—')+'<br>趋势强 '+(n.trend||0)+' · 情绪强 '+(n.emotion||0)+' · 两轴都强 '+(n.both||0)+' · 去重强势 '+(n.focus||0)+'；主板 '+(c.pool||0)+'只，趋势缺口 '+(c.trend_missing||0)+'，情绪缺口 '+(c.emotion_missing||0);}
++function msRender(key){
++ var rows=msRows(key),v=MS_VIEW[key],html=msTools(key)+'<p class="flat">当前强势 · 完整筛选结果 '+rows.length+' 项；趋势强或情绪强即入选。</p>'+msTable(rows,key,v.limit);
++ var host=document.getElementById(key==='radar'?'radar-opportunities':key==='industry'?'board-center':key==='theme'?'theme-center':key==='stocks'?'ms-stock-host':'ms-overview-host');
++ if(host){var focused=document.activeElement,label=focused&&focused.getAttribute('aria-label'),position=focused&&focused.selectionStart;host.innerHTML=html;if(label==='强势搜索'){var next=host.querySelector('[aria-label="强势搜索"]');next.focus();if(position!=null)next.setSelectionRange(position,position);}}
+ }
+ function renderRadar(){
+-  var m=DATA.radar_opportunity||{},host=document.getElementById('radar-opportunities');
+-  if(RADAR_AUTO_VIEW||!RADAR_VIEW)RADAR_VIEW=(m.presentation||{}).default_view||'current';
+-  document.getElementById('radar-views').innerHTML=[['current','当前机会'],['follow','预警与跟踪'],['close','收盘复核'+(m.last_close_review?' · '+m.last_close_review.day:'')],['daily','日线背景']].map(function(v){return '<button class="'+(RADAR_VIEW===v[0]?'on':'')+'" onclick="setRadarView(\''+v[0]+'\')">'+v[1]+'</button>';}).join('');
+-  document.getElementById('rad-tiers').style.display=RADAR_VIEW==='daily'?'grid':'none';
+-  document.getElementById('tb-radar').parentElement.style.display=RADAR_VIEW==='daily'?'block':'none';
+-  document.getElementById('rad-more').style.display=RADAR_VIEW==='daily'?'block':'none';
+-  host.style.display=RADAR_VIEW==='daily'?'none':'block';
+-  document.getElementById('radar-tools').innerHTML='<button onclick="exportRadarCSV()">导出当前视图 CSV</button>'+(RADAR_VIEW==='daily'?'':' <select aria-label="雷达类别" onchange="RADAR_KIND=this.value;renderRadar()">'+[['','全部类别'],['强势再启动','强势再启动'],['突破启动','突破启动'],['持续进攻','持续进攻']].map(function(v){return '<option value="'+v[0]+'" '+(RADAR_KIND===v[0]?'selected':'')+'>'+v[1]+'</option>';}).join('')+'</select>'+(RADAR_VIEW==='close'?'':' <select aria-label="雷达参考" onchange="RADAR_REFERENCE=this.value;renderRadar()">'+[['','全部参考'],['peers','同行共同走强'],['hot','位置偏热'],['divergence','触板未封']].map(function(v){return '<option value="'+v[0]+'" '+(RADAR_REFERENCE===v[0]?'selected':'')+'>'+v[1]+'</option>';}).join('')+'</select>')+' <input aria-label="查询雷达未入选原因" placeholder="查询代码/名称" value="'+esc(RADAR_QUERY)+'" onchange="RADAR_QUERY=this.value.trim();renderRadar()">');
+-  if(RADAR_VIEW==='daily'){renderDailyRadar();return;}
+-  var market=m.market||{},env=market.environment||{};
+-  document.getElementById('rad-sub').innerHTML=esc(m.version||'本快照尚未计算V1')+' · '+esc(m.phase||'')+' · 判断截至 '+esc(m.judged_at||'—')+'<br>'+(market.enabled===false?esc(market.reason||'连续竞价基准尚未启用')+' · M0 — · E0 待核验':'主板等权 M0 '+pct(market.M0)+' · 上涨 '+(market.U0==null?'—':fmt(market.U0,1)+'%')+' · 有效报价覆盖 '+fmt(market.valid_count,0)+'/'+fmt(market.expected_count,0)+'（'+(market.coverage_pct==null?'待核验':fmt(market.coverage_pct,2)+'%')+'） · 环境 '+esc(env.label||'未知'))+'<br>两次源采样确认只代表采样时成立。缺盘口/同时间量能序列，尚未确认成交及放量。';
+-  if(m.close_review&&!m.close_review.ready)document.getElementById('rad-sub').innerHTML+='<br>'+esc(m.close_review.day)+' 待收盘核验：正式日线或基准未齐备；保留原盘中记录。';
+-  if(m.last_close_review)document.getElementById('rad-sub').innerHTML+='<br>收盘复核 '+esc(m.last_close_review.day)+'：收盘确认 '+m.last_close_review.event_counts['收盘确认']+'项事件 / '+m.last_close_review.stock_counts['收盘确认']+'只股票；日期与当前盘中判断分别标注。';
+-  if(RADAR_VIEW==='close'){host.innerHTML=radarCloseTable();return;}
+-  if(RADAR_QUERY){host.innerHTML=radarOpportunityTable(radarOpportunityRows('current'),'查询结果（含未入选）');return;}
+-  if(RADAR_VIEW==='current')host.innerHTML=radarOpportunityTable(radarOpportunityRows('current'),'当前已确认')+'<details><summary>观察受限 · '+((m.lists||{}).limited||[]).length+'只（不承诺可成交）</summary>'+radarOpportunityTable(radarOpportunityRows('limited'),'观察受限')+'</details>';
+-  else {
+-    var pending=radarOpportunityRows('pending'),warning=radarOpportunityRows('warning'),used={};pending.concat(warning).forEach(function(r){used[r.code]=true;});
+-    var warnings=radarOpportunityTable(warning.filter(function(r){return !pending.some(function(x){return x.code===r.code;});}),market.enabled===false?'竞价预警（不参与连续竞价确认）':'预警');
+-    host.innerHTML=(market.enabled===false?warnings+radarOpportunityTable(pending,'待采样确认'):radarOpportunityTable(pending,'待采样确认')+warnings)+radarOpportunityTable(radarOpportunityRows('tracking').filter(function(r){return !used[r.code];}),m.close_review?'盘中记录与跟踪（收盘复核另列）':'跟踪与判断暂停');
+-  }
++ ['radar-views','radar-tools','radar-daily','radar-close'].forEach(function(id){var e=document.getElementById(id);if(e)e.innerHTML='';});
++ document.getElementById('rad-sub').innerHTML=msStamp();
++ var old=document.getElementById('radar-views');if(old)old.innerHTML='<b>当前强势</b>';
++ msRender('radar');
+ }
+-function radarOpportunityDetail(s){
+-  var r=s.radar_opportunity,h=radarCloseDetail(s.code);if(!r)return h;
+-  h+='<div class="detail-panel radar-opportunity-detail"><div class="detail-panel-title">雷达机会依据 · '+esc((DATA.radar_opportunity||{}).close_review?'盘中记录 '+r.status:r.status)+'</div><p>'+esc(r.version)+' · 源报价 '+esc(r.source_at||'待核验')+' · 数据版本 '+esc(DATA.ui_generation||DATA.generated_at)+'</p>';
+-  Object.keys(r.categories||{}).forEach(function(kind){var c=r.categories[kind],e=c.event||{};
+-    h+='<details><summary>'+esc(({restart:'强势再启动',breakout:'突破启动',sustained:'持续进攻'})[kind])+' · '+esc(c.close_review?c.close_review.status+'（盘中记录：'+(e.status||'未入选')+'）':e.status||'未入选')+'</summary><p>事件 '+esc(e.event_id||'尚未触发')+' · 平台 '+fmt(e.platform,4)+' · 冻结ATR '+fmt(e.atr,4)+' · 背景 '+esc(e.background_date||'—')+'<br>首次观察 '+esc(e.first_observed_at||'—')+' · 首次正式触发 '+esc(e.first_formal_at||'—')+' · 首次确认 '+esc(e.first_confirmed_at||'—')+'<br>本段确认 '+((e.sequence||{}).count||0)+'次 / '+((e.sequence||{}).span_seconds||0)+'秒<br>最后有效报价 ¥'+fmt(e.last_valid_price,2)+' · '+esc(e.last_valid_quote_at||'—')+'</p>';
+-    h+='<p>本轮连续性：'+esc(e.reset_reason||'未发生中断')+' · 相邻源报价 '+fmt((e.continuity||{}).gap_seconds,0)+'秒</p><table><thead><tr><th class="l">条件</th><th>实际值</th><th>门槛</th><th>结果/原因</th></tr></thead><tbody>';
+-    (r.admission_checks||[]).concat(c.checks||[]).forEach(function(x){h+='<tr><td class="l">'+esc(x.key)+'</td><td>'+esc(radarEvidenceValue(x.actual))+'</td><td>'+esc(x.threshold)+'</td><td>'+esc(x.passed===true?'通过':x.passed===false?'未通过':'待核验')+' '+esc(x.reason||'')+'</td></tr>';});
+-    h+='</tbody></table><p>未通过/待核验：'+esc(((r.reasons||{})[kind]||[]).join('；')||'正式条件全部通过，确认状态见上方')+'</p><p>'+esc(JSON.stringify(e.history||[]))+'</p>';
+-    if(c.close_review){h+='<p>收盘复核：'+esc(c.close_review.status)+' '+esc(c.close_review.reason||'')+'</p><table class="radar-close-evidence"><thead><tr><th class="l">收盘条件</th><th>实际值</th><th>门槛</th><th>结果/原因</th></tr></thead><tbody>';(c.close_review.checks||[]).forEach(function(x){h+='<tr><td class="l">'+esc(x.key)+'</td><td>'+esc(radarEvidenceValue(x.actual))+'</td><td>'+esc(x.threshold)+'</td><td>'+esc(x.passed===true?'通过':x.passed===false?'未通过':'待核验')+' '+esc(x.reason||'')+'</td></tr>';});h+='</tbody></table>';}
+-    h+='</details>';
+-  });
+-  h+='<details><summary>行业与题材全部参考</summary><p>'+esc(r.board_relation_status)+'</p>'+(r.boards||[]).map(function(b){return '<p>'+esc(b.type==='industry'?'行业':'题材')+' · '+esc(b.name)+' · 所属板块入选 '+esc(String(b.selected))+' · 剔除本股后同行共同走强 '+esc(String(b.peers_qualified))+'<br>'+esc(JSON.stringify(b.checks))+'</p>';}).join('')+'</details><p>'+esc((r.data_gaps||[]).join('；'))+'</p></div>';
+-  return h;
++function exportRadarCSV(){msCSV('radar');}
++function renderBoards(){document.getElementById('bd-metrics').innerHTML='<div class="card"><h3>当前强势 · 行业</h3><p>'+msStamp()+'</p></div>';msRender('industry');}
++function renderThemesPage(){msRender('theme');}
++function renderStocks(){
++ var table=document.getElementById('tb-stocks'),res=document.getElementById('stk-res');
++ if(!document.getElementById('ms-stock-host')){var host=document.createElement('div');host.id='ms-stock-host';table.parentNode.insertBefore(host,table);table.style.display='none';}
++ res.innerHTML='统一强度模型 · '+esc(msModel().version||'—');
++ ['stk-more','stock-view-tabs','stock-views','stk-view-tabs'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});
++ var filter=document.getElementById('btn-filter');if(filter)filter.style.display='none';
++ var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.onclick=function(){STATE.boardFilterId=null;msRender('stocks');};}
++ MS_VIEW.stocks.q=STATE.q||'';if(STATE.q)MS_VIEW.stocks.scope='all';
++ msRender('stocks');
+ }
++function renderOverview(){
++ document.getElementById('hero-h1').textContent='当前强势';document.getElementById('hero-p').innerHTML=msStamp();document.getElementById('hero-stamp').textContent=DATA.generated_at||'';
++ ['ov-work-live','ov-work-close','overview-more'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});
++ var switches=document.querySelector('#p-overview .work-switch');if(switches)switches.style.display='none';
++ if(!document.getElementById('ms-overview-host')){var h=document.createElement('div');h.id='ms-overview-host';h.className='card';document.querySelector('#p-overview .main').prepend(h);}
++ msRender('overview');
++}
++function renderWorkboard(){renderOverview();}
++function msDetail(m){
++ var h='<section class="card market-strength-detail"><h3>统一市场强度</h3><p>趋势 '+msScore(m,'trend')+' · 情绪 '+msScore(m,'emotion')+' · 主导 '+(m.dominant_period||'—')+'日 · 阶段 '+esc(m.phase||'—')+'</p><p>'+esc((m.reasons||[]).join('；')||'—')+'</p><p>风险：'+esc((m.risks||[]).join('；')||'—')+'</p><p>'+esc(m.version)+' · '+esc(m.mode)+' · 趋势截至 '+esc(m.trend_at||'—')+' · 情绪截至 '+esc(m.emotion_at||'—')+' · UI '+esc(DATA.ui_generation)+'</p>';
++ h+='<p>趋势：60%绝对上涨力度＋40%同周期分位，再乘结构系数；5/10/20日个股满分尺度8/12/20%，板块5/8/12%。情绪：个股70%当日进攻＋30%盘中保持；板块40%整体进攻＋35%情绪强股比例＋25%保持。≥65强，≥80很强；缺失保持未知。</p>';
++ h+='<div class="tw"><table><thead><tr><th>周期</th><th>R%</th><th>S</th><th>A</th><th>G</th><th>K</th><th>T</th><th>当前MA</th><th>前值MA</th><th>峰值</th><th>回撤ATR</th><th>ATR/日期</th><th>N/覆盖</th></tr></thead><tbody>';
++ [5,10,20].forEach(function(n){var p=(m.trend_parts_by_period||{})[n]||{};h+='<tr><td>'+n+'日</td>'+['R','S','A','G','K','T','MA_now','MA_previous','peak','dd'].map(function(k){return '<td>'+fmt(p[k],2)+'</td>';}).join('')+'<td>'+fmt(p.ATR,4)+' '+esc(p.ATR_date||'—')+'</td><td>'+(p.N==null?'—':p.N)+(p.valid==null?'':' · '+p.valid+'/'+p.expected+' · '+fmt(p.coverage_pct,2)+'%')+'</td></tr>';});
++ h+='</tbody></table></div><details><summary>情绪、阶段、事件、覆盖及来源完整依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据缺口 '+(m.data_reasons||[]).length+'项</summary>'+esc((m.data_reasons||[]).join('；')||'无')+'</details></section>';return h;
++}
++function showStock(code,boardId){var s=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0];if(!s)return;openDrawer(esc(s.name)+' '+esc(code),'当前强势 · 统一模型',msDetail(s.market_strength||{}),false);}
++function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],html=msDetail(b.market_strength||{})+'<section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><p>个股强度独立于所属板块。官方指数仅作参照。</p>'+msTable(members.map(function(r){return Object.assign({name:r.name||r.code},r);}), 'members')+'</section>';openDrawer(esc(b.name),'主板成员共振 · 当前成员历史背景',html,true);}
++function boardMemberRows(b,codes){return msTable((b.members||[]).filter(function(r){return codes.indexOf(r.code)>=0;}),'members');}
++function downloadMSCSV(text,name){var blob=new Blob([text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}
++function msCSV(key){var rows=msRows(key);if(key==='industry'||key==='theme'){var headers=['ID','名称','趋势分','情绪分','主导周期','阶段','版本','UI版本','完整模型依据'];function cell(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';}downloadMSCSV('\ufeff'+[headers.join(',')].concat(rows.map(function(r){var m=r.market_strength;return [r.id,r.name,m.trend_score,m.emotion_score,m.dominant_period,m.phase,m.version,DATA.ui_generation,JSON.stringify(m)].map(cell).join(',');})).join('\n'),'板块强度_'+DATA.ui_generation+'.csv');return;}return exportCSV(rows,'当前强势_'+DATA.ui_generation+'.csv');}
++function radarOpportunityDetail(s){return msDetail(s.market_strength||{});}
++
++var legacyExportCSV=typeof exportCSV==='function'?exportCSV:function(){};exportCSV=function(rows,name){return legacyExportCSV(Array.isArray(rows)?rows:msRows('stocks'),name||'当前强势_'+DATA.ui_generation+'.csv');};

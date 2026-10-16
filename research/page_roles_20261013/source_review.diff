@@ -1,0 +1,487 @@
+--- before/config.py
++++ after/config.py
+@@ -13,7 +13,7 @@
+ 
+ ROOT = Path(__file__).resolve().parent
+ MARKET_STRENGTH = {
+-    'version': 'market-strength-2026-10-13.2',
++    'version': 'market-strength-2026-10-13.3',
+     'periods': [5, 10, 20], 'strong_min': 65, 'very_strong_min': 80, 'normal_min': 45,
+     'stock_full_returns': {5: 8, 10: 12, 20: 20},
+     'board_full_returns': {5: 5, 10: 8, 20: 12},
+@@ -31,6 +31,8 @@
+     'phase_consolidation_share': .50, 'tie_epsilon': 1e-9,
+     'breakout_days': 20, 'restart_days': 3, 'event_priority': ['再启动', '突破', '反包'],
+     'quote_tick_default': .01, 'limit_tick_tolerance': .50,
++    'direction_compare_minutes': 15, 'direction_compare_min_minutes': 10,
++    'direction_compare_max_minutes': 30, 'direction_observations_max': 24,
+ }
+ CACHE_DIR = ROOT / "cache"
+ CACHE_DIR.mkdir(exist_ok=True)
+--- before/dashboard_template.html
++++ after/dashboard_template.html
+@@ -909,7 +909,9 @@
+ .radar-opportunity-detail summary{cursor:pointer;font-weight:600;margin-bottom:8px}
+ #stratbar{display:none!important}
+ .ms-summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}.ms-stat{display:block;font-size:32px;margin-top:9px;color:#263246}.ms-card-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.ms-discovery-card{border:1px solid #e6eaf0;border-radius:14px;background:#fff;padding:18px;transition:box-shadow .15s,border-color .15s}.ms-discovery-card:hover{border-color:#bccddd;box-shadow:0 6px 20px #2632460d}.ms-card-head{display:flex;justify-content:space-between;gap:10px;align-items:center}.ms-card-head b{font-size:16px}.ms-axis{display:flex;gap:8px;flex-wrap:wrap;margin:13px 0}.ms-badge{display:inline-block;border-radius:8px;padding:5px 9px;background:#f1f4f8;color:#617084;font-size:12px;white-space:nowrap}.ms-hot{background:#fceeea;color:#b64333}.ms-mini-metrics{display:flex;justify-content:space-between;font-size:12px;color:#7a8494;gap:12px}.ms-mini-metrics b{display:block;margin-top:5px;font-size:14px;color:#354052}.ms-muted,.ms-card-context{color:#7a8494;font-size:12px;line-height:1.65}.ms-card-signal{font-size:12px;color:#47617e;margin:13px 0 7px}.ms-card-risk{font-size:11px;color:#a87844;min-height:16px;margin:6px 0 0}.ms-overview-section{margin-bottom:20px;padding:22px}.ms-overview-section h3{margin:0 0 5px}.ms-toolbar{flex-wrap:wrap;margin:12px 0}.ms-research-table td{padding-top:13px;padding-bottom:13px}.market-strength-detail details{margin-top:14px}.market-strength-detail summary{cursor:pointer;color:#667a93}.market-strength-detail pre{font-size:11px;max-height:420px;overflow:auto;background:#f5f7fa;padding:12px}.ms-research-table .cd{display:block;margin-top:5px}@media(max-width:1050px){.ms-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:640px){.ms-card-grid{grid-template-columns:1fr}.ms-summary-grid{grid-template-columns:repeat(2,1fr)}}
+-.ms-trend.ms-hot{background:#eaf1ff;color:#31689c}.ms-toolbar{display:flex;align-items:center;gap:8px}.ms-toolbar select,.ms-toolbar input{min-height:36px;padding:7px 11px;border:1px solid #dfe4ec;border-radius:9px;background:#fff;color:#4b586b;font:inherit;font-size:12px;outline:none}.ms-toolbar select{min-width:106px}.ms-toolbar input{min-width:166px}.ms-toolbar select:focus,.ms-toolbar input:focus{border-color:#80a8cf;box-shadow:0 0 0 3px #eaf1ff}.ms-toolbar .btn{margin:0}</style>
++.ms-trend.ms-hot{background:#eaf1ff;color:#31689c}.ms-toolbar{display:flex;align-items:center;gap:8px}.ms-toolbar select,.ms-toolbar input:not([type=checkbox]){min-height:36px;padding:7px 11px;border:1px solid #dfe4ec;border-radius:9px;background:#fff;color:#4b586b;font:inherit;font-size:12px;outline:none}.ms-toolbar select{min-width:106px}.ms-toolbar input:not([type=checkbox]){min-width:166px}.ms-toolbar select:focus,.ms-toolbar input:focus{border-color:#80a8cf;box-shadow:0 0 0 3px #eaf1ff}.ms-toolbar .btn{margin:0}
++.ms-style-tabs{display:flex;gap:8px;margin:10px 0 18px}.ms-tab{border:1px solid #e1e6ee;border-radius:12px;padding:12px 28px;background:#fff;color:#718092;font:inherit;font-weight:600;cursor:pointer}.ms-tab.on{background:#eaf1ff;color:#31689c;border-color:#bdd0e9}.ms-tab.emotion.on{background:#fceeea;color:#b64333;border-color:#efc9be}.ms-check{display:flex;align-items:center;gap:7px;color:#617084;font-size:12px}.ms-check input{accent-color:#4177a8}.ms-section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.ms-temperature-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin:22px 0}.ms-temperature-grid span{display:block;color:#7a8494;font-size:12px}.ms-temperature-grid strong{display:block;font-size:27px;margin-top:8px;color:#263246}.ms-direction-columns{display:grid;grid-template-columns:1fr 1fr;gap:26px}.ms-direction-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.ms-direction-card{background:#fff;border:1px solid #e2e8f0;border-radius:13px;padding:16px}.ms-direction-card.emotion{border-top:3px solid #e7c5bc}.ms-direction-card.trend{border-top:3px solid #bfd1e8}.ms-name-link{border:0;background:none;padding:0;color:#263246;font:inherit;font-size:15px;font-weight:600;cursor:pointer;text-align:left}.ms-detail-link{border:0;background:none;padding:2px;color:#7a8494;font-size:11px;cursor:pointer;white-space:nowrap}.ms-leaders{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}.ms-leaders button{border:0;border-radius:5px;background:#f2f5fa;color:#5e7086;padding:4px 6px;font-size:11px;cursor:pointer}.ms-turning-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.ms-turning-card{text-align:left;background:#f6f9fd;border:1px solid #e1e8f1;border-radius:12px;padding:15px;cursor:pointer;color:#34485f}.ms-turning-card.emotion{background:#fdf7f4}.ms-turning-card b,.ms-turning-card span,.ms-turning-card small{display:block;margin-bottom:6px}.ms-turning-card small{font-size:11px;color:#7a8494}.ms-direction-picker{padding:22px;margin-bottom:22px}.ms-direction-picker h3{margin:0}.ms-direction-search{width:100%;padding:11px 14px;border:1px solid #dde4ee;border-radius:10px;font:inherit;font-size:13px}.ms-selected-directions{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0}.ms-direction-options{padding:10px 0;border-top:1px solid #edf0f4;font-size:13px;color:#52657a}.ms-direction-options summary{cursor:pointer}.ms-direction-options .ms-chip-list{max-height:190px;overflow:auto}.ms-chip-list{display:flex;gap:7px;flex-wrap:wrap;padding:12px 0}.ms-chip{border:1px solid #e3e8ef;background:#f7f9fc;color:#60728b;border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer}.ms-chip.selected{background:#eaf1ff;color:#31689c;border-color:#b9cde6}.ms-chip.small{padding:3px 6px;font-size:10px;margin:3px 3px 0 0}.ms-affiliation{font-size:11px;color:#718092;margin:6px 0}.ms-industry{display:block;font-weight:500;margin-bottom:4px}.ms-affiliation details{display:inline-block;margin-top:4px}.ms-affiliation summary{cursor:pointer;font-size:10px}.ms-affiliation details[open]{display:block}.ms-match{color:#31689c;margin:5px 0}.ms-tag-list{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0}.ms-tag{background:#eef4f7;color:#537484;padding:4px 7px;border-radius:6px;font-size:10px}.ms-tag.risk{background:#fff0e9;color:#af593c}.ms-return{display:block;font-size:11px;color:#718092;margin:5px 0;white-space:nowrap}.ms-return.dominant{font-weight:600;color:#31689c}.ms-metric-cell{min-width:135px}.ms-research-table td:first-child{min-width:180px;max-width:260px}.ms-research-table td:last-child{min-width:170px}.ms-radar-group{margin:26px 0 35px}.ms-radar-group h3{margin-bottom:14px}.ms-chart-tools{display:flex;align-items:center;gap:14px;color:#718092;font-size:11px;margin:10px 0}.ms-chart-tools select{border:1px solid #dfe4ec;border-radius:6px;padding:4px;color:#52657a}.ms-chart-tools #k-readout{flex:1}
++@media(max-width:1100px){.ms-direction-columns{grid-template-columns:1fr}.ms-turning-grid{grid-template-columns:1fr 1fr}}@media(max-width:640px){.ms-direction-grid,.ms-turning-grid{grid-template-columns:1fr}.ms-temperature-grid{grid-template-columns:1fr 1fr}.ms-section-head{align-items:flex-start}.ms-tab{flex:1;padding:11px}.ms-chart-tools{flex-wrap:wrap}}</style>
+ </head>
+ <body>
+ <div class="ambient"></div>
+--- before/market_strength.py
++++ after/market_strength.py
+@@ -17,7 +17,7 @@
+ 
+ 
+ def implementation_hash():
+-    return hashlib.sha256(Path(__file__).read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
++    return hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('direction_changes.py').read_bytes() + json.dumps(P, sort_keys=True).encode()).hexdigest()
+ 
+ 
+ IMPLEMENTATION_HASH = implementation_hash()  # fixed at process import
+@@ -165,7 +165,8 @@
+     """Display projection; numerical evidence stays on the canonical stock/board detail."""
+     keys=('version','trend_score','emotion_score','trend_level','emotion_level','dominant_period',
+           'phase','events','trend_strong','emotion_strong','focus','trend_at','emotion_at','mode','reasons','risks','data_reasons',
+-          'background','recent_emotion','day_attack','day_attack_strong','history_returns')
++          'background','recent_emotion','day_attack','day_attack_strong','history_returns',
++          'display_evidence','labels','new_strong_axes','direction_change','member_strength')
+     return {k:m.get(k) for k in keys}
+ 
+ 
+@@ -186,11 +187,10 @@
+     if t is not None and t >= P['strong_min']:
+         if consolidating is None:
+             return None, days
+-        return ('回踩整理' if days >= 1 and consolidating else
+-                '推进' if days >= P['phase_mature_strong_days'] and not consolidating else '启动'), days
+-    if e is not None and e >= P['strong_min'] and days == 0:
+-        return '启动', days
+-    if t is not None and t < P['strong_min'] and days >= 1:
++        return ('启动' if history[-1] < P['strong_min'] else
++                '回踩整理' if consolidating else '推进'), days
++    # A prior trend score cannot establish the start of an emotion move.
++    if t is not None and t < P['strong_min'] and history[-1] >= P['strong_min']:
+         return '转弱', days
+     return None, days
+ 
+@@ -348,7 +348,7 @@
+         previous = [b for b in bars if b['date'] < day]
+         m['trend_parts_by_period'] = trend_raw(current['close'], previous, atr, prior[-1], prior)
+         m['R3'] = 100*(current['close']/previous[-3]['close']-1)
+-        m['consolidating'] = current['close'] < previous[-1]['close'] or current['close'] < m['trend_parts_by_period']['5']['MA_now'] or m['R3'] <= 0
++        m['consolidating'] = current['close'] < m['trend_parts_by_period']['5']['MA_now'] or m['R3'] <= 0
+     for n in P['periods']:
+         vals = {c:m['trend_parts_by_period'].get(str(n),{}).get('R') for c,m in result.items()
+                 if m['trend_parts_by_period'].get(str(n),{}).get('K') is not None}
+@@ -359,6 +359,9 @@
+             part.update(trend_period_score(part['R'],s,part['historical_R'],past_ranks[c],part['K'],P['stock_full_returns'][n]), N=len(ranks))
+     for m in result.values():
+         finish(m)
++        p = m['trend_parts_by_period'].get(str(m['dominant_period']), {})
++        if m.get('consolidating') is not None and finite(p.get('dd')):
++            m['consolidating'] = m['consolidating'] or p['dd'] > P['drawdown_shallow_atr']
+     return result
+ 
+ 
+@@ -435,7 +438,7 @@
+     t,e = m.get('trend_score'),m.get('emotion_score')
+     last = lambda x: -x if x is not None else math.inf
+     if order == 'trend':
+-        return last(t),last(m.get('trend_parts_by_period',{}).get(str(m.get('dominant_period')),{}).get('historical_G')),identity
++        return last(t),last(m.get('trend_parts_by_period',{}).get(str(m.get('dominant_period')),{}).get('historical_R')),identity
+     if order == 'emotion':
+         return last(e),last((m.get('recent_emotion') or {}).get('score')),identity
+     valid = sorted([x for x in (t,e) if x is not None],reverse=True)
+@@ -501,6 +504,23 @@
+     formal_close = (session == '已收盘' and verified_at is not None and
+                     verified_at.date() == now.date() and verified_at.hour >= 15 and
+                     (verified_at-now).total_seconds() <= config.INTRADAY['max_quote_future_seconds'])
++    # Suppliers may update their timestamp after the market has closed. Such
++    # quotes still fail quote_valid; reuse an intact, same-day closing batch
++    # with its original source clock instead of emptying the published lists.
++    close_source = (previous or {}).get('market_strength_close_input') or {}
++    if formal_close and close_source.get('day') == now.date().isoformat():
++        saved = {c:q for c,q in (close_source.get('quotes') or {}).items() if c in pool}
++        valid_now = sum(quote_valid(q,now,session,None,True)[0] for q in qs.values())
++        valid_saved = sum(quote_valid(q,now,session,None,True)[0] for q in saved.values())
++        if valid_now < len(pool)*.60 and valid_saved >= len(pool)*.60:
++            qs = copy.deepcopy(saved)
++            for c,q in qs.items():
++                rows[c].update(copy.deepcopy(q))
++            contexts = {}  # Align preserved prices against the actual formal history.
++            snap['market_strength_close_reference'] = dict(
++                source_at=max(str(q.get('quote_at') or q.get('ts')) for q in qs.values()
++                              if quote_valid(q,now,session,None,True)[0]),
++                reason='收盘后源时间不用于新评分；使用当日已核验收市报价')
+     current, aligned = stock_scores(qs, contexts or {}, histories, calendar, now, session, formal_close) if not reference else ({},{})
+     source = morning_input(previous,now,pool) if session == '午间休市' else None
+     old_models = {r['code']:r.get('market_strength',{}) for r in (previous or {}).get('stocks',[])+(previous or {}).get('coverage_catalog',[])}
+@@ -559,7 +579,8 @@
+         m['consolidating'],m['R3'] = None,None
+         if len(bars)>=5 and positive(q.get('price')):
+             m['R3'] = 100*(q['price']/bars[-3]['close']-1)
+-            m['consolidating'] = q['price'] < bars[-1]['close'] or q['price'] < (q['price']+sum(b['close'] for b in bars[-4:]))/5 or m['R3'] <= 0
++            dp = m['trend_parts_by_period'].get(str(m['dominant_period']), {})
++            m['consolidating'] = q['price'] < (q['price']+sum(b['close'] for b in bars[-4:]))/5 or m['R3'] <= 0 or finite(dp.get('dd')) and dp['dd'] > P['drawdown_shallow_atr']
+         m['phase'],m['strong_days'] = phase(m['trend_score'],m['emotion_score'],[x['score'] for x in m['history_trend']],m['consolidating'])
+         if m['phase']=='启动' and not m['trend_strong']:
+             m['reasons'].append('情绪先行')
+@@ -586,6 +607,13 @@
+                 m['event_evidence']['反包'] = dict(price=price,threshold=bars[-1]['open'],date=bars[-1]['date'])
+         m['events'] = [e for e in P['event_priority'] if e in m['event_evidence']]
+         m['risks'] = list(dict.fromkeys(rows[c].get('intraday_risk_flags') or [])) if m.get('quote_at') else []
++        # Closing price snapshots can legitimately omit intraday flags. A real
++        # current quote still supplies the existing limit-relative drop rule.
++        drop = intraday._drop_risk(q.get('change_pct'),q.get('limit_pct')) if m.get('quote_at') else None
++        if drop:
++            m['risks'].append(drop)
++            if m.get('trend_strong'):
++                m['phase']='明显回落'
+         # Old daily risk_notes mixes qualification failures with risk facts; never project it.
+         p5=m['trend_parts_by_period'].get('5',{})
+         if p5.get('MA_now') is not None and positive(p5.get('ATR')):
+@@ -619,7 +647,7 @@
+             cp['R3'],cp['trimmed_codes'] = trim({c:current[c]['R3'] for c in cons_codes})
+             cp['below_MA5_share'] = mean(qs[c]['price'] < current[c]['trend_parts_by_period']['5']['MA_now'] for c in cons_codes)
+             day_return=m['emotion_parts'].get('R0')
+-            cons = cp['R3'] <= 0 or cp['below_MA5_share'] >= P['phase_consolidation_share'] or finite(day_return) and day_return<0
++            cons = cp['R3'] <= 0 or cp['below_MA5_share'] >= P['phase_consolidation_share']
+         m['consolidation_parts'] = cp
+         m['phase'],m['strong_days'] = phase(m['trend_score'],m['emotion_score'],[x['score'] for x in m['history_trend']],cons)
+         if m['phase']=='启动' and not m['trend_strong']:
+@@ -651,6 +679,9 @@
+         b['lists'] = {k:[r['code'] for r in b['members'] if r['market_strength'][k+'_strong']] for k in ('trend','emotion')}
+         b['lists']['focus'] = [r['code'] for r in b['members'] if r['market_strength']['focus']]
+         b['opportunity'] = dict(version=VERSION,current_opportunity=m['focus'],primary_label=m['phase'],status=m['phase'] or '—',market_strength=m)
++    import direction_changes
++    direction_changes.attach(snap, previous, current, board_current, boards, rows, qs, now,
++                             reference=reference, parameters=P, implementation_hash=IMPLEMENTATION_HASH)
+     stock_lists,board_lists = lists(current),lists(board_current)
+     pool_stats = {}
+     for n in P['periods']:
+@@ -688,6 +719,12 @@
+     snap['radar'] = dict(market_strength=stock_lists)
+     snap['board_opportunity_model'] = dict(version=VERSION,counts=dict(current=len(board_lists['focus'])),lists=dict(current=board_lists['focus']))
+     snap.pop('market_strength_morning_input',None)
++    snap.pop('market_strength_close_input',None)
++    if session == '已收盘':
++        closing = {c:copy.deepcopy(qs[c]) for c,m in current.items()
++                   if m.get('quote_at') and c in qs}
++        if closing:
++            snap['market_strength_close_input'] = dict(day=now.date().isoformat(),quotes=closing)
+     if session in ('早盘','午间休市') and (any(m['trend_score'] is not None or m['emotion_score'] is not None for m in current.values())):
+         snap['market_strength_morning_input'] = dict(at=str(now),session=session,
+             quotes=copy.deepcopy(qs),
+--- before/radar_ui.js
++++ after/radar_ui.js
+@@ -1,68 +1,118 @@
+-/* All scores and candidate lists come from the backend. */
+-var MS_VIEW={radar:{scope:'focus',sort:'trend',phase:'',q:'',limit:60},stocks:{scope:'all',sort:'trend',phase:'',q:'',limit:100},industry:{scope:'focus',sort:'trend',phase:'',q:'',limit:100},theme:{scope:'focus',sort:'trend',phase:'',q:'',limit:100}};
++/* Rankings and strength judgments are backend results. UI only selects confirmed members. */
++var MS_VIEW={radar:{scope:'focus',sort:'trend',phase:'',q:'',limit:24,industryIds:[],themeIds:[],boardQuery:'',allMembers:false},stocks:{axis:'trend',scope:'trend',sort:'trend',phase:'',q:'',limit:100},industry:{scope:'focus',sort:'trend',phase:'',q:'',limit:100},theme:{scope:'focus',sort:'trend',phase:'',q:'',limit:100}};
++var MS_REL_DATA=null,MS_REL={};
+ function msModel(){return DATA.market_strength||{};}
+-function msRows(key){
++function msRelations(code){
++ if(MS_REL_DATA!==DATA){MS_REL_DATA=DATA;MS_REL={};(DATA.board_catalog||[]).forEach(function(b){(b.member_codes||[]).forEach(function(c){(MS_REL[c]||(MS_REL[c]=[])).push(b);});});}
++ return MS_REL[code]||[];
++}
++function msMatchDirections(r){var v=MS_VIEW.radar,relations=msRelations(r.code).map(function(b){return b.id;});
++ return (!v.industryIds.length||v.industryIds.some(function(id){return relations.indexOf(id)>=0;}))&&(!v.themeIds.length||v.themeIds.some(function(id){return relations.indexOf(id)>=0;}));
++}
++function msRows(key,axis){
+  var v=MS_VIEW[key],boards=key==='industry'||key==='theme',src=boards?(DATA.board_catalog||[]):(DATA.stocks||[]).concat(DATA.coverage_catalog||[]),map={};
+  src.forEach(function(r){map[boards?r.id:r.code]=r;});
+- var lists=msModel()[boards?'boards':'stocks']||{},ids=(lists.sorts||{})[v.sort]||lists.all||[],included={};
+- (lists[v.scope]||[]).forEach(function(c){included[c]=true;});if(v.sort==='day_attack')ids=lists.day_attack||[];
++ var lists=msModel()[boards?'boards':'stocks']||{},sort=axis||v.sort,ids=(lists.sorts||{})[sort]||lists.all||[],scope=v.scope;
++ if(key==='radar'&&(v.allMembers||scope==='all'))scope='all';else if(key==='radar'&&axis&&scope==='focus')scope=axis;
++ var included={};(lists[scope]||[]).forEach(function(c){included[c]=true;});if(sort==='day_attack')ids=lists.day_attack||[];
+  return ids.map(function(c){return map[c];}).filter(function(r){
+   if(!r||!included[boards?r.id:r.code]||boards&&r.type!==key)return false;
+   if(key==='stocks'&&STATE.boardFilterId){var b=boardById(STATE.boardFilterId);if(b&&(b.member_codes||[]).indexOf(r.code)<0)return false;}
+-  var m=r.market_strength||{};return (!v.phase||m.phase===v.phase)&&(!v.q||String((r.code||'')+' '+r.name).indexOf(v.q)>=0);
++  if(key==='radar'&&!msMatchDirections(r))return false;
++  var m=r.market_strength||{},tags=(m.labels||[]).concat(m.events||[],m.phase||[]);
++  return (!v.phase||tags.indexOf(v.phase)>=0)&&(!v.q||String((r.code||'')+' '+r.name).indexOf(v.q)>=0);
+  });
+ }
+-function msUpdate(key,field,value){MS_VIEW[key][field]=value;if(field==='scope'){MS_VIEW[key].sort=value==='emotion'?'emotion':value==='day_attack'?'day_attack':'trend';MS_VIEW[key].phase='';}MS_VIEW[key].limit=key==='radar'?60:100;msRender(key);}
+-function msTools(key){var v=MS_VIEW[key];
+- function select(field,opts,label){return '<select aria-label="'+label+'" onchange="msUpdate(\''+key+'\',\''+field+'\',this.value)">'+opts.map(function(x){return '<option value="'+x[0]+'" '+(v[field]===x[0]?'selected':'')+'>'+x[1]+'</option>';}).join('')+'</select>';}
+- var scopes=[['focus','全部强势'],['trend','趋势强'],['emotion','情绪强'],['all','全部股票']];
+- if(key==='radar')scopes=[['focus','全部强势'],['starting','启动'],['trend','趋势强'],['pullback','回踩整理'],['emotion','情绪活跃'],['day_attack','当日异动'],['all','全部股票']];
+- if(key==='industry'||key==='theme')scopes[3][1]='全部板块';
+- return '<div class="radar-tools ms-toolbar">'+select('scope',scopes,'强势范围')+' '+select('sort',(v.scope==='day_attack'?[['day_attack','当日进攻排序']]:[]).concat([['trend','趋势排序'],['emotion','情绪排序'],['combined','两轴最高分排序']]),'强势排序')+' '+select('phase',[['','全部阶段'],['启动','启动'],['推进','推进'],['回踩整理','回踩整理'],['转弱','转弱']],'强势阶段')+' <input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" oninput="msUpdate(\''+key+'\',\'q\',this.value)"> <button class="btn" onclick="msCSV(\''+key+'\')">导出筛选结果 CSV</button></div>';
++function msUpdate(key,field,value){var v=MS_VIEW[key];v[field]=value;
++ if(field==='scope'){v.sort=value==='emotion'?'emotion':value==='day_attack'?'day_attack':'trend';v.phase='';if(key==='stocks'&&value!=='all')v.axis=value;}
++ v.limit=key==='radar'?24:100;msRender(key);
+ }
+-function msScore(m,axis){return m[axis+'_score']==null?'—':fmt(m[axis+'_score'],2)+' · '+esc(m[axis+'_level']||'—');}
++function msStockAxis(axis){var v=MS_VIEW.stocks;v.axis=axis;v.sort=axis;v.scope=v.scope==='all'?'all':axis;v.limit=100;msRender('stocks');}
++function msStockAll(checked){MS_VIEW.stocks.scope=checked?'all':MS_VIEW.stocks.axis;MS_VIEW.stocks.limit=100;msRender('stocks');}
++function msRadarAll(checked){MS_VIEW.radar.allMembers=checked;MS_VIEW.radar.limit=24;msRender('radar');}
++function msToggleBoard(id){var b=boardById(id);if(!b)return;var v=MS_VIEW.radar,field=b.type==='industry'?'industryIds':'themeIds',idx=v[field].indexOf(id);if(idx<0)v[field].push(id);else v[field].splice(idx,1);v.openKind=b.type;v.limit=24;msRender('radar');}
++function msClearDirections(){MS_VIEW.radar.industryIds=[];MS_VIEW.radar.themeIds=[];MS_VIEW.radar.boardQuery='';msRender('radar');}
++function msOpenRadar(id,axis){msClearRadarState();if(id){var b=boardById(id);if(b)MS_VIEW.radar[b.type==='industry'?'industryIds':'themeIds']=[id];}if(axis){MS_VIEW.radar.scope=axis;MS_VIEW.radar.sort=axis;}closeDrawer();RENDERED.radar=false;goPane('radar');renderRadar();}
++function msClearRadarState(){MS_VIEW.radar={scope:'focus',sort:'trend',phase:'',q:'',limit:24,industryIds:[],themeIds:[],boardQuery:'',allMembers:false};}
++function msSelect(field,opts,key,label){var v=MS_VIEW[key];return '<select aria-label="'+label+'" onchange="msUpdate(\''+key+'\',\''+field+'\',this.value)">'+opts.map(function(x){return '<option value="'+x[0]+'" '+(v[field]===x[0]?'selected':'')+'>'+x[1]+'</option>';}).join('')+'</select>';}
++function msTools(key){var v=MS_VIEW[key],h='';
++ if(key==='stocks')h='<div class="ms-style-tabs" role="tablist" aria-label="个股风格"><button role="tab" aria-selected="'+(v.axis==='trend')+'" class="ms-tab '+(v.axis==='trend'?'on':'')+'" onclick="msStockAxis(\'trend\')">趋势榜</button><button role="tab" aria-selected="'+(v.axis==='emotion')+'" class="ms-tab emotion '+(v.axis==='emotion'?'on':'')+'" onclick="msStockAxis(\'emotion\')">情绪榜</button></div>';
++ h+='<div class="ms-toolbar">';
++ if(key==='stocks')h+='<label class="ms-check"><input type="checkbox" aria-label="查看完整排名" '+(v.scope==='all'?'checked':'')+' onchange="msStockAll(this.checked)">查看完整排名</label>';
++ else if(key==='radar')h+=msSelect('scope',(v.scope==='day_attack'?[['day_attack','当日异动']]:[]).concat([['focus','任一强势'],['trend','趋势强'],['emotion','情绪强'],['both','双强']]),'radar','强势风格')+'<label class="ms-check"><input type="checkbox" aria-label="查看全部成员" '+(v.allMembers?'checked':'')+' onchange="msRadarAll(this.checked)">查看全部成员</label><button class="ms-detail-link" onclick="msUpdate(\'radar\',\'scope\',\'day_attack\')">当日异动</button>';
++ else h+=msSelect('scope',[['focus','全部强势'],['trend','趋势强'],['emotion','情绪强'],['all','全部板块']],key,'强势范围')+msSelect('sort',[['trend','趋势排序'],['emotion','情绪排序']],key,'强势排序');
++ h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" oninput="msUpdate(\''+key+'\',\'q\',this.value)"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
++}
++function msDirectionPicker(){var v=MS_VIEW.radar,selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
++ var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同类多选取并集，行业与题材同时选择取交集 · 同花顺确认成员</p></div><button class="btn" onclick="msClearDirections()">清除方向</button></div><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" oninput="MS_VIEW.radar.boardQuery=this.value;msRender(\'radar\')">';
++ h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向：展示沪深主板强势股票</span>')+'</div>';
++ ['industry','theme'].forEach(function(kind){var rows=(DATA.board_catalog||[]).filter(function(b){return b.type===kind&&(!q||b.name.indexOf(q)>=0);}),rank=((msModel().boards||{}).sorts||{}).trend||[],order={};rank.forEach(function(id,i){order[id]=i;});rows.sort(function(a,b){return (order[a.id]==null?1e9:order[a.id])-(order[b.id]==null?1e9:order[b.id]);});
++  h+='<details '+(q||v.openKind===kind?'open':'')+' class="ms-direction-options"><summary>'+ (kind==='industry'?'行业':'题材')+' · '+rows.length+' 个方向</summary><div class="ms-chip-list">'+rows.map(function(b){var on=selected.indexOf(b.id)>=0;return '<button aria-pressed="'+on+'" class="ms-chip '+(on?'selected':'')+'" onclick="msToggleBoard(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
++ });return h+'</section>';
++}
++function msScore(m,axis){return m[axis+'_score']==null?'—':fmt(m[axis+'_score'],1)+' · '+esc(m[axis+'_level']||'—');}
+ function msBadge(m,axis){return '<span class="ms-badge ms-'+axis+' '+(m[axis+'_score']>=65?'ms-hot':'')+'">'+(axis==='trend'?'趋势 ':'情绪 ')+msScore(m,axis)+'</span>';}
+ function msHistory(m,n){var r=(m.history_returns||{})[n];return r==null?'—':pct(r,2);}
+-function msMore(rows,shown,key){return (rows.length>shown.length?'<button class="btn" onclick="MS_VIEW[\''+key+'\'].limit+=100;msRender(\''+key+'\')">加载更多（完整 '+rows.length+' 项）</button>':'')+(!rows.length?'<p class="empty">暂无符合条件的对象，可切换到其他类型或全部股票。</p>':'');}
+-function msTable(rows,key,limit){var boards=key==='industry'||key==='theme',shown=limit?rows.slice(0,limit):rows;
+- var h='<div class="tw"><table class="market-strength-table ms-research-table"><thead><tr><th class="l">名称</th><th>当日涨幅</th><th>趋势强度</th><th>情绪强度</th><th>完成日20日涨幅</th><th class="l">结构 / 阶段</th><th class="l">进攻信号</th></tr></thead><tbody>';
+- shown.forEach(function(r){var m=r.market_strength||{},chg=boards?(m.emotion_parts||{}).R0:r.change_pct;
+- h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'"><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||r.type)+'</span></td><td>'+pct(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td>'+msHistory(m,20)+'</td><td class="l">'+esc(m.phase||'—')+'<span class="cd">'+esc((m.background||{}).label||((m.dominant_period||'—')+'日主导'))+'</span></td><td class="l">'+esc((m.events||[]).join('、')||'—')+'<span class="cd">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
++function msTags(m){return (m.labels||m.events||[]).map(function(t){return '<span class="ms-tag '+(t==='明显回落'?'risk':'')+'">'+esc(t)+'</span>';}).join('')||'<span class="ms-muted">暂无新增形态标签</span>';}
++function msAffiliation(r,key){var rel=msRelations(r.code),v=MS_VIEW.radar,selected=v.industryIds.concat(v.themeIds),matched=key==='radar'?rel.filter(function(b){return selected.indexOf(b.id)>=0;}):[],themes=rel.filter(function(b){return b.type==='theme';}),industry=r.industry_detail||r.industry||'行业未收录';
++ var h='<div class="ms-affiliation"><span class="ms-industry">'+esc(industry)+'</span>';
++ if(matched.length)h+='<div class="ms-match">匹配方向：'+matched.map(function(b){return esc(b.name);}).join(' / ')+'</div>';
++ var display=themes.slice(0,2);h+=display.map(function(b){return '<button class="ms-chip small" onclick="event.stopPropagation();msOpenRadar(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('');
++ if(themes.length>2)h+='<details onclick="event.stopPropagation()"><summary>+'+(themes.length-2)+' 个题材</summary><div class="ms-chip-list">'+themes.slice(2).map(function(b){return '<button class="ms-chip small" onclick="event.stopPropagation();msOpenRadar(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
++ return h+'</div>';
++}
++function msMore(rows,shown,key){return (rows.length>shown.length?'<button class="btn" onclick="MS_VIEW[\''+key+'\'].limit+=100;msRender(\''+key+'\')">加载更多（完整 '+rows.length+' 项）</button>':'')+(!rows.length?'<p class="empty">暂无符合条件的股票或方向，可调整当前筛选。</p>':'');}
++function msTable(rows,key,limit){var boards=key==='industry'||key==='theme',shown=limit?rows.slice(0,limit):rows,axis=key==='stocks'?MS_VIEW.stocks.axis:null;
++ var h='<div class="tw"><table class="market-strength-table ms-research-table"><thead><tr><th class="l">名称 / 所属方向</th><th>当日涨幅</th><th>趋势强度</th><th>情绪强度</th><th>'+ (axis==='emotion'?'进攻 / 保持 / 活跃':'历史5 / 10 / 20日')+'</th><th class="l">结构 / 个性标签</th></tr></thead><tbody>';
++ shown.forEach(function(r){var m=r.market_strength||{},chg=boards?(m.emotion_parts||{}).R0:r.change_pct,ev=m.display_evidence||{},recent=m.recent_emotion||{};
++ var metric=axis==='emotion'?'<b>'+fmt(m.day_attack,1)+' / '+fmt(ev.hold,1)+' / '+(recent.active_days==null?'—':recent.active_days+'/5')+'</b><span class="cd">完成日5日 '+msHistory(m,5)+'</span>':[5,10,20].map(function(n){return '<span class="ms-return '+(m.dominant_period===n?'dominant':'')+'">'+n+'日 '+msHistory(m,n)+'</span>';}).join('');
++ h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'"><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span>'+(boards?'':msAffiliation(r,key))+'</td><td>'+pct(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td class="ms-metric-cell">'+metric+'</td><td class="l"><span class="cd">'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</span><div class="ms-tag-list">'+msTags(m)+'</div><span class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
+  });return h+'</tbody></table></div>'+msMore(rows,shown,key);
+ }
+-function msCard(r,board){var m=r.market_strength||{},recent=m.recent_emotion||{},bg=m.background||{};
+- var info=board?'确认成员 '+((m.expected||r.member_codes&&r.member_codes.length)||0)+' 只':esc(bg.label||'')+' · '+esc(m.dominant_period?(m.dominant_period+'日主导'):'当日异动');
+- return '<article class="ms-discovery-card clickable" data-strength-id="'+esc(r.id||r.code)+'" onclick="'+(board?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'"><div class="ms-card-head"><div><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||r.type)+'</span></div><strong>'+pct(board?(m.emotion_parts||{}).R0:r.change_pct,2)+'</strong></div><div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><p class="ms-card-context">'+info+'</p><div class="ms-mini-metrics"><span>完成日5日 <b>'+msHistory(m,5)+'</b></span><span>完成日20日 <b>'+msHistory(m,20)+'</b></span></div><p class="ms-card-signal">'+esc(m.phase||'—')+' · '+esc((m.events||[]).join(' / ')||'无新突破事件')+'</p>'+(board?'':'<p class="ms-muted">近5日活跃 '+(recent.active_days==null?'—':recent.active_days)+'/5 · 当日进攻 '+fmt(m.day_attack,1)+'</p>')+'<p class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；')||'')+'</p></article>';
++function msCard(r,board){var m=r.market_strength||{},recent=m.recent_emotion||{},ev=m.display_evidence||{};
++ return '<article class="ms-discovery-card clickable" data-strength-id="'+esc(r.id||r.code)+'" onclick="showStock(\''+jsq(r.code)+'\')"><div class="ms-card-head"><div><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span></div><strong>'+pct(r.change_pct,2)+'</strong></div>'+msAffiliation(r,'radar')+'<div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><p class="ms-card-context">'+esc((m.background||{}).label||'')+' · '+esc(m.dominant_period?(m.dominant_period+'日主导'):'')+' · '+esc(ev.structure||'')+'</p><div class="ms-mini-metrics"><span>完成日5日 <b>'+msHistory(m,5)+'</b></span><span>完成日20日 <b>'+msHistory(m,20)+'</b></span></div><div class="ms-tag-list">'+msTags(m)+'</div><p class="ms-muted">近5日活跃 '+(recent.active_days==null?'—':recent.active_days)+'/5 · 当日进攻 '+fmt(m.day_attack,1)+'</p><p class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</p></article>';
+ }
+-function msStamp(){var m=msModel();return esc(m.mode||'')+' · 行情判断 '+esc(String(m.at||'—').slice(0,19));}
+-function msRender(key){var rows=msRows(key),v=MS_VIEW[key],shown=rows.slice(0,v.limit);
+- var intro=key==='radar'?'寻找启动、趋势推进与回踩整理；当日异动单列，结合历史背景判断。':key==='stocks'?'完整股票研究库 · 点击查看60日K线、两轴依据与所属板块。':'成员共振排行 · 点击查看确认成员及官方指数参照。';
+- var html=msTools(key)+'<p class="ms-muted">'+intro+' 当前 '+rows.length+' 项。</p>'+(key==='radar'?'<div class="ms-card-grid">'+shown.map(function(r){return msCard(r,false);}).join('')+'</div>'+msMore(rows,shown,key):msTable(rows,key,v.limit));
++function msStamp(){var m=msModel();return esc(m.mode||'')+' · 行情截至 '+esc(String((DATA.direction_changes||{}).source_at||m.at||'—').slice(0,19))+' · 沪深主板';}
++function msDelta(value,digits){return value==null?'—':(value>0?'+':'')+fmt(value,digits);}
++function msRender(key){var v=MS_VIEW[key],rows=msRows(key),html='';
++ if(key==='radar')html+=msDirectionPicker();
++ html+=msTools(key);
++ if(key==='radar'&&(v.scope==='focus'||v.scope==='both'||v.allMembers)){
++  html+='<p class="ms-muted">当前筛选 '+rows.length+' 只 · 两榜独立，允许重复 · 标签不作为必过条件</p>';
++  ['trend','emotion'].forEach(function(axis){var group=msRows(key,axis),shown=group.slice(0,v.limit);html+='<section class="ms-radar-group" data-axis="'+axis+'"><h3>'+(axis==='trend'?'趋势强势成员':'情绪强势成员')+' <span class="ms-muted">'+group.length+' 只</span></h3><div class="ms-card-grid">'+shown.map(function(r){return msCard(r,false);}).join('')+'</div>'+msMore(group,shown,key)+'</section>';});
++ }else if(key==='radar'){var shown=rows.slice(0,v.limit);html+='<p class="ms-muted">当前筛选 '+rows.length+' 只 · 按'+(v.sort==='emotion'?'情绪':v.sort==='day_attack'?'当日进攻':'趋势')+'强度排序</p><div class="ms-card-grid">'+shown.map(function(r){return msCard(r,false);}).join('')+'</div>'+msMore(rows,shown,key);
++ }else{html+='<p class="ms-muted">'+(key==='stocks'?(v.axis==='trend'?'历史上涨力度与结构决定趋势排名；当天大涨不是入榜要求。':'当日进攻、区间保持与近期活跃决定情绪排名；不要求历史趋势强。'):'同花顺确认成员共振；官方指数在详情中单列。')+' 当前 '+rows.length+' 项。</p>'+msTable(rows,key,v.limit);}
+  var host=document.getElementById(key==='radar'?'radar-opportunities':key==='industry'?'board-center':key==='theme'?'theme-center':'ms-stock-host');
+- if(host){var focused=document.activeElement,label=focused&&focused.getAttribute('aria-label'),position=focused&&focused.selectionStart;host.innerHTML=html;if(label==='强势搜索'){var next=host.querySelector('[aria-label="强势搜索"]');next.focus();if(position!=null)next.setSelectionRange(position,position);}}
++ if(host){var focused=document.activeElement,label=focused&&focused.getAttribute('aria-label'),position=focused&&focused.selectionStart;host.innerHTML=html;if(label==='强势搜索'||label==='搜索板块题材'){var next=host.querySelector('[aria-label="'+label+'"]');next.focus();if(position!=null)next.setSelectionRange(position,position);}}
+ }
+ function renderRadar(){['radar-views','radar-tools','radar-daily','radar-close','rad-tiers','tb-radar','rad-more'].forEach(function(id){var e=document.getElementById(id);if(e){e.innerHTML='';e.style.display='none';}});document.getElementById('rad-sub').innerHTML=msStamp();msRender('radar');}
+ function exportRadarCSV(){msCSV('radar');}
+ function renderBoards(){document.getElementById('bd-metrics').innerHTML='<div class="card"><h3>行业强度</h3><p>'+msStamp()+'</p></div>';msRender('industry');}
+ function renderThemesPage(){msRender('theme');}
+-function renderStocks(){document.getElementById('stk-sub').textContent=msStamp();var stockHeading=document.querySelector('#p-stocks h1');if(stockHeading)stockHeading.textContent='个股研究库';var oldSearch=document.querySelector('#p-stocks .search');if(oldSearch)oldSearch.style.display='none';var table=document.getElementById('tb-stocks'),res=document.getElementById('stk-res');
++function renderStocks(){document.getElementById('stk-sub').textContent=msStamp();var stockHeading=document.querySelector('#p-stocks h1');if(stockHeading)stockHeading.textContent='个股强度榜';var oldSearch=document.querySelector('#p-stocks .search');if(oldSearch)oldSearch.style.display='none';var table=document.getElementById('tb-stocks'),res=document.getElementById('stk-res');
+  if(!document.getElementById('ms-stock-host')){var host=document.createElement('div');host.id='ms-stock-host';table.parentNode.insertBefore(host,table);table.style.display='none';}
+- res.innerHTML=STATE.boardFilterId?'当前成员：'+esc((boardById(STATE.boardFilterId)||{}).name||''):'全部主板股票 · 历史结构与实时强度';
++ res.innerHTML=STATE.boardFilterId?'当前成员：'+esc((boardById(STATE.boardFilterId)||{}).name||''):'沪深主板 · 趋势与情绪独立排名';
+  ['stk-more','stock-view-tabs','stock-views','stk-view-tabs','btn-filter','btn-export','q'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});
+  var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.style.display=STATE.boardFilterId?'':'none';only.onclick=clearMSMembers;}
+  if(STATE.q){MS_VIEW.stocks.q=STATE.q;MS_VIEW.stocks.scope='all';}msRender('stocks');
+ }
+-function renderOverview(){document.getElementById('hero-h1').textContent='强势市场工作台';document.getElementById('hero-p').textContent='先看强板块，再看趋势与情绪。启动和回踩都保留。';document.getElementById('hero-stamp').textContent=msStamp();
++function msDirectionCard(b,axis){var m=b.market_strength||{},share=(m.member_strength||{})[axis+'_pct'],r0=(m.emotion_parts||{}).R0,dc=m.direction_change,a=dc&&dc.axes&&dc.axes[axis],lists=msModel().stocks||{},lookup={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){lookup[r.code]=r;});var leaders=(((lists.sorts||{})[axis])||[]).filter(function(c){return (b.member_codes||[]).indexOf(c)>=0&&lookup[c]&&(lookup[c].market_strength||{})[axis+'_strong'];}).slice(0,3);
++ return '<article class="ms-direction-card '+axis+'" data-board-id="'+esc(b.id)+'" data-axis="'+axis+'"><div class="ms-card-head"><button class="ms-name-link" onclick="msOpenRadar(\''+jsq(b.id)+'\',\''+axis+'\')">'+esc(b.name)+'</button><button class="ms-detail-link" onclick="showBoardById(\''+jsq(b.id)+'\')">详情 ↗</button></div>'+msBadge(m,axis)+'<div class="ms-mini-metrics"><span>成员整体涨幅<b>'+pct(r0,2)+'</b></span><span>'+ (axis==='trend'?'趋势':'情绪')+'强股占比<b>'+fmt(share,1)+'%</b></span></div>'+(a?'<p class="ms-muted">较 '+esc(dc.from_at.slice(11,16))+' · 成员涨幅 '+msDelta(dc.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(a.share_delta_pp,1)+'个百分点</p>':'')+'<div class="ms-leaders">'+leaders.map(function(c){return '<button onclick="showStock(\''+jsq(c)+'\')">'+esc(lookup[c].name)+'</button>';}).join('')+'</div></article>';
++}
++function renderOverview(){document.getElementById('hero-h1').textContent='今天重点看哪里';document.getElementById('hero-p').textContent='市场温度 · 趋势与情绪集中方向 · 最新行情中的转强变化';document.getElementById('hero-stamp').textContent=msStamp();
+  ['ov-work-live','ov-work-close','overview-more'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});var sw=document.querySelector('#p-overview .work-switch');if(sw)sw.style.display='none';
+  var host=document.getElementById('ms-overview-host');if(!host){host=document.createElement('div');host.id='ms-overview-host';document.querySelector('#p-overview .main').prepend(host);}
+- var meta=msModel(),counts=meta.counts||{},lookup={},bl={},breadth=DATA.breadth||{},temperature=DATA.market_emotion||{};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){lookup[r.code]=r;});(DATA.board_catalog||[]).forEach(function(b){bl[b.id]=b;});
+- function stockGroup(title,ids,note){return '<section class="card ms-overview-section"><h3>'+title+'</h3><p class="ms-muted">'+note+'</p><div class="ms-card-grid">'+ids.slice(0,6).map(function(id){return lookup[id]?msCard(lookup[id],false):'';}).join('')+'</div></section>';}
+- var sl=meta.stocks||{},sorts=sl.sorts||{},trends=(sorts.trend||[]).filter(function(c){return (sl.trend||[]).indexOf(c)>=0;}),emotions=(sorts.emotion||[]).filter(function(c){return (sl.emotion||[]).indexOf(c)>=0;});
+- var bs=meta.boards||{},strongBoards=((bs.sorts||{}).trend||[]).filter(function(id){return (bs.focus||[]).indexOf(id)>=0;});
+- host.innerHTML='<section class="card ms-overview-section"><h3>市场温度</h3><p class="ms-muted">当前主板报价池 · '+(temperature.traded||breadth.traded||0)+'只成交 · 上涨占比 '+fmt(breadth.up_ratio,1)+'% · 涨停 '+(temperature.limit_up||0)+' · 跌停 '+(temperature.limit_down||0)+' · 昨日涨停股当前中位涨幅 '+pct(temperature.yesterday_limit_median_pct,2)+'</p></section><div class="ms-summary-grid">'+[['趋势强',counts.trend||0],['情绪强',counts.emotion||0],['启动',(sl.starting||[]).length],['回踩整理',(sl.pullback||[]).length]].map(function(x){return '<div class="card"><span class="ms-muted">'+x[0]+'</span><strong class="ms-stat">'+x[1]+'</strong></div>';}).join('')+'</div><section class="card ms-overview-section"><h3>强势板块 / 题材</h3><p class="ms-muted">按成员趋势排序，点击查看共振与成员。</p><div class="ms-card-grid">'+strongBoards.slice(0,6).map(function(id){return bl[id]?msCard(bl[id],true):'';}).join('')+'</div></section>'+stockGroup('趋势领先',trends,'历史积累优先，当前涨幅只占趋势强度的一部分。')+stockGroup('情绪领先',emotions,'当日进攻、区间保持与近5日活跃背景。')+'<p class="ms-muted">'+esc(meta.version||'')+' · '+esc(DATA.ui_generation||'')+' · 两轴独立；风险仅提示。</p>';
++ var meta=msModel(),counts=meta.counts||{},breadth=DATA.breadth||{},temperature=DATA.market_emotion||{},bl={};(DATA.board_catalog||[]).forEach(function(b){bl[b.id]=b;});var dc=DATA.direction_changes||{},pool=(meta.coverage||{}).pool||0;
++ var metrics=[['上涨占比',fmt(breadth.up_ratio,1)+'%'],['涨停 / 跌停',(temperature.limit_up||0)+' / '+(temperature.limit_down||0)],['昨日涨停股表现',pct(temperature.yesterday_limit_median_pct,2)],['趋势强 / 情绪强',(counts.trend||0)+' / '+(counts.emotion||0)]];
++ var h='<section class="card ms-overview-section"><div class="ms-section-head"><h3>市场温度</h3><span class="ms-muted">沪深主板 · '+(temperature.traded||breadth.traded||0)+'只成交</span></div><div class="ms-temperature-grid">'+metrics.map(function(x){return '<div><span>'+x[0]+'</span><strong>'+x[1]+'</strong></div>';}).join('')+'</div><p class="ms-muted">股票池 '+pool+' 只 · 趋势强占比 '+fmt(pool?100*(counts.trend||0)/pool:null,1)+'% · 情绪强占比 '+fmt(pool?100*(counts.emotion||0)/pool:null,1)+'%'+(dc.temperature_change?' · 较 '+esc(dc.from_at.slice(11,16))+' 可比样本上涨占比变化 '+msDelta(dc.temperature_change.up_ratio_delta_pp,1)+'个百分点':'')+'</p></section>';
++ h+='<section class="card ms-overview-section"><div class="ms-section-head"><h3>正在转强</h3><span class="ms-muted">'+(dc.from_at?'比较 '+esc(dc.from_at.slice(11,19))+' → '+esc(dc.source_at.slice(11,19)):'依据同日可比行情变化')+'</span></div>';
++ var changes=(dc.items||[]).slice(0,6);h+=changes.length?'<div class="ms-turning-grid">'+changes.map(function(x){return '<button class="ms-turning-card '+x.axis+'" onclick="msOpenRadar(\''+jsq(x.id)+'\',\''+x.axis+'\')"><b>'+esc(x.name)+'</b><span>'+ (x.axis==='trend'?'趋势':'情绪')+' · '+esc(x.kind)+'</span><small>成员涨幅 '+msDelta(x.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(x.share_delta_pp,1)+'个百分点</small></button>';}).join('')+'</div>':'<p class="ms-muted">'+(dc.from_at?'本次可比行情中暂无符合转强条件的方向。':'暂无同日可比行情变化记录；下面展示最新强势方向。')+'</p>';h+='</section>';
++ ['trend','emotion'].forEach(function(axis){var lists=meta.boards||{},ids=((lists.sorts||{})[axis]||[]).filter(function(id){return (lists[axis]||[]).indexOf(id)>=0;});h+='<section class="card ms-overview-section"><div class="ms-section-head"><h3>'+(axis==='trend'?'趋势集中方向':'情绪集中方向')+'</h3><button class="btn" onclick="msOpenRadar(null,\''+axis+'\')">查看对应强势股 →</button></div><div class="ms-direction-columns">';['industry','theme'].forEach(function(kind){var rows=ids.map(function(id){return bl[id];}).filter(function(b){return b&&b.type===kind;});h+='<div><div class="ms-section-head"><h4>'+ (kind==='industry'?'行业':'题材')+' <span class="ms-muted">'+rows.length+' 个强势方向</span></h4><button class="ms-detail-link" onclick="MS_VIEW.'+kind+'.scope=\''+axis+'\';MS_VIEW.'+kind+'.sort=\''+axis+'\';RENDERED.'+(kind==='industry'?'boards':'themes')+'=false;goPane(\''+(kind==='industry'?'boards':'themes')+'\')">全部 →</button></div><div class="ms-direction-grid">'+rows.slice(0,4).map(function(b){return msDirectionCard(b,axis);}).join('')+'</div>'+(!rows.length?'<p class="ms-muted">当前没有达到强势范围的方向。</p>':'')+'</div>';});h+='</div></section>';});
++ host.innerHTML=h+'<p class="ms-muted">'+esc(meta.version||'')+' · '+esc(DATA.ui_generation||'')+' · 行业题材采用同花顺确认成员，最新源时间单独显示。</p>';
+ }
+ function renderWorkboard(){renderOverview();}
+-function msDetail(m){var h='<section class="card market-strength-detail"><div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><p>阶段 '+esc(m.phase||'—')+' · '+esc((m.background||{}).label||'')+' · '+esc((m.events||[]).join(' / ')||'无新突破事件')+'</p><p>'+esc((m.reasons||[]).join('；')||'—')+'</p><p class="ms-card-risk">'+esc((m.risks||[]).join('；')||'')+'</p>';
++
++function msDetail(m){var ev=m.display_evidence||{},h='<section class="card market-strength-detail"><div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><div class="ms-tag-list">'+msTags(m)+'</div><p>'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</p><p>'+esc((m.reasons||[]).join('；')||'—')+'</p><p class="ms-muted">距阶段高点 '+fmt(ev.drawdown_atr,2)+' ATR · '+[5,10,20].map(function(n){return '距MA'+n+' '+pct((ev.ma_distance_pct||{})[n],2);}).join(' / ')+'</p>'+(m.new_strong_axes||[]).map(function(x){return '<p class="ms-muted">'+(x.axis==='trend'?'趋势':'情绪')+'新进入强势：'+esc(x.basis)+' '+esc(x.from_at)+' → '+esc(x.to_at||'—')+'</p>';}).join('')+'<p class="ms-card-risk">'+esc((m.risks||[]).join('；')||'')+'</p>';
+  h+='<details><summary>强度计算依据与实际数值</summary><p>趋势：75%完成日历史力度 + 25%当前窗口力度，再乘结构系数；力度内部60%绝对收益 + 40%同周期分位。5/10/20日择强，20/60日背景另外展示。个股绝对力度满分尺度8/12/20%，板块5/8/12%。板块情绪：40%成员整体进攻 + 35%情绪强股比例 + 25%成员保持中位数。个股情绪：60%当日进攻 + 20%区间保持 + 20%近5日活跃。≥65强，≥80很强；单一价格涨停保持分50，不代表封板时长。</p><div class="tw"><table><thead><tr><th>周期</th><th>完成日涨幅</th><th>当前窗口涨幅</th><th>历史力度</th><th>当前力度</th><th>结构系数</th><th>趋势分</th></tr></thead><tbody>';
+  [5,10,20].forEach(function(n){var p=(m.trend_parts_by_period||{})[n]||{};h+='<tr><td>'+n+'日</td>'+['historical_R','R','historical_G','G','K','T'].map(function(k){return '<td>'+fmt(p[k],2)+'</td>';}).join('')+'</tr>';});
+  h+='</tbody></table></div><p>'+esc(m.version||'')+' · '+esc(m.mode||'')+' · 截至 '+esc(m.trend_at||m.emotion_at||'—')+' · UI '+esc(DATA.ui_generation||'')+'</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据来源与缺口</summary>'+esc((m.data_reasons||[]).join('；')||'当前计算数据完整')+'</details></section>';return h;
+@@ -72,10 +122,12 @@
+  var h='<section class="card"><div class="ms-card-head"><div><h3>'+esc(s.name)+' <span class="cd">'+esc(code)+'</span></h3><p class="ms-muted">'+esc(s.industry||s.industry_detail||'')+'</p></div><div class="detail-price">'+fmt(s.price,2)+' <small>'+pct(s.change_pct,2)+'</small></div></div><h3>60日历史K线</h3>'+(hasOHLC||hasClose?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas><p class="ms-muted">'+(hasOHLC?'完成日OHLC · MA5 / MA10 / MA20 · 成交量；现价仅在口径确认后画虚线，不补成完成日K线。':'完成日收盘走势 · OHLC不足，当前价与历史口径需结合来源。')+'</p>':'<p class="ms-muted">暂无可用历史走势图</p>')+'</section>'+msDetail(s.market_strength||{});
+  var themes=s.themes||s.concepts||[];if(!Array.isArray(themes))themes=[themes];h+='<section class="card"><h3>所属板块 / 题材</h3><p>'+esc(themes.map(function(t){return typeof t==='string'?t:t.name||'';}).join(' / ')||s.industry||'—')+'</p></section>';
+  var confirmed=(DATA.board_catalog||[]).filter(function(b){return (b.member_codes||[]).indexOf(code)>=0;});if(confirmed.length)h+='<section class="card"><h3>确认成员关系</h3><div class="ms-axis">'+confirmed.map(function(b){return '<button class="btn" onclick="pickBoardMembers(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></section>'; openDrawer(esc(s.name)+' '+esc(code),'个股研究 · 历史结构与实时进攻',h,true);
+- setTimeout(function(){var cv=document.getElementById('k-cv');if(cv){if(hasOHLC)msDrawCandles(cv,bars,(s.market_strength||{}).quote_at&&(s.market_strength||{}).price_context&&s.market_strength.price_context.valid?s.price:null);else if(hasClose)drawTrend(cv,s.k);}},30);
++ setTimeout(function(){var cv=document.getElementById('k-cv');if(cv){if(hasOHLC){var price=(s.market_strength||{}).quote_at&&(s.market_strength||{}).price_context&&s.market_strength.price_context.valid?s.price:null;MS_CHART={bars:bars,price:price};var tools=document.createElement('div');tools.className='ms-chart-tools';tools.innerHTML='<label>显示区间 <select aria-label="K线显示区间" onchange="msChartRange(Number(this.value))"><option value="60">60日</option><option value="40">40日</option><option value="20">20日</option></select></label><span id="k-readout">移到K线上查看日期、OHLC与成交量</span>';cv.parentNode.insertBefore(tools,cv);msDrawCandles(cv,bars,price,60);}else if(hasClose)drawTrend(cv,s.k);}},30);
+ }
+-function msDrawCandles(cv,bars,price){var dpr=window.devicePixelRatio||1,w=cv.clientWidth||600,h=cv.clientHeight||310,g=cv.getContext('2d');cv.width=w*dpr;cv.height=h*dpr;g.scale(dpr,dpr);g.clearRect(0,0,w,h);
+- var pad=45,top=22,bottom=h*.73,volTop=h*.79,step=(w-pad-15)/bars.length,closes=bars.map(function(b){return b.close;}),mas=[5,10,20].map(function(n){return ma(closes,n);}),values=[];
++var MS_CHART=null;
++function msChartRange(n){var cv=document.getElementById('k-cv');if(cv&&MS_CHART)msDrawCandles(cv,MS_CHART.bars,MS_CHART.price,n);}
++function msDrawCandles(cv,fullBars,price,count){var allMA=[5,10,20].map(function(n){return ma(fullBars.map(function(b){return b.close;}),n);}),bars=fullBars.slice(-(count||60)),mas=allMA.map(function(a){return a.slice(-bars.length);});var dpr=window.devicePixelRatio||1,w=cv.clientWidth||600,h=cv.clientHeight||310,g=cv.getContext('2d');cv.width=w*dpr;cv.height=h*dpr;g.scale(dpr,dpr);g.clearRect(0,0,w,h);
++ var pad=45,top=22,bottom=h*.73,volTop=h*.79,step=(w-pad-15)/bars.length,values=[];
+  bars.forEach(function(b){values.push(b.high,b.low);});if(price>0)values.push(price);var lo=Math.min.apply(null,values),hi=Math.max.apply(null,values),range=hi-lo||1;lo-=range*.04;hi+=range*.04;
+  var x=function(i){return pad+(i+.5)*step;},y=function(v){return bottom-(v-lo)/(hi-lo)*(bottom-top);};g.font='10px sans-serif';g.fillStyle='#8b929d';
+  for(var j=0;j<4;j++){var v=lo+(hi-lo)*j/3,yy=y(v);g.strokeStyle='#eceef2';g.beginPath();g.moveTo(pad,yy);g.lineTo(w-15,yy);g.stroke();g.fillText(v.toFixed(2),2,yy+3);}
+@@ -84,9 +136,10 @@
+  ['#e19a2d','#8a6bb1','#367ad6'].forEach(function(color,i){g.strokeStyle=color;g.lineWidth=1.2;g.beginPath();var started=false;mas[i].forEach(function(v,j){if(v==null)return;if(!started){g.moveTo(x(j),y(v));started=true;}else g.lineTo(x(j),y(v));});g.stroke();g.fillStyle=color;g.fillText('MA'+[5,10,20][i],pad+i*65,12);});
+  if(price>0){g.setLineDash([4,4]);g.strokeStyle='#768294';g.beginPath();g.moveTo(pad,y(price));g.lineTo(w-15,y(price));g.stroke();g.setLineDash([]);g.fillStyle='#768294';g.fillText('现价 '+fmt(price,2),w-105,12);}
+  g.fillStyle='#8b929d';g.fillText(bars[0].date,pad,h-3);g.fillText(bars[bars.length-1].date,w-85,h-3);g.fillText('成交量',pad,volTop-3);
++ cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+fmt(b.volume,0);};
+ }
+ function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],idx=(b.market_strength||{}).index_reference||{};var html=msDetail(b.market_strength||{})+'<section class="card"><h3>官方指数参照</h3><p>'+esc(idx.source||'同花顺指数')+' · '+pct(idx.change_pct==null?idx.ret1:idx.change_pct,2)+' · '+esc(idx.quote_at||idx.asof||'—')+'</p><p class="ms-muted">成员共振与官方指数分别计算。</p></section><section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members,'members')+'</section>';openDrawer(esc(b.name),'板块研究 · 成员共振与指数参照',html,true);}
+-function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';MS_VIEW.stocks={scope:'all',sort:'trend',phase:'',q:'',limit:100};}
++function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';MS_VIEW.stocks={axis:'trend',scope:'all',sort:'trend',phase:'',q:'',limit:100};}
+ function pickBoardMembers(id){var b=boardById(id);if(!b)return toast('板块成员暂无数据');STATE.filters=defaultFilters();STATE.boardFilterId=id;resetMSMemberView();closeDrawer();RENDERED.stocks=false;goPane('stocks');renderStocks();}
+ function clearMSMembers(){STATE.boardFilterId=null;resetMSMemberView();renderStocks();}
+ function boardMemberRows(b,codes){return msTable((b.members||[]).filter(function(r){return codes.indexOf(r.code)>=0;}),'members');}
+--- before/test_board_latest.py
++++ after/test_board_latest.py
+@@ -160,7 +160,9 @@
+         for returned,bars,error in [('错误名称',self.corrected,None),(None,self.corrected,OSError('offline')),
+                                     (None,self.corrected+[self.corrected[-1]],None)]:
+             # Independent attempts must not share the previous failure cooldown.
+-            with B.connect(self.path) as con:con.execute('DELETE FROM board_fetch_state')
++            # sqlite's transaction context does not close the Windows file handle.
++            from contextlib import closing
++            with closing(B.connect(self.path)) as con, con:con.execute('DELETE FROM board_fetch_state')
+             with patch.object(B,'parse_year',return_value=(returned,bars),side_effect=error):
+                 self.assertEqual(self.repair()['failed'],1)
+             self.assertEqual(B.load('881281',self.path)[-1]['close'],129)
+--- before/test_market_strength.py
++++ after/test_market_strength.py
+@@ -51,11 +51,12 @@
+             e=M.P['emotion_attack_weight']*d+M.P['emotion_hold_weight']*100+M.P['emotion_recent_weight']*100
+             self.assertLessEqual(e,64.)
+     def test_phase_priority_and_unknown(self):
+-        self.assertEqual(M.phase(70,90,[70,70,30],True),( '回踩整理',2))
+-        self.assertEqual(M.phase(70,20,[70,70,30],False),('推进',2))
++        self.assertEqual(M.phase(70,90,[70,70,70],True),( '回踩整理',3))
++        self.assertEqual(M.phase(70,20,[70,70,70],False),('推进',3))
++        self.assertEqual(M.phase(70,90,[70,70,30],False),('启动',2))
+         self.assertEqual(M.phase(70,None,[30,30,30],False),('启动',0))
+-        self.assertEqual(M.phase(None,70,[30,30,30],None),('启动',0))
+-        self.assertEqual(M.phase(60,70,[70,30,30],None),('转弱',1))
++        self.assertEqual(M.phase(None,70,[30,30,30],None),(None,0))
++        self.assertEqual(M.phase(60,70,[30,30,70],None),('转弱',1))
+         self.assertEqual(M.phase(None,70,[70,30,30],None),(None,1))
+         self.assertEqual(M.phase(70,70,[None,30,30],False),(None,None))
+         self.assertEqual(M.phase(70,70,[30,30,30],None),(None,0))
+@@ -114,7 +115,7 @@
+         # Recent down-structure forces K=.5; a 9% rebound is still below prior rolling lines.
+         for b in h[code][:-1]:b.update(open=115.,close=115.,high=115.5,low=114.5)
+         q[code].update(price=109.,last_close=100.,open=100.,high=109.,low=100.,change_pct=9.)
+-        r=run(f)[code];self.assertFalse(r['trend_strong']);self.assertTrue(r['emotion_strong']);self.assertTrue(r['focus']);self.assertEqual(r['phase'],'启动');self.assertIn('情绪先行',r['reasons'])
++        r=run(f)[code];self.assertFalse(r['trend_strong']);self.assertTrue(r['emotion_strong']);self.assertTrue(r['focus']);self.assertIsNone(r['phase']);self.assertIn('情绪进攻',r['labels']);self.assertNotIn('新进入强势',r['labels'])
+     def test_history_missing_emotion_admitted(self):
+         f=fixture();s,q,p,h,c,n=f;code=next(iter(q));h[code]=[]
+         q[code].update(price=109.,high=109.,low=100.,open=100.,change_pct=9.)
+--- before/test_market_strength_integration.py
++++ after/test_market_strength_integration.py
+@@ -62,7 +62,7 @@
+     def test_render_emotion_only_detail(self):
+         code=self.s['stocks'][0]['code'];self.f[3][code]=[];run(self.f)
+         r=render(self.s,"showStock('"+code+"');")
+-        html=r['drawer'][2];self.assertIn('情绪',html);self.assertIn(M.VERSION,html);self.assertIn('阶段 —',html)
++        html=r['drawer'][2];self.assertIn('情绪',html);self.assertIn(M.VERSION,html);self.assertIn('暂无新增形态标签',html)
+     def test_board_table_matches_ids(self):
+         r=render(self.s,'renderThemesPage();');html=r['els']['theme-center']['innerHTML'];self.assertIn('theme:测试',html)
+     def test_combined_priority_no_third_score(self):
+--- before/test_market_strength_rework.py
++++ after/test_market_strength_rework.py
+@@ -97,7 +97,7 @@
+         r=json.loads(result.stdout);members=set(s['board_catalog'][1]['member_codes']);lists=s['market_strength']['stocks']
+         self.assertEqual(r['all'],[c for c in lists['sorts']['combined'] if c in members])
+         for key in ('trend','emotion'):self.assertEqual(r[key],[c for c in lists['sorts'][key] if c in members and c in lists[key]])
+-        self.assertEqual(r['view'],dict(scope='all',sort='trend',phase='',q='',limit=100));self.assertEqual(r['cleared'],lists['sorts']['trend']);self.assertIsNone(r['board'])
++        self.assertEqual(r['view'],dict(axis='trend',scope='all',sort='trend',phase='',q='',limit=100));self.assertEqual(r['cleared'],lists['sorts']['trend']);self.assertIsNone(r['board'])
+ 
+     def test_detail_contains_member_entry(self):
+         from test_market_strength_integration import render
+--- before/test_owner_strength_rebuild.py
++++ after/test_owner_strength_rebuild.py
+@@ -23,7 +23,7 @@
+         self.assertFalse(m['trend_strong']);self.assertLess(m['trend_score'],50)
+         self.assertEqual(m['emotion_score'],80)
+         self.assertEqual(m['background']['label'],'中期未恢复')
+-        self.assertTrue(m['day_attack_strong']);self.assertIn(code,f[0]['market_strength']['stocks']['starting'])
++        self.assertTrue(m['day_attack_strong']);self.assertIn('情绪进攻',m['labels']);self.assertNotIn('新进入强势',m['labels'])
+         self.assertEqual(len(f[0]['stocks'][0]['strength_history']),60)
+ 
+     def test_established_history_beats_one_day_jump(self):
+@@ -36,12 +36,12 @@
+ 
+ 
+ 
+-    def test_pullback_above_ma5_is_not_mislabeled_advance(self):
++    def test_small_negative_day_above_ma5_does_not_alone_mean_pullback(self):
+         f=fixture();a=next(iter(f[1]))
+         prices(f,a,[100+i*1.2 for i in range(20)],121.8)
+         m=run(f)[a]
+         self.assertGreater(m['R3'],0);self.assertGreater(f[1][a]['price'],m['trend_parts_by_period']['5']['MA_now'])
+-        self.assertTrue(m['trend_strong']);self.assertEqual(m['phase'],'回踩整理')
++        self.assertTrue(m['trend_strong']);self.assertEqual(m['phase'],'推进');self.assertNotIn('回踩整理',m['labels'])
+ 
+     def test_identical_day_gain_uses_recent_history_for_emotion(self):
+         f=fixture();a,b=list(f[1])[:2]
+@@ -69,16 +69,17 @@
+         self.assertIn('<article',radar);self.assertNotIn('<table',radar)
+         self.assertIn('<table',stocks);self.assertNotEqual(stocks,radar)
+         overview=render(f[0],'renderOverview();')['els']['ms-overview-host']['innerHTML']
+-        for section in ('市场温度','强势板块 / 题材','趋势领先','情绪领先'):self.assertIn(section,overview)
++        for section in ('市场温度','正在转强','趋势集中方向','情绪集中方向'):self.assertIn(section,overview)
+         self.assertNotIn('<table',overview);self.assertNotEqual(overview,radar)
+ 
+     def test_emotion_scope_automatically_uses_emotion_sort(self):
+         f=fixture();run(f)
+         output=render(f[0],"msUpdate('radar','scope','emotion');")
+         html=output['els']['radar-opportunities']['innerHTML']
+-        self.assertIn('value="emotion" selected>情绪排序',html)
++        self.assertIn('value="emotion" selected>情绪强',html)
++        self.assertIn('按情绪强度排序',html)
+         output=render(f[0],"msUpdate('radar','scope','day_attack');")
+-        self.assertIn('value="day_attack" selected>当日进攻排序',output['els']['radar-opportunities']['innerHTML'])
++        self.assertEqual(output['ids'],f[0]['market_strength']['stocks']['day_attack'])
+ 
+     def test_history_return_uses_five_completed_intervals(self):
+         f=fixture();a=next(iter(f[1]));prices(f,a,[100,101,102,103,104,105],106)
+--- before/ui_payload.py
++++ after/ui_payload.py
+@@ -87,8 +87,11 @@
+ 
+ def summary(full, token):
+     result = dict(full)
++    result.pop('direction_observations', None)
++    result.pop('market_strength_close_input', None)
+     list_fields = set(json.loads((config.ROOT / 'stock_list_fields.json').read_text(encoding='utf-8')))
+     list_fields.add('market_strength')
++    list_fields.update(('industry','industry_detail','themes','concepts'))
+     for group in ('stocks', 'coverage_catalog'):
+         rows = []
+         for s in full.get(group, []):

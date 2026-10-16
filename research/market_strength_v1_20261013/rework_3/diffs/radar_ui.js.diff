@@ -1,0 +1,28 @@
+--- before/radar_ui.js
++++ after/radar_ui.js
+@@ -47,7 +47,7 @@
+  res.innerHTML='统一强度模型 · '+esc(msModel().version||'—');
+  ['stk-more','stock-view-tabs','stock-views','stk-view-tabs'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});
+  var filter=document.getElementById('btn-filter');if(filter)filter.style.display='none';
+- var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.onclick=function(){STATE.boardFilterId=null;msRender('stocks');};}
++ var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.style.display=STATE.boardFilterId?'':'none';only.onclick=clearMSMembers;}
+  MS_VIEW.stocks.q=STATE.q||'';if(STATE.q)MS_VIEW.stocks.scope='all';
+  msRender('stocks');
+ }
+@@ -67,10 +67,13 @@
+  h+='</tbody></table></div><details><summary>情绪、阶段、事件、覆盖及来源完整依据</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(m,null,2))+'</pre></details><details><summary>数据缺口 '+(m.data_reasons||[]).length+'项</summary>'+esc((m.data_reasons||[]).join('；')||'无')+'</details></section>';return h;
+ }
+ function showStock(code,boardId){var s=(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).filter(function(r){return r.code===code;})[0];if(!s)return;openDrawer(esc(s.name)+' '+esc(code),'当前强势 · 统一模型',msDetail(s.market_strength||{}),false);}
+-function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],html=msDetail(b.market_strength||{})+'<section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><p>个股强度独立于所属板块。官方指数仅作参照。</p>'+msTable(members.map(function(r){return Object.assign({name:r.name||r.code},r);}), 'members')+'</section>';openDrawer(esc(b.name),'主板成员共振 · 当前成员历史背景',html,true);}
++function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],html=msDetail(b.market_strength||{})+'<section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><p>个股强度独立于所属板块。官方指数仅作参照。</p><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members.map(function(r){return Object.assign({name:r.name||r.code},r);}), 'members')+'</section>';openDrawer(esc(b.name),'主板成员共振 · 当前成员历史背景',html,true);}
++function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';MS_VIEW.stocks={scope:'all',sort:'combined',phase:'',q:'',limit:100};}
++function pickBoardMembers(id){var b=boardById(id);if(!b)return toast('板块成员暂无数据');STATE.filters=defaultFilters();STATE.boardFilterId=id;resetMSMemberView();closeDrawer();RENDERED.stocks=false;goPane('stocks');renderStocks();}
++function clearMSMembers(){STATE.boardFilterId=null;resetMSMemberView();renderStocks();}
+ function boardMemberRows(b,codes){return msTable((b.members||[]).filter(function(r){return codes.indexOf(r.code)>=0;}),'members');}
+-function downloadMSCSV(text,name){var blob=new Blob([text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}
+-function msCSV(key){var rows=msRows(key);if(key==='industry'||key==='theme'){var headers=['ID','名称','趋势分','情绪分','主导周期','阶段','版本','UI版本','完整模型依据'];function cell(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';}downloadMSCSV('\ufeff'+[headers.join(',')].concat(rows.map(function(r){var m=r.market_strength;return [r.id,r.name,m.trend_score,m.emotion_score,m.dominant_period,m.phase,m.version,DATA.ui_generation,JSON.stringify(m)].map(cell).join(',');})).join('\n'),'板块强度_'+DATA.ui_generation+'.csv');return;}return exportCSV(rows,'当前强势_'+DATA.ui_generation+'.csv');}
++function downloadMSCSV(text,name){if(text.charAt(0)!=='\ufeff')text='\ufeff'+text;var blob=new Blob([text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}
++function msCSV(key){var rows=msRows(key);if(key==='industry'||key==='theme'){var generation=DATA.ui_generation,name='板块强度_'+key+'_'+generation+'.csv';if(DATA.ui_lazy){return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:generation,kind:'board',ids:rows.map(function(r){return r.id;})})}).then(function(r){if(!r.ok)throw new Error(r.status===409?'数据版本已过期，请先更新页面':'导出失败 '+r.status);return r.text();}).then(function(text){downloadMSCSV(text,name);}).catch(function(e){toast(e.message);throw e;});}var headers=['ID','名称','趋势分','情绪分','主导周期','阶段','版本','UI版本','完整模型依据'];function cell(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';}downloadMSCSV('\ufeff'+[headers.join(',')].concat(rows.map(function(r){var m=r.market_strength;return [r.id,r.name,m.trend_score,m.emotion_score,m.dominant_period,m.phase,m.version,generation,JSON.stringify(m)].map(cell).join(',');})).join('\n'),name);return;}return exportCSV(rows,'当前强势_'+DATA.ui_generation+'.csv');}
+ function radarOpportunityDetail(s){return msDetail(s.market_strength||{});}
+ 
+ var legacyExportCSV=typeof exportCSV==='function'?exportCSV:function(){};exportCSV=function(rows,name){return legacyExportCSV(Array.isArray(rows)?rows:msRows('stocks'),name||'当前强势_'+DATA.ui_generation+'.csv');};

@@ -1,0 +1,27 @@
+--- check_live_service.py.before
++++ check_live_service.py
+@@ -49,9 +49,21 @@
+         idx = b.get('index_trend')
+         if idx and idx.get('ready'):
+             assert idx['asof'] == served['strength_model']['asof']
+-            assert len(served['board_trend_model']['calendar']) == 22
+-            assert idx['trend_online'] == (idx['ma5'] > idx['ma10'] > idx['ma20']
+-                and idx['ma20'] > idx['ma20_prev'] and idx['close'] >= idx['ma10'])
++            assert len(served['board_trend_model']['calendar']) >= 22
++            assert idx['advance_signal'] == (idx['ma5'] > idx['ma10']
++                and idx['ma5'] > idx['ma5_prev'] and idx['ma10'] > idx['ma10_prev']
++                and idx['close'] >= idx['ma5'] and idx['close'] >= idx['ma10'])
++            if idx['strong_advance']:
++                assert idx['advance_signal'] and idx['priority_observation'] and not idx['weak']
++            if idx['weak']:
++                assert not idx['observing'] and not idx['priority_observation']
++            if idx['ma20_support_established']:
++                assert idx['observing'] and idx['close'] >= idx['ma20']
++            if idx['support_observation']:
++                assert idx['ma20_support_established'] and not idx['priority_observation']
++            if idx['pullback_atr'] is not None:
++                assert idx['pullback_atr'] > 0
++                assert idx['episode_start'] <= idx['pullback_atr_asof'] < idx['pullback_start'] <= idx['asof']
+     assert snapshot['board_trend_model']['version'] == served['board_trend_model']['version'] == board_trend.VERSION
+     assert status['snapshot_board_trend_version'] == board_trend.VERSION
+     assert all(set(row["stock_strength_parts"]) == set(stock_strength.WEIGHTS)

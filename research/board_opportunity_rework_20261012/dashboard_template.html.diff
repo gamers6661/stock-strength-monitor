@@ -1,0 +1,109 @@
+--- before/dashboard_template.html
++++ dashboard_template.html
+@@ -4394,7 +4394,7 @@
+   return '<article class="bc-card" data-board-id="'+esc(b.id)+'">'
+     +'<div class="bc-card-head"><button type="button" class="bc-name" onclick="showBoardById(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>'
+     +'<span class="bc-kind">'+(b.type==='industry'?'行业':'题材')+'</span></div>'
+-    +'<div class="ui-tags">'+uiTag(o.status||'机会待核验',o.current_opportunity?'good':'warn',o.display_phase||'')
++    +'<div class="ui-tags">'+uiTag(o.status||'机会待核验',o.current_opportunity?'good':'warn',boardOpportunityExplanation(o))
+     +(q.small_sample||d.small_sample?uiTag('小样本','','对应周期6—9只有效成员；剔除最高1只'): '')
+     +(o.index_member_divergence?uiTag('指数与主板成员分歧','warn','两种口径单列，不混算'): '')+'</div>'
+     +'<div class="ui-metrics">'+boardAuctionMetrics(b)+metrics
+@@ -4404,27 +4404,29 @@
+ }
+ function exportBoardOpportunities(kind){
+   var rows=boardCatalog().filter(function(b){return b.type===kind&&boardMatches(b,BC_FILTER)&&(!BC_SEARCH||b.name.toLowerCase().indexOf(BC_SEARCH.toLowerCase())>=0);})
+-    .sort(function(a,b){return n((a.opportunity||{}).sort_rank,1e9)-n((b.opportunity||{}).sort_rank,1e9);})
++    .sort(boardCompare)
+     .map(function(b){return {id:b.id,name:b.name,type:b.type,member_codes:b.member_codes,opportunity:b.opportunity};});
+   var model=DATA.board_opportunity_model||{},blob=new Blob([JSON.stringify({version:model.version,judgment_at:model.judgment_at,market:model.market,rows:rows},null,2)],{type:'application/json;charset=utf-8'});
+   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='板块机会依据_'+String(model.judgment_at||'').slice(0,10)+'.json';a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},2000);
+ }
+ function setBoardFilter(key){BC_FILTER=key;renderBoards();renderThemesPage();}
++function boardOpportunityOrder(){return ['watch','mainline','new_start','restart','pending','daily'].indexOf(BC_FILTER)>=0;}
++function boardCompare(a,b){
++  if(boardOpportunityOrder())return n((a.opportunity||{}).sort_rank,1e9)-n((b.opportunity||{}).sort_rank,1e9);
++  if(a.ranking_eligible!==b.ranking_eligible)return a.ranking_eligible?-1:1;
++  if(!a.ranking_eligible)return a.name.localeCompare(b.name);
++  if(BC_SORT==='today'){
++    var av=boardTodayValue(a),bv=boardTodayValue(b);
++    return (av==null)-(bv==null)||(av==null?0:bv-av)||a.name.localeCompare(b.name);
++  }
++  return n(a.trend_rank,1e9)-n(b.trend_rank,1e9)||a.name.localeCompare(b.name);
++}
+ function centerMarkup(kind,showTabs){
+-  var opportunityOrder=['watch','mainline','new_start','restart','pending','daily'].indexOf(BC_FILTER)>=0;
++  var opportunityOrder=boardOpportunityOrder();
+   var all=boardCatalog().filter(function(b){return b.type===kind;});
+   if(BC_SEARCH)all=all.filter(function(b){return b.name.toLowerCase().indexOf(BC_SEARCH.toLowerCase())>=0;});
+   var boards=all.filter(function(b){return boardMatches(b,BC_FILTER);});
+-  boards.sort(function(a,b){
+-    if(['watch','mainline','new_start','restart','pending','daily'].indexOf(BC_FILTER)>=0)return n((a.opportunity||{}).sort_rank,1e9)-n((b.opportunity||{}).sort_rank,1e9);
+-    if(a.ranking_eligible!==b.ranking_eligible)return a.ranking_eligible?-1:1;
+-    if(!a.ranking_eligible)return a.name.localeCompare(b.name);
+-    if(BC_SORT==='today'){
+-      var av=boardTodayValue(a),bv=boardTodayValue(b);
+-      return (av==null)-(bv==null)||(av==null?0:bv-av)||a.name.localeCompare(b.name);
+-    }
+-    return n(a.trend_rank,1e9)-n(b.trend_rank,1e9)||a.name.localeCompare(b.name);
+-  });
++  boards.sort(boardCompare);
+   return '<div class="card bc-toolbar"><div class="row wrap" style="gap:8px;align-items:center">'
+     +(showTabs?'<button class="btn '+(kind==='industry'?'primary':'')+'" onclick="BC_KIND=\'industry\';renderBoards()">行业</button>'
+       +'<button class="btn '+(kind==='theme'?'primary':'')+'" onclick="BC_KIND=\'theme\';renderBoards()">题材</button>':'')
+@@ -4459,7 +4461,9 @@
+   var next=document.createElement('div');next.innerHTML=centerMarkup(kind,showTabs);
+   var buttons=host.querySelectorAll('.bc-toolbar > .row button');
+   var newButtons=next.querySelectorAll('.bc-toolbar > .row button');
+-  buttons.forEach(function(button,i){if(newButtons[i])button.className=newButtons[i].className;});
++  // 按钮的结构、文字、事件、禁用状态必须一起更新；搜索框及其父节点保持不动。
++  buttons.forEach(function(button){button.remove();});
++  newButtons.forEach(function(button){input.parentNode.insertBefore(button,input);});
+   ['.bc-filters','.bc-reference','.bc-grid'].forEach(function(selector){
+     var old=host.querySelector(selector),replacement=next.querySelector(selector);
+     if(old&&replacement)old.replaceWith(replacement);
+@@ -4493,29 +4497,24 @@
+   }
+   renderBoards();renderThemesPage();
+ }
++function boardOpportunityExplanation(o){
++  var status=o.status||'';
++  if(status==='当前未入选')return '当前尚未满足持续强势、新启动、回踩再启动中的任一机会资格，因此不进入“当前机会”列表。仍可在指数筛选或全部板块中查看；指数趋势另行判断。';
++  if(status==='日线持续强势·当前未共振')return '完成日线具备持续强势背景，但当前成员尚未共同走强，保留在“日线强势背景”，暂不进入“当前机会”。';
++  if(status==='日线持续强势·当前待核验')return '完成日线具备持续强势背景，当前报价尚不足以核验机会资格，等待有效数据更新。';
++  if(status==='启动待确认'||status==='回踩再启动待确认')return '本轮符合机会条件，连续有效报价的确认尚未完成，暂不进入“当前机会”。';
++  if(o.current_opportunity)return '当前已通过'+(o.primary_label||'机会')+'筛选，进入“当前机会”列表。盘中判断仍需收盘复核。';
++  return '当前数据尚不足以核验机会资格，等待有效数据更新。';
++}
+ function boardOpportunityDetail(b){
+   var o=b.opportunity;if(!o)return '<section class="card bc-detail">机会结果待后台刷新</section>';
+-  var q=o.current,d=o.daily,bg=o.background||{},sc=o.startup_confirmation||{},rc=o.restart_confirmation||{};
+-  function value(v){return v==null?'—':typeof v==='number'?fmt(v,4):typeof v==='boolean'?v?'是':'否':esc(String(v));}
++  var q=o.current||{};
+   var h='<section class="card bc-detail" id="board-opportunity-detail"><h3>'+esc(o.status)+' · '+esc(o.display_phase)+'</h3>'
+-    +'<p>规则 '+esc(o.version)+'；完成日线 '+esc(o.daily_asof)+'；判断 '+esc(o.judgment_at)+'；源报价 '+esc(q.sample_at||'无')+' 至 '+esc(q.latest_quote_at||'无')+'</p>'
+-    +'<p>日线覆盖 '+d.valid_count+'/'+d.expected_count+' ('+value(d.coverage_pct)+'%)；报价覆盖 '+q.valid_count+'/'+o.expected_count+' ('+value(q.coverage_pct)+'%)；事件可核验 '+q.event_valid_count+'只；明确排除 '+o.excluded_count+'只。</p>'
+-    +'<p>新启动确认 '+sc.count+'轮 / '+value(sc.span_seconds)+'秒，首次确认 '+esc(sc.first_confirmed_at||'尚未确认')+'；再启动确认 '+rc.count+'轮 / '+value(rc.span_seconds)+'秒，首次确认 '+esc(rc.first_confirmed_at||'尚未确认')+'。</p>'
+-    +'<p>回踩背景 '+esc(bg.source||bg.reason||'待核验')+'；趋势段 '+esc(bg.episode_id||'无')+'；回踩开始 '+esc(bg.pullback_start||'无')+'；前期证据截至 '+esc(bg.evidence_asof||'无')+'。'+(o.index_member_divergence?'指数与主板成员分歧。':'')+'</p>'
+-    +'<div class="tw"><table><thead><tr><th>指标</th><th>实际值</th></tr></thead><tbody>';
+-  [['R5%',d.R5],['E5百分点',d.E5],['P5%',d.P5],['T%',d.T],['5日收益中位数%',d.median5],['剔除领先成员5日%',d.trimmed_R5],['剔除领先成员5日相对收益',d.trimmed_E5],['R0%',q.R0],['E0百分点',q.E0],['U0%',q.U0],['A0只',q.A0],['B0只',q.B0],['当日收益中位数%',q.median0],['剔除领先成员当日%',q.trimmed_R0],['剔除领先成员当日相对收益',q.trimmed_E0]].forEach(function(v){h+='<tr><td>'+v[0]+'</td><td>'+value(v[1])+'</td></tr>';});
+-  h+='</tbody></table></div><p>剔除日线领先 '+d.trimmed_count+'只、当日领先 '+q.trimmed_count+'只，仅说明成员参与程度，不代表官方指数权重贡献。</p>';
+-  [['daily','完成日线持续强势'],['mainline','持续强势当前共振'],['startup','新启动当轮条件'],['startup_confirmation','新启动连续确认'],['restart','回踩再启动当轮条件'],['restart_confirmation','回踩再启动连续确认']].forEach(function(pair){
+-    h+='<h4>'+pair[1]+'</h4><div class="tw"><table class="opportunity-checks"><thead><tr><th>资格项</th><th>实际值</th><th>门槛</th><th>是否通过</th></tr></thead><tbody>';
+-    (o.checks[pair[0]]||[]).forEach(function(c){h+='<tr><td>'+esc(c.key)+'</td><td>'+value(c.actual)+'</td><td>'+esc(c.threshold)+'</td><td>'+ (c.passed==null?'待核验':c.passed?'通过':'未通过')+'</td></tr>';});
+-    h+='</tbody></table></div>';
+-  });
+-  if(o.close_review)h+='<p>收盘复核：新启动当轮 '+value(o.close_review.startup_conditions)+'；再启动当轮 '+value(o.close_review.restart_conditions)+'；'+esc(o.close_review.note)+'</p>';
+-  var opportunityModel=DATA.board_opportunity_model||{};
+-  var audit=(o.retained?opportunityModel.retained_quote_audit:opportunityModel.quote_audit)||opportunityModel.quote_audit||{},rows={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){rows[r.code]=r;});
+-  h+='<details><summary>本轮应统计成员 '+o.expected_count+'只：报价／日线／事件依据</summary><div class="tw"><table><thead><tr><th>成员</th><th>当日%</th><th>源报价</th><th>报价状态</th><th>日线有效</th><th>突破计入B0</th></tr></thead><tbody>';
+-  (o.expected_codes||[]).forEach(function(code){var r=rows[code]||{},a=audit[code]||{};h+='<tr><td>'+esc(r.name||code)+' '+esc(code)+'</td><td>'+value(a.valid?a.change_pct:null)+'</td><td>'+esc(a.source_at||'缺失')+'</td><td>'+esc(a.reason||'缺失')+'</td><td>'+(d.valid_codes.indexOf(code)>=0?'是':'否')+'</td><td>'+(q.event_codes.indexOf(code)>=0?'是':'否')+'</td></tr>';});
+-  return h+'</tbody></table></div></details></section>';
++    +'<p class="opportunity-explanation">'+esc(boardOpportunityExplanation(o))+'</p>'
++    +'<p class="flat">完成日线 '+esc(o.daily_asof||'待更新')+'；判断 '+esc(o.judgment_at||'待更新')+'；成员源报价 '+esc(q.sample_at||'待更新')+' 至 '+esc(q.latest_quote_at||'待更新')+'。</p>';
++  if(o.retained)h+='<p class="flat">午休沿用上午结果，下午重新采样确认。</p>';
++  if(o.close_review)h+='<p class="flat">收盘复核：已按收盘数据复核机会结果。</p>';
++  return h+'</section>';
+ }
+ function boardMemberRows(b,codes){
+   var by={},auction=!!boardAuction(b);(b.members||[]).forEach(function(r){by[r.code]=r;});

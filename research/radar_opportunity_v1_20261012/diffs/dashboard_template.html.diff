@@ -1,0 +1,95 @@
+--- before/dashboard_template.html
++++ dashboard_template.html
+@@ -891,6 +891,22 @@
+ .bc-empty{grid-column:1/-1}.bc-detail{margin-bottom:16px}.bc-line-values{display:flex;flex-wrap:wrap;gap:16px;padding-top:12px;border-top:1px solid var(--line);color:var(--txt2);font-size:12px}
+ @media(max-width:1150px){.bc-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ @media(max-width:700px){.bc-grid{grid-template-columns:minmax(0,1fr)}#bd-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}#bd-metrics .metric{padding:13px}#bd-metrics .val{font-size:22px}.bc-search{margin-left:0;width:100%;max-width:none}.bc-card{padding:16px}.bc-filter{padding:8px}.bc-reference{gap:7px;flex-wrap:wrap}}
++#radar-views{margin-bottom:14px}
++#radar-views.seg button.on{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12)}
++#radar-tools{display:flex;flex-wrap:wrap;align-items:center;gap:9px}
++#radar-tools button,#radar-tools select,#radar-tools input{font:inherit;font-size:13px;border:1px solid var(--line2);border-radius:11px;background:var(--fill);color:var(--txt);padding:8px 12px;min-height:36px}
++#radar-tools button{cursor:pointer}
++#radar-tools input{flex:1;min-width:230px;max-width:430px}
++#radar-opportunities>.detail-panel{margin-bottom:16px}
++.radar-opportunity-detail table{table-layout:fixed;width:100%}
++.radar-opportunity-detail th,.radar-opportunity-detail td{white-space:normal;overflow-wrap:anywhere;vertical-align:top;font-size:12px}
++.radar-opportunity-detail th:first-child{width:26%}
++.radar-opportunity-detail th{position:static;cursor:default}
++.radar-opportunity-detail th:nth-child(2){width:24%}
++.radar-opportunity-detail th:nth-child(3){width:23%}
++.radar-opportunity-detail p{overflow-wrap:anywhere;line-height:1.6;font-size:12px}
++.radar-opportunity-detail details{margin-top:12px}
++.radar-opportunity-detail summary{cursor:pointer;font-weight:600;margin-bottom:8px}
+ </style>
+ </head>
+ <body>
+@@ -1062,9 +1078,12 @@
+ <section class="pane" id="p-radar">
+   <div class="hero" style="padding-bottom:26px">
+     <h1 style="font-size:clamp(2rem,3.6vw,3rem)">选股雷达</h1>
+-    <p id="rad-sub">先看5/10/20日线趋势，再按个股自身强度分位分档；回踩、量价结构和风险单列。</p>
++    <p id="rad-sub">独立机会雷达；日线A/B/C保留为背景。</p>
+   </div>
+   <div class="main" style="padding-top:0">
++    <div id="radar-views" class="seg" style="margin-bottom:16px"></div>
++    <div id="radar-tools" style="margin-bottom:16px"></div>
++    <div id="radar-opportunities"></div>
+     <div class="grid" id="rad-tiers" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px"></div>
+     <div class="tw"><table id="tb-radar"></table></div>
+     <div id="rad-more" style="text-align:center;padding:24px"></div>
+@@ -2570,12 +2589,13 @@
+ 
+ /* ── 选股雷达：A/B/C 是趋势候选关注层级，全体强度排名另列。 ── */
+ var RADAR_TIER='A';
++/*__RADAR_SCRIPT__*/
+ function setRadarTier(k){ RADAR_TIER=k; renderRadar(); }
+ function radarItems(){
+   var R=(DATA.radar||{})[strat()]||{};
+   return (R.items||[]).filter(function(x){return x.tier===RADAR_TIER;});
+ }
+-function renderRadar(){
++function renderDailyRadar(){
+   var R=(DATA.radar||{})[strat()]||{}, ts=R.tiers||[];
+   var host=document.getElementById('rad-tiers'), tb=document.getElementById('tb-radar');
+   if(!host||!tb)return;
+@@ -3441,8 +3461,8 @@
+ 
+ /* ── 导出 ── */
+ 
+-function exportCSV(){
+-  var res=stockViewRows(STOCK_VIEW,true),contexts={useCompletedClose:useCompletedClose()};
++function exportCSV(overrideRows,overrideName){
++  var res=Array.isArray(overrideRows)?overrideRows:stockViewRows(STOCK_VIEW,true),contexts={useCompletedClose:useCompletedClose()};
+   res.forEach(function(s){var candidates={};
+     ['current_strong_candidate','current_pullback_candidate','startup_candidate','turn_weak_repair_candidate']
+       .forEach(function(k){candidates[k]=currentCandidateActive(s,k);});
+@@ -3452,11 +3472,11 @@
+   });
+   function save(text){
+     var blob=new Blob([text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
+-    a.href=URL.createObjectURL(blob);a.download='强势观察_'+String(DATA.quote_capture_at||DATA.generated_at||'').slice(0,10)+'_日线基准_'+((DATA.strength_model||{}).asof||'')+'.csv';
++    a.href=URL.createObjectURL(blob);a.download=overrideName||'强势观察_'+String(DATA.quote_capture_at||DATA.generated_at||'').slice(0,10)+'_日线基准_'+((DATA.strength_model||{}).asof||'')+'.csv';
+     a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},10000);toast('已导出 '+res.length+' 条');
+   }
+   if(!DATA.ui_lazy){save(buildStockCSV(res,DATA,contexts));return Promise.resolve();}
+-  if(!res.length){toast('当前没有符合筛选的个股');return Promise.resolve();}
++  if(!res.length&&!Array.isArray(overrideRows)){toast('当前没有符合筛选的个股');return Promise.resolve();}
+   var generation=DATA.ui_generation;
+   toast('正在导出 '+res.length+' 条…');
+   return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},
+@@ -3575,6 +3595,7 @@
+     +'<div class="detail-return"><span>'+(completed?(closing&&closing.kind==='收盘报价截至15:00'?'收盘报价涨幅 · 待日线确认':'最近完成日涨幅'):lunch?'上午收市涨幅':bridge?'11:30参考涨幅':openBridge?'竞价参考涨幅':auction?'竞价涨幅':fresh?'当日涨幅 · 暂态':'当日涨幅 · 报价过期')+'</span><b class="'+(change!=null?cls(change):'flat')+'">'+(change!=null?pct(change,1):completed?'收盘涨幅未知':'报价不可判断')+'</b></div>'
+     +'<div class="detail-return"><span>近5日 · 完成日线</span><b class="'+cls(s.ret5)+'">'+(s.ret5==null?'—':pct(s.ret5,1))+'</b></div>'
+     +'<div class="detail-return"><span>近20日 · 完成日线</span><b class="'+cls(s.ret20)+'">'+(s.ret20==null?'—':pct(s.ret20,1))+'</b></div></div></div>';
++  h+=radarOpportunityDetail(s);
+   h+='<div class="detail-main-grid"><div class="detail-panel"><div class="detail-panel-title">近60日走势</div>'
+     +'<div class="detail-panel-sub">现有有效收盘价 · 不插补缺失交易日</div>'
+     +(s.k?'<canvas class="chart detail-chart" id="k-cv"></canvas>':'<div class="detail-chart flat">走势数据不足</div>')+'</div>'
+@@ -3722,6 +3743,7 @@
+     +'<div class="detail-return"><span>近5日 · 完成日线</span><b class="'+cls(s.ret5)+'">'+pct(s.ret5,1)+'</b></div>'
+     +'<div class="detail-return"><span>近20日 · 完成日线</span><b class="'+cls(s.ret20)+'">'+pct(s.ret20,1)+'</b></div></div></div>';
+   h+=sessionContextDetail(s);
++  h+=radarOpportunityDetail(s);
+   h+='<div class="detail-main-grid">'
+     +'<div class="detail-panel"><div class="detail-panel-title">近60日走势</div>'
+     +'<div class="detail-panel-sub">收盘价与 MA5 / MA10 / MA20 · 截至 '+esc(s.signal_date||'—')+'</div>'

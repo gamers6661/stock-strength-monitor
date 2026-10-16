@@ -1,0 +1,49 @@
+--- before/market_strength.py
++++ after/market_strength.py
+@@ -165,23 +165,25 @@
+         return False, None, '报价时间缺失'
+     if not positive(q.get('price')) or not (positive(q.get('amount_wan')) or positive(q.get('volume_shou'))):
+         return False, at, '报价不可用或无真实成交'
+-    if formal_close:
+-        return True, at, None
+     age = (now-at).total_seconds()
+     minute = at.hour*60+at.minute
+-    lunch = session == '午间休市' and at.date() == now.date() and 690 <= minute < 780
+     if at.date() != now.date() or age < -config.INTRADAY['max_quote_future_seconds']:
+         return False, at, '报价日期不一致或时间超前'
+-    if age > config.INTRADAY['max_quote_age_seconds'] and not lunch:
+-        return False, at, '报价过期'
+-    if not (570 <= minute <= 690 or 780 <= minute <= 900 or session == '已收盘' and minute >= 900):
+-        # Existing lunch collector reports 11:31/11:32: retain 11:30 effective judgment.
+-        if not lunch:
+-            return False, at, '非连续竞价报价'
++    # Only the morning closing edge and the established supplier's 11:31/11:32
++    # delayed update may survive lunch. Keep the original source timestamp.
++    morning_close = now.replace(hour=11, minute=30, second=0, microsecond=0)
++    lunch = session == '午间休市' and -config.INTRADAY['max_quote_age_seconds'] <= (at-morning_close).total_seconds() < 180
++    closing_quote = session == '已收盘' and 900 <= minute <= 902
++    if not (570 <= minute <= 690 or 780 <= minute <= 900 or lunch or closing_quote):
++        return False, at, '非连续竞价报价'
++    if session == '已收盘' and not closing_quote:
++        return False, at, '尚无当日收市有效行情'
+     if session in ('午盘','尾盘') and minute < 780:
+         return False, at, '本段开盘报价未更新'
+     if session == '午间休市' and not lunch:
+         return False, at, '尚无上午收市有效行情'
++    if age > config.INTRADAY['max_quote_age_seconds'] and not lunch and not (formal_close and closing_quote):
++        return False, at, '报价过期'
+     if center and not lunch and abs((at-center).total_seconds()) > config.INTRADAY['max_quote_batch_skew_seconds']:
+         return False, at, '报价批次时间偏差过大'
+     return True, at, None
+@@ -387,7 +389,10 @@
+             rows[c] = row
+     qs = {c:quotes[c] for c in pool if c in quotes}
+     reference = session in ('盘前','集合竞价','竞价结束','非交易日','收盘竞价') or 897 <= now.hour*60+now.minute < 900
+-    formal_close = session == '已收盘' and bool(snap.get('close_daily_verified_at'))
++    verified_at = intraday.parse_quote_timestamp(snap.get('close_daily_verified_at'))
++    formal_close = (session == '已收盘' and verified_at is not None and
++                    verified_at.date() == now.date() and verified_at.hour >= 15 and
++                    (verified_at-now).total_seconds() <= config.INTRADAY['max_quote_future_seconds'])
+     current, aligned = stock_scores(qs, contexts or {}, histories, calendar, now, session, formal_close) if not reference else ({},{})
+     for c in pool:
+         current.setdefault(c,empty(None,'参考行情' if reference else '连续竞价'))

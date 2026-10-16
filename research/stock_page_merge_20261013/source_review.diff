@@ -1,0 +1,397 @@
+--- baseline/check_dashboard.py
++++ check_dashboard.py
+@@ -212,7 +212,8 @@
+     assert all(b['fund_covered'] == 0 for b in catalog)
+ assert sum(snap['fund_confirmation'].get('source_counts', {}).values()) == snap['fund_confirmation']['covered']
+ assert snap['market_strength']['counts']['focus']==len(snap['market_strength']['stocks']['focus'])
+-for ident in ['seg','tb-stocks','tb-radar','tb-boards','tb-themes','tb-hold','drawer','btn-refresh','work-attack-list','work-consolidation-pending','work-close-table','ov-axes','ov-market-emotion','ov-emotion-only']:
++assert 'id="p-radar"' not in html and 'data-p="radar"' not in html
++for ident in ['seg','tb-stocks','tb-boards','tb-themes','tb-hold','drawer','btn-refresh','work-attack-list','work-consolidation-pending','work-close-table','ov-axes','ov-market-emotion','ov-emotion-only']:
+     assert f'id="{ident}"' in html, ident
+ assert 'id="work-trend-comparison"' not in html
+ assert 'function uiTrendPullbackItems(s)' in html and 'id="stock-trend-pullbacks"' in html
+--- baseline/dashboard_template.html
++++ dashboard_template.html
+@@ -930,7 +930,6 @@
+       <div class="sl"></div>
+       <button data-p="overview" class="on">总览</button>
+       <button data-p="stocks">个股</button>
+-      <button data-p="radar">选股雷达</button>
+       <button data-p="boards">板块</button>
+       <button data-p="themes">题材</button>
+       <button data-p="hold">持仓</button>
+@@ -1075,22 +1074,6 @@
+     <div id="search-outside" class="search-outside"></div>
+     <div class="tw"><table id="tb-stocks"></table></div>
+     <div id="stk-more" style="text-align:center;padding:24px"></div>
+-  </div>
+-</section>
+-
+-<!-- ══════ 选股雷达 ══════ -->
+-<section class="pane" id="p-radar">
+-  <div class="hero" style="padding-bottom:26px">
+-    <h1 style="font-size:clamp(2rem,3.6vw,3rem)">选股雷达</h1>
+-    <p id="rad-sub">当前强势：趋势强或情绪强，任一成立即入选。</p>
+-  </div>
+-  <div class="main" style="padding-top:0">
+-    <div id="radar-views" class="seg" style="margin-bottom:16px"></div>
+-    <div id="radar-tools" style="margin-bottom:16px"></div>
+-    <div id="radar-opportunities"></div>
+-    <div class="grid" id="rad-tiers" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px"></div>
+-    <div class="tw"><table id="tb-radar"></table></div>
+-    <div id="rad-more" style="text-align:center;padding:24px"></div>
+   </div>
+ </section>
+ 
+@@ -1914,6 +1897,7 @@
+ /* ═══════════════ 页签 ═══════════════ */
+ var RENDERED={};
+ function goPane(p){
++  if(p==='radar')p='stocks';
+   STATE.pane=p;
+   [].forEach.call(document.querySelectorAll('.pane'),function(x){x.classList.remove('on');});
+   var el=document.getElementById('p-'+p); if(el)el.classList.add('on');
+@@ -1926,7 +1910,6 @@
+   if(!RENDERED[p]){
+     RENDERED[p]=true;
+     if(p==='stocks')renderStocks();
+-    if(p==='radar')renderRadar();
+     if(p==='boards')renderBoards();
+     if(p==='themes')renderThemesPage();
+     if(p==='hold')renderHold();
+--- baseline/radar_ui.js
++++ radar_ui.js
+@@ -1,64 +1,62 @@
+ /* Rankings and strength judgments are backend results. UI only selects confirmed members. */
+-var MS_VIEW={radar:{scope:'focus',sort:'trend',phase:'',q:'',limit:24,industryIds:[],themeIds:[],boardQuery:'',allMembers:false},stocks:{axis:'trend',scope:'trend',sort:'trend',phase:'',q:'',limit:100},industry:{scope:'focus',sort:'trend',phase:'',q:'',limit:100},theme:{scope:'focus',sort:'trend',phase:'',q:'',limit:100}};
++function msStockDefaults(){return {axis:'trend',scope:'trend',sort:'trend',phase:'',q:'',limit:100,industryIds:[],themeIds:[],boardQuery:'',openKinds:{}};}
++var MS_VIEW={stocks:msStockDefaults(),industry:{scope:'focus',sort:'trend',phase:'',q:'',limit:100},theme:{scope:'focus',sort:'trend',phase:'',q:'',limit:100}};
+ var MS_REL_DATA=null,MS_REL={};
+ function msModel(){return DATA.market_strength||{};}
+ function msRelations(code){
+  if(MS_REL_DATA!==DATA){MS_REL_DATA=DATA;MS_REL={};(DATA.board_catalog||[]).forEach(function(b){(b.member_codes||[]).forEach(function(c){(MS_REL[c]||(MS_REL[c]=[])).push(b);});});}
+  return MS_REL[code]||[];
+ }
+-function msMatchDirections(r){var v=MS_VIEW.radar,relations=msRelations(r.code).map(function(b){return b.id;});
++function msMatchDirections(r){var v=MS_VIEW.stocks,relations=msRelations(r.code).map(function(b){return b.id;});
+  return (!v.industryIds.length||v.industryIds.some(function(id){return relations.indexOf(id)>=0;}))&&(!v.themeIds.length||v.themeIds.some(function(id){return relations.indexOf(id)>=0;}));
+ }
+ function msRows(key,axis){
+  var v=MS_VIEW[key],boards=key==='industry'||key==='theme',src=boards?(DATA.board_catalog||[]):(DATA.stocks||[]).concat(DATA.coverage_catalog||[]),map={};
+  src.forEach(function(r){map[boards?r.id:r.code]=r;});
+  var lists=msModel()[boards?'boards':'stocks']||{},sort=axis||v.sort,ids=(lists.sorts||{})[sort]||lists.all||[],scope=v.scope;
+- if(key==='radar'&&(v.allMembers||scope==='all'))scope='all';else if(key==='radar'&&axis&&scope==='focus')scope=axis;
+  var included={};(lists[scope]||[]).forEach(function(c){included[c]=true;});if(sort==='day_attack')ids=lists.day_attack||[];
+  return ids.map(function(c){return map[c];}).filter(function(r){
+   if(!r||!included[boards?r.id:r.code]||boards&&r.type!==key)return false;
+   if(key==='stocks'&&STATE.boardFilterId){var b=boardById(STATE.boardFilterId);if(b&&(b.member_codes||[]).indexOf(r.code)<0)return false;}
+-  if(key==='radar'&&!msMatchDirections(r))return false;
++  if(key==='stocks'&&!msMatchDirections(r))return false;
+   var m=r.market_strength||{},tags=(m.labels||[]).concat(m.events||[],m.phase||[]);
+   return (!v.phase||tags.indexOf(v.phase)>=0)&&(!v.q||String((r.code||'')+' '+r.name).indexOf(v.q)>=0);
+  });
+ }
+ function msUpdate(key,field,value){var v=MS_VIEW[key];v[field]=value;
+- if(field==='scope'){v.sort=value==='emotion'?'emotion':value==='day_attack'?'day_attack':'trend';v.phase='';if(key==='stocks'&&value!=='all')v.axis=value;}
+- v.limit=key==='radar'?24:100;msRender(key);
++ if(field==='scope'){v.sort=value==='day_attack'?'day_attack':key==='stocks'?v.axis:value==='emotion'?'emotion':'trend';}
++ v.limit=100;msRender(key);
+ }
+-function msStockAxis(axis){var v=MS_VIEW.stocks;v.axis=axis;v.sort=axis;v.scope=v.scope==='all'?'all':axis;v.limit=100;msRender('stocks');}
+-function msStockAll(checked){MS_VIEW.stocks.scope=checked?'all':MS_VIEW.stocks.axis;MS_VIEW.stocks.limit=100;msRender('stocks');}
+-function msRadarAll(checked){MS_VIEW.radar.allMembers=checked;MS_VIEW.radar.limit=24;msRender('radar');}
+-function msToggleBoard(id){var b=boardById(id);if(!b)return;var v=MS_VIEW.radar,field=b.type==='industry'?'industryIds':'themeIds',idx=v[field].indexOf(id);if(idx<0)v[field].push(id);else v[field].splice(idx,1);v.openKind=b.type;v.limit=24;msRender('radar');}
+-function msClearDirections(){MS_VIEW.radar.industryIds=[];MS_VIEW.radar.themeIds=[];MS_VIEW.radar.boardQuery='';msRender('radar');}
+-function msOpenRadar(id,axis){msClearRadarState();if(id){var b=boardById(id);if(b)MS_VIEW.radar[b.type==='industry'?'industryIds':'themeIds']=[id];}if(axis){MS_VIEW.radar.scope=axis;MS_VIEW.radar.sort=axis;}closeDrawer();RENDERED.radar=false;goPane('radar');renderRadar();}
+-function msClearRadarState(){MS_VIEW.radar={scope:'focus',sort:'trend',phase:'',q:'',limit:24,industryIds:[],themeIds:[],boardQuery:'',allMembers:false};}
++function msStockAxis(axis){var v=MS_VIEW.stocks;v.axis=axis;if(v.scope==='trend'||v.scope==='emotion')v.scope=axis;v.sort=v.scope==='day_attack'?'day_attack':axis;v.limit=100;msRender('stocks');}
++function msStockAll(checked){MS_VIEW.stocks.scope=checked?'all':MS_VIEW.stocks.axis;MS_VIEW.stocks.sort=MS_VIEW.stocks.axis;MS_VIEW.stocks.limit=100;msRender('stocks');}
++function msToggleBoard(id){var b=boardById(id);if(!b)return;STATE.boardFilterId=null;var v=MS_VIEW.stocks,field=b.type==='industry'?'industryIds':'themeIds',idx=v[field].indexOf(id);if(idx<0)v[field].push(id);else v[field].splice(idx,1);v.openKinds[b.type]=true;v.limit=100;msRender('stocks');}
++function msClearDirections(){STATE.boardFilterId=null;MS_VIEW.stocks.industryIds=[];MS_VIEW.stocks.themeIds=[];MS_VIEW.stocks.boardQuery='';msRender('stocks');}
++function msOpenStocks(id,axis,allMembers){var priorAxis=MS_VIEW.stocks.axis;resetMSMemberView();var v=MS_VIEW.stocks;v.axis=axis||priorAxis;v.sort=v.axis;v.scope=allMembers?'all':axis||'focus';if(id){var b=boardById(id);if(b){v[b.type==='industry'?'industryIds':'themeIds']=[id];v.openKinds[b.type]=true;}}closeDrawer();RENDERED.stocks=false;goPane('stocks');renderStocks();}
+ function msSelect(field,opts,key,label){var v=MS_VIEW[key];return '<select aria-label="'+label+'" onchange="msUpdate(\''+key+'\',\''+field+'\',this.value)">'+opts.map(function(x){return '<option value="'+x[0]+'" '+(v[field]===x[0]?'selected':'')+'>'+x[1]+'</option>';}).join('')+'</select>';}
+ function msTools(key){var v=MS_VIEW[key],h='';
+  if(key==='stocks')h='<div class="ms-style-tabs" role="tablist" aria-label="个股风格"><button role="tab" aria-selected="'+(v.axis==='trend')+'" class="ms-tab '+(v.axis==='trend'?'on':'')+'" onclick="msStockAxis(\'trend\')">趋势榜</button><button role="tab" aria-selected="'+(v.axis==='emotion')+'" class="ms-tab emotion '+(v.axis==='emotion'?'on':'')+'" onclick="msStockAxis(\'emotion\')">情绪榜</button></div>';
+  h+='<div class="ms-toolbar">';
+- if(key==='stocks')h+='<label class="ms-check"><input type="checkbox" aria-label="查看完整排名" '+(v.scope==='all'?'checked':'')+' onchange="msStockAll(this.checked)">查看完整排名</label>';
+- else if(key==='radar')h+=msSelect('scope',(v.scope==='day_attack'?[['day_attack','当日异动']]:[]).concat([['focus','任一强势'],['trend','趋势强'],['emotion','情绪强'],['both','双强']]),'radar','强势风格')+'<label class="ms-check"><input type="checkbox" aria-label="查看全部成员" '+(v.allMembers?'checked':'')+' onchange="msRadarAll(this.checked)">查看全部成员</label><button class="ms-detail-link" onclick="msUpdate(\'radar\',\'scope\',\'day_attack\')">当日异动</button>';
++ if(key==='stocks')h+=msSelect('scope',[[v.axis,'当前榜强势'],['focus','任一强势'],['both','仅看双强'],['all','全部成员'],['day_attack','当日异动']],key,'筛选范围');
++
+  else h+=msSelect('scope',[['focus','全部强势'],['trend','趋势强'],['emotion','情绪强'],['all','全部板块']],key,'强势范围')+msSelect('sort',[['trend','趋势排序'],['emotion','情绪排序']],key,'强势排序');
+  h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" oninput="msUpdate(\''+key+'\',\'q\',this.value)"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
+ }
+-function msDirectionPicker(){var v=MS_VIEW.radar,selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
+- var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同类多选取并集，行业与题材同时选择取交集 · 同花顺确认成员</p></div><button class="btn" onclick="msClearDirections()">清除方向</button></div><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" oninput="MS_VIEW.radar.boardQuery=this.value;msRender(\'radar\')">';
++function msDirectionPicker(){var v=MS_VIEW.stocks,selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
++ var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同类多选取并集，行业与题材同时选择取交集 · 同花顺确认成员</p></div><button class="btn" onclick="msClearDirections()">清除方向</button></div><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" oninput="MS_VIEW.stocks.boardQuery=this.value;msRender(\'stocks\')">';
+  h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向：展示沪深主板强势股票</span>')+'</div>';
+  ['industry','theme'].forEach(function(kind){var rows=(DATA.board_catalog||[]).filter(function(b){return b.type===kind&&(!q||b.name.indexOf(q)>=0);}),rank=((msModel().boards||{}).sorts||{}).trend||[],order={};rank.forEach(function(id,i){order[id]=i;});rows.sort(function(a,b){return (order[a.id]==null?1e9:order[a.id])-(order[b.id]==null?1e9:order[b.id]);});
+-  h+='<details '+(q||v.openKind===kind?'open':'')+' class="ms-direction-options"><summary>'+ (kind==='industry'?'行业':'题材')+' · '+rows.length+' 个方向</summary><div class="ms-chip-list">'+rows.map(function(b){var on=selected.indexOf(b.id)>=0;return '<button aria-pressed="'+on+'" class="ms-chip '+(on?'selected':'')+'" onclick="msToggleBoard(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
++  h+='<details '+(q||v.openKinds[kind]?'open':'')+' class="ms-direction-options"><summary onclick="MS_VIEW.stocks.openKinds[\''+kind+'\']=!this.parentNode.open">'+ (kind==='industry'?'行业':'题材')+' · '+rows.length+' 个方向</summary><div class="ms-chip-list">'+rows.map(function(b){var on=selected.indexOf(b.id)>=0;return '<button aria-pressed="'+on+'" class="ms-chip '+(on?'selected':'')+'" onclick="msToggleBoard(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
+  });return h+'</section>';
+ }
+ function msScore(m,axis){return m[axis+'_score']==null?'—':fmt(m[axis+'_score'],1)+' · '+esc(m[axis+'_level']||'—');}
+ function msBadge(m,axis){return '<span class="ms-badge ms-'+axis+' '+(m[axis+'_score']>=65?'ms-hot':'')+'">'+(axis==='trend'?'趋势 ':'情绪 ')+msScore(m,axis)+'</span>';}
+ function msHistory(m,n){var r=(m.history_returns||{})[n];return r==null?'—':pct(r,2);}
+ function msTags(m){return (m.labels||m.events||[]).map(function(t){return '<span class="ms-tag '+(t==='明显回落'?'risk':'')+'">'+esc(t)+'</span>';}).join('')||'<span class="ms-muted">暂无新增形态标签</span>';}
+-function msAffiliation(r,key){var rel=msRelations(r.code),v=MS_VIEW.radar,selected=v.industryIds.concat(v.themeIds),matched=key==='radar'?rel.filter(function(b){return selected.indexOf(b.id)>=0;}):[],themes=rel.filter(function(b){return b.type==='theme';}),industry=r.industry_detail||r.industry||'行业未收录';
++function msAffiliation(r,key){var rel=msRelations(r.code),v=MS_VIEW.stocks,selected=v.industryIds.concat(v.themeIds),matched=key==='stocks'?rel.filter(function(b){return selected.indexOf(b.id)>=0;}):[],themes=rel.filter(function(b){return b.type==='theme';}),industry=r.industry_detail||r.industry||'行业未收录';
+  var h='<div class="ms-affiliation"><span class="ms-industry">'+esc(industry)+'</span>';
+  if(matched.length)h+='<div class="ms-match">匹配方向：'+matched.map(function(b){return esc(b.name);}).join(' / ')+'</div>';
+- var display=themes.slice(0,2);h+=display.map(function(b){return '<button class="ms-chip small" onclick="event.stopPropagation();msOpenRadar(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('');
+- if(themes.length>2)h+='<details onclick="event.stopPropagation()"><summary>+'+(themes.length-2)+' 个题材</summary><div class="ms-chip-list">'+themes.slice(2).map(function(b){return '<button class="ms-chip small" onclick="event.stopPropagation();msOpenRadar(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
++ var display=themes.slice(0,2);h+=display.map(function(b){return '<button class="ms-chip small" onclick="event.stopPropagation();msOpenStocks(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('');
++ if(themes.length>2)h+='<details onclick="event.stopPropagation()"><summary>+'+(themes.length-2)+' 个题材</summary><div class="ms-chip-list">'+themes.slice(2).map(function(b){return '<button class="ms-chip small" onclick="event.stopPropagation();msOpenStocks(\''+jsq(b.id)+'\')">'+esc(b.name)+'</button>';}).join('')+'</div></details>';
+  return h+'</div>';
+ }
+ function msMore(rows,shown,key){return (rows.length>shown.length?'<button class="btn" onclick="MS_VIEW[\''+key+'\'].limit+=100;msRender(\''+key+'\')">加载更多（完整 '+rows.length+' 项）</button>':'')+(!rows.length?'<p class="empty">暂无符合条件的股票或方向，可调整当前筛选。</p>':'');}
+@@ -69,35 +67,26 @@
+  h+='<tr data-strength-id="'+esc(r.id||r.code)+'" class="clickable" onclick="'+(boards?'showBoardById(\''+jsq(r.id)+'\')':'showStock(\''+jsq(r.code)+'\')')+'"><td class="l"><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span>'+(boards?'':msAffiliation(r,key))+'</td><td>'+pct(chg,2)+'</td><td>'+msBadge(m,'trend')+'</td><td>'+msBadge(m,'emotion')+'</td><td class="ms-metric-cell">'+metric+'</td><td class="l"><span class="cd">'+esc((m.background||{}).label||'')+' · '+esc(ev.structure||'')+'</span><div class="ms-tag-list">'+msTags(m)+'</div><span class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</span></td></tr>';
+  });return h+'</tbody></table></div>'+msMore(rows,shown,key);
+ }
+-function msCard(r,board){var m=r.market_strength||{},recent=m.recent_emotion||{},ev=m.display_evidence||{};
+- return '<article class="ms-discovery-card clickable" data-strength-id="'+esc(r.id||r.code)+'" onclick="showStock(\''+jsq(r.code)+'\')"><div class="ms-card-head"><div><b>'+esc(r.name||r.code)+'</b><span class="cd">'+esc(r.code||'')+'</span></div><strong>'+pct(r.change_pct,2)+'</strong></div>'+msAffiliation(r,'radar')+'<div class="ms-axis">'+msBadge(m,'trend')+msBadge(m,'emotion')+'</div><p class="ms-card-context">'+esc((m.background||{}).label||'')+' · '+esc(m.dominant_period?(m.dominant_period+'日主导'):'')+' · '+esc(ev.structure||'')+'</p><div class="ms-mini-metrics"><span>完成日5日 <b>'+msHistory(m,5)+'</b></span><span>完成日20日 <b>'+msHistory(m,20)+'</b></span></div><div class="ms-tag-list">'+msTags(m)+'</div><p class="ms-muted">近5日活跃 '+(recent.active_days==null?'—':recent.active_days)+'/5 · 当日进攻 '+fmt(m.day_attack,1)+'</p><p class="ms-card-risk">'+esc((m.risks||[]).slice(0,1).join('；'))+'</p></article>';
+-}
+ function msStamp(){var m=msModel();return esc(m.mode||'')+' · 行情截至 '+esc(String((DATA.direction_changes||{}).source_at||m.at||'—').slice(0,19))+' · 沪深主板';}
+ function msDelta(value,digits){return value==null?'—':(value>0?'+':'')+fmt(value,digits);}
+-function msRender(key){var v=MS_VIEW[key],rows=msRows(key),html='';
+- if(key==='radar')html+=msDirectionPicker();
+- html+=msTools(key);
+- if(key==='radar'&&(v.scope==='focus'||v.scope==='both'||v.allMembers)){
+-  html+='<p class="ms-muted">当前筛选 '+rows.length+' 只 · 两榜独立，允许重复 · 标签不作为必过条件</p>';
+-  ['trend','emotion'].forEach(function(axis){var group=msRows(key,axis),shown=group.slice(0,v.limit);html+='<section class="ms-radar-group" data-axis="'+axis+'"><h3>'+(axis==='trend'?'趋势强势成员':'情绪强势成员')+' <span class="ms-muted">'+group.length+' 只</span></h3><div class="ms-card-grid">'+shown.map(function(r){return msCard(r,false);}).join('')+'</div>'+msMore(group,shown,key)+'</section>';});
+- }else if(key==='radar'){var shown=rows.slice(0,v.limit);html+='<p class="ms-muted">当前筛选 '+rows.length+' 只 · 按'+(v.sort==='emotion'?'情绪':v.sort==='day_attack'?'当日进攻':'趋势')+'强度排序</p><div class="ms-card-grid">'+shown.map(function(r){return msCard(r,false);}).join('')+'</div>'+msMore(rows,shown,key);
+- }else{html+='<p class="ms-muted">'+(key==='stocks'?(v.axis==='trend'?'历史上涨力度与结构决定趋势排名；当天大涨不是入榜要求。':'当日进攻、区间保持与近期活跃决定情绪排名；不要求历史趋势强。'):'同花顺确认成员共振；官方指数在详情中单列。')+' 当前 '+rows.length+' 项。</p>'+msTable(rows,key,v.limit);}
+- var host=document.getElementById(key==='radar'?'radar-opportunities':key==='industry'?'board-center':key==='theme'?'theme-center':'ms-stock-host');
++function msRender(key){var v=MS_VIEW[key],rows=msRows(key),html=msTools(key);
++ if(key==='stocks')html+=msDirectionPicker();
++ var description=key==='stocks'?(v.scope==='day_attack'?'按当日进攻强度排序；当日异动不等于趋势强或情绪强。':v.axis==='trend'?'历史上涨力度与结构决定趋势排名；当天大涨不是入榜要求。':'当日进攻、区间保持与近期活跃决定情绪排名；不要求历史趋势强。'):'同花顺确认成员共振；官方指数在详情中单列。';
++ html+='<p class="ms-muted">'+description+' 当前 '+rows.length+' 项。</p>'+msTable(rows,key,v.limit);
++ var host=document.getElementById(key==='industry'?'board-center':key==='theme'?'theme-center':'ms-stock-host');
+  if(host){var focused=document.activeElement,label=focused&&focused.getAttribute('aria-label'),position=focused&&focused.selectionStart;host.innerHTML=html;if(label==='强势搜索'||label==='搜索板块题材'){var next=host.querySelector('[aria-label="'+label+'"]');next.focus();if(position!=null)next.setSelectionRange(position,position);}}
+ }
+-function renderRadar(){['radar-views','radar-tools','radar-daily','radar-close','rad-tiers','tb-radar','rad-more'].forEach(function(id){var e=document.getElementById(id);if(e){e.innerHTML='';e.style.display='none';}});document.getElementById('rad-sub').innerHTML=msStamp();msRender('radar');}
+-function exportRadarCSV(){msCSV('radar');}
+ function renderBoards(){document.getElementById('bd-metrics').innerHTML='<div class="card"><h3>行业强度</h3><p>'+msStamp()+'</p></div>';msRender('industry');}
+ function renderThemesPage(){msRender('theme');}
+ function renderStocks(){document.getElementById('stk-sub').textContent=msStamp();var stockHeading=document.querySelector('#p-stocks h1');if(stockHeading)stockHeading.textContent='个股强度榜';var oldSearch=document.querySelector('#p-stocks .search');if(oldSearch)oldSearch.style.display='none';var table=document.getElementById('tb-stocks'),res=document.getElementById('stk-res');
+  if(!document.getElementById('ms-stock-host')){var host=document.createElement('div');host.id='ms-stock-host';table.parentNode.insertBefore(host,table);table.style.display='none';}
+- res.innerHTML=STATE.boardFilterId?'当前成员：'+esc((boardById(STATE.boardFilterId)||{}).name||''):'沪深主板 · 趋势与情绪独立排名';
++ res.innerHTML='沪深主板 · 趋势与情绪独立排名 · 行业 / 题材多选筛选';
+  ['stk-more','stock-view-tabs','stock-views','stk-view-tabs','btn-filter','btn-export','q'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});
+- var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.style.display=STATE.boardFilterId?'':'none';only.onclick=clearMSMembers;}
++ var only=document.getElementById('btn-only-view');if(only){only.textContent='清除成员筛选';only.style.display='none';only.onclick=clearMSMembers;}
+  if(STATE.q){MS_VIEW.stocks.q=STATE.q;MS_VIEW.stocks.scope='all';}msRender('stocks');
+ }
+ function msDirectionCard(b,axis){var m=b.market_strength||{},share=(m.member_strength||{})[axis+'_pct'],r0=(m.emotion_parts||{}).R0,dc=m.direction_change,a=dc&&dc.axes&&dc.axes[axis],lists=msModel().stocks||{},lookup={};(DATA.stocks||[]).concat(DATA.coverage_catalog||[]).forEach(function(r){lookup[r.code]=r;});var leaders=(((lists.sorts||{})[axis])||[]).filter(function(c){return (b.member_codes||[]).indexOf(c)>=0&&lookup[c]&&(lookup[c].market_strength||{})[axis+'_strong'];}).slice(0,3);
+- return '<article class="ms-direction-card '+axis+'" data-board-id="'+esc(b.id)+'" data-axis="'+axis+'"><div class="ms-card-head"><button class="ms-name-link" onclick="msOpenRadar(\''+jsq(b.id)+'\',\''+axis+'\')">'+esc(b.name)+'</button><button class="ms-detail-link" onclick="showBoardById(\''+jsq(b.id)+'\')">详情 ↗</button></div>'+msBadge(m,axis)+'<div class="ms-mini-metrics"><span>成员整体涨幅<b>'+pct(r0,2)+'</b></span><span>'+ (axis==='trend'?'趋势':'情绪')+'强股占比<b>'+fmt(share,1)+'%</b></span></div>'+(a?'<p class="ms-muted">较 '+esc(dc.from_at.slice(11,16))+' · 成员涨幅 '+msDelta(dc.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(a.share_delta_pp,1)+'个百分点</p>':'')+'<div class="ms-leaders">'+leaders.map(function(c){return '<button onclick="showStock(\''+jsq(c)+'\')">'+esc(lookup[c].name)+'</button>';}).join('')+'</div></article>';
++ return '<article class="ms-direction-card '+axis+'" data-board-id="'+esc(b.id)+'" data-axis="'+axis+'"><div class="ms-card-head"><button class="ms-name-link" onclick="msOpenStocks(\''+jsq(b.id)+'\',\''+axis+'\')">'+esc(b.name)+'</button><button class="ms-detail-link" onclick="showBoardById(\''+jsq(b.id)+'\')">详情 ↗</button></div>'+msBadge(m,axis)+'<div class="ms-mini-metrics"><span>成员整体涨幅<b>'+pct(r0,2)+'</b></span><span>'+ (axis==='trend'?'趋势':'情绪')+'强股占比<b>'+fmt(share,1)+'%</b></span></div>'+(a?'<p class="ms-muted">较 '+esc(dc.from_at.slice(11,16))+' · 成员涨幅 '+msDelta(dc.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(a.share_delta_pp,1)+'个百分点</p>':'')+'<div class="ms-leaders">'+leaders.map(function(c){return '<button onclick="showStock(\''+jsq(c)+'\')">'+esc(lookup[c].name)+'</button>';}).join('')+'</div></article>';
+ }
+ function renderOverview(){document.getElementById('hero-h1').textContent='今天重点看哪里';document.getElementById('hero-p').textContent='市场温度 · 趋势与情绪集中方向 · 最新行情中的转强变化';document.getElementById('hero-stamp').textContent=msStamp();
+  ['ov-work-live','ov-work-close','overview-more'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});var sw=document.querySelector('#p-overview .work-switch');if(sw)sw.style.display='none';
+@@ -106,8 +95,8 @@
+  var metrics=[['上涨占比',fmt(breadth.up_ratio,1)+'%'],['涨停 / 跌停',(temperature.limit_up||0)+' / '+(temperature.limit_down||0)],['昨日涨停股表现',pct(temperature.yesterday_limit_median_pct,2)],['趋势强 / 情绪强',(counts.trend||0)+' / '+(counts.emotion||0)]];
+  var h='<section class="card ms-overview-section"><div class="ms-section-head"><h3>市场温度</h3><span class="ms-muted">沪深主板 · '+(temperature.traded||breadth.traded||0)+'只成交</span></div><div class="ms-temperature-grid">'+metrics.map(function(x){return '<div><span>'+x[0]+'</span><strong>'+x[1]+'</strong></div>';}).join('')+'</div><p class="ms-muted">股票池 '+pool+' 只 · 趋势强占比 '+fmt(pool?100*(counts.trend||0)/pool:null,1)+'% · 情绪强占比 '+fmt(pool?100*(counts.emotion||0)/pool:null,1)+'%'+(dc.temperature_change?' · 较 '+esc(dc.from_at.slice(11,16))+' 可比样本上涨占比变化 '+msDelta(dc.temperature_change.up_ratio_delta_pp,1)+'个百分点':'')+'</p></section>';
+  h+='<section class="card ms-overview-section"><div class="ms-section-head"><h3>正在转强</h3><span class="ms-muted">'+(dc.from_at?'比较 '+esc(dc.from_at.slice(11,19))+' → '+esc(dc.source_at.slice(11,19)):'依据同日可比行情变化')+'</span></div>';
+- var changes=(dc.items||[]).slice(0,6);h+=changes.length?'<div class="ms-turning-grid">'+changes.map(function(x){return '<button class="ms-turning-card '+x.axis+'" onclick="msOpenRadar(\''+jsq(x.id)+'\',\''+x.axis+'\')"><b>'+esc(x.name)+'</b><span>'+ (x.axis==='trend'?'趋势':'情绪')+' · '+esc(x.kind)+'</span><small>成员涨幅 '+msDelta(x.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(x.share_delta_pp,1)+'个百分点</small></button>';}).join('')+'</div>':'<p class="ms-muted">'+(dc.from_at?'本次可比行情中暂无符合转强条件的方向。':'暂无同日可比行情变化记录；下面展示最新强势方向。')+'</p>';h+='</section>';
+- ['trend','emotion'].forEach(function(axis){var lists=meta.boards||{},ids=((lists.sorts||{})[axis]||[]).filter(function(id){return (lists[axis]||[]).indexOf(id)>=0;});h+='<section class="card ms-overview-section"><div class="ms-section-head"><h3>'+(axis==='trend'?'趋势集中方向':'情绪集中方向')+'</h3><button class="btn" onclick="msOpenRadar(null,\''+axis+'\')">查看对应强势股 →</button></div><div class="ms-direction-columns">';['industry','theme'].forEach(function(kind){var rows=ids.map(function(id){return bl[id];}).filter(function(b){return b&&b.type===kind;});h+='<div><div class="ms-section-head"><h4>'+ (kind==='industry'?'行业':'题材')+' <span class="ms-muted">'+rows.length+' 个强势方向</span></h4><button class="ms-detail-link" onclick="MS_VIEW.'+kind+'.scope=\''+axis+'\';MS_VIEW.'+kind+'.sort=\''+axis+'\';RENDERED.'+(kind==='industry'?'boards':'themes')+'=false;goPane(\''+(kind==='industry'?'boards':'themes')+'\')">全部 →</button></div><div class="ms-direction-grid">'+rows.slice(0,4).map(function(b){return msDirectionCard(b,axis);}).join('')+'</div>'+(!rows.length?'<p class="ms-muted">当前没有达到强势范围的方向。</p>':'')+'</div>';});h+='</div></section>';});
++ var changes=(dc.items||[]).slice(0,6);h+=changes.length?'<div class="ms-turning-grid">'+changes.map(function(x){return '<button class="ms-turning-card '+x.axis+'" onclick="msOpenStocks(\''+jsq(x.id)+'\',\''+x.axis+'\')"><b>'+esc(x.name)+'</b><span>'+ (x.axis==='trend'?'趋势':'情绪')+' · '+esc(x.kind)+'</span><small>成员涨幅 '+msDelta(x.return_delta_pp,2)+'个百分点 · 强股占比 '+msDelta(x.share_delta_pp,1)+'个百分点</small></button>';}).join('')+'</div>':'<p class="ms-muted">'+(dc.from_at?'本次可比行情中暂无符合转强条件的方向。':'暂无同日可比行情变化记录；下面展示最新强势方向。')+'</p>';h+='</section>';
++ ['trend','emotion'].forEach(function(axis){var lists=meta.boards||{},ids=((lists.sorts||{})[axis]||[]).filter(function(id){return (lists[axis]||[]).indexOf(id)>=0;});h+='<section class="card ms-overview-section"><div class="ms-section-head"><h3>'+(axis==='trend'?'趋势集中方向':'情绪集中方向')+'</h3><button class="btn" onclick="msOpenStocks(null,\''+axis+'\')">查看对应强势股 →</button></div><div class="ms-direction-columns">';['industry','theme'].forEach(function(kind){var rows=ids.map(function(id){return bl[id];}).filter(function(b){return b&&b.type===kind;});h+='<div><div class="ms-section-head"><h4>'+ (kind==='industry'?'行业':'题材')+' <span class="ms-muted">'+rows.length+' 个强势方向</span></h4><button class="ms-detail-link" onclick="MS_VIEW.'+kind+'.scope=\''+axis+'\';MS_VIEW.'+kind+'.sort=\''+axis+'\';RENDERED.'+(kind==='industry'?'boards':'themes')+'=false;goPane(\''+(kind==='industry'?'boards':'themes')+'\')">全部 →</button></div><div class="ms-direction-grid">'+rows.slice(0,4).map(function(b){return msDirectionCard(b,axis);}).join('')+'</div>'+(!rows.length?'<p class="ms-muted">当前没有达到强势范围的方向。</p>':'')+'</div>';});h+='</div></section>';});
+  host.innerHTML=h+'<p class="ms-muted">'+esc(meta.version||'')+' · '+esc(DATA.ui_generation||'')+' · 行业题材采用同花顺确认成员，最新源时间单独显示。</p>';
+ }
+ function renderWorkboard(){renderOverview();}
+@@ -139,9 +128,9 @@
+  cv.onpointermove=function(e){var rect=cv.getBoundingClientRect(),i=Math.max(0,Math.min(bars.length-1,Math.floor((e.clientX-rect.left-pad)/step))),b=bars[i],out=document.getElementById('k-readout');if(out)out.textContent=b.date+' · 开 '+fmt(b.open,2)+' 高 '+fmt(b.high,2)+' 低 '+fmt(b.low,2)+' 收 '+fmt(b.close,2)+' · 成交量 '+fmt(b.volume,0);};
+ }
+ function showBoardById(id){var b=boardById(id);if(!b)return;var members=b.members||[],idx=(b.market_strength||{}).index_reference||{};var html=msDetail(b.market_strength||{})+'<section class="card"><h3>官方指数参照</h3><p>'+esc(idx.source||'同花顺指数')+' · '+pct(idx.change_pct==null?idx.ret1:idx.change_pct,2)+' · '+esc(idx.quote_at||idx.asof||'—')+'</p><p class="ms-muted">成员共振与官方指数分别计算。</p></section><section class="card"><h3>同花顺确认主板成员 · '+members.length+'只</h3><button class="btn" onclick="pickBoardMembers(\''+jsq(id)+'\')">在个股页查看该板块全部成员</button>'+msTable(members,'members')+'</section>';openDrawer(esc(b.name),'板块研究 · 成员共振与指数参照',html,true);}
+-function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';MS_VIEW.stocks={axis:'trend',scope:'all',sort:'trend',phase:'',q:'',limit:100};}
+-function pickBoardMembers(id){var b=boardById(id);if(!b)return toast('板块成员暂无数据');STATE.filters=defaultFilters();STATE.boardFilterId=id;resetMSMemberView();closeDrawer();RENDERED.stocks=false;goPane('stocks');renderStocks();}
+-function clearMSMembers(){STATE.boardFilterId=null;resetMSMemberView();renderStocks();}
++function resetMSMemberView(){STATE.q='';var input=document.getElementById('q');if(input)input.value='';STATE.boardFilterId=null;MS_VIEW.stocks=msStockDefaults();}
++function pickBoardMembers(id){if(!boardById(id))return toast('板块成员暂无数据');msOpenStocks(id,'trend',true);}
++function clearMSMembers(){resetMSMemberView();MS_VIEW.stocks.scope='all';renderStocks();}
+ function boardMemberRows(b,codes){return msTable((b.members||[]).filter(function(r){return codes.indexOf(r.code)>=0;}),'members');}
+ function downloadMSCSV(text,name){if(text.charAt(0)!=='\ufeff')text='\ufeff'+text;var blob=new Blob([text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}
+ function msCSV(key){var rows=msRows(key);if(key==='industry'||key==='theme'){var generation=DATA.ui_generation,name='板块强度_'+key+'_'+generation+'.csv';if(DATA.ui_lazy){return fetch('/__ui/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:generation,kind:'board',ids:rows.map(function(r){return r.id;})})}).then(function(r){if(!r.ok)throw new Error('导出失败 '+r.status);return r.text();}).then(function(text){downloadMSCSV(text,name);}).catch(function(e){toast(e.message);throw e;});}var headers=['ID','名称','趋势分','情绪分','主导周期','阶段','版本','UI版本','完整模型依据'];function cell(v){return v==null?'':'"'+String(v).replace(/"/g,'""')+'"';}downloadMSCSV('\ufeff'+[headers.join(',')].concat(rows.map(function(r){var m=r.market_strength;return [r.id,r.name,m.trend_score,m.emotion_score,m.dominant_period,m.phase,m.version,generation,JSON.stringify(m)].map(cell).join(',');})).join('\n'),name);return;}return exportCSV(rows,'强势研究_'+DATA.ui_generation+'.csv');}
+--- baseline/test_market_strength_integration.py
++++ test_market_strength_integration.py
+@@ -13,11 +13,11 @@
+ from test_market_strength import fixture,run
+ 
+ 
+-def render(s,action='renderRadar();'):
++def render(s,action="msRender('stocks');"):
+     tpl=(config.ROOT/'dashboard_template.html').read_text(encoding='utf8')
+     formats=tpl[tpl.index('function fmt('):tpl.index('/* 成交额格式化')]
+-    script="""const fs=require('fs'),vm=require('vm');const els={};const ctx={DATA:INPUT,STATE:{boardFilterId:null,q:''},document:{activeElement:null,querySelector(){return {style:{}}},getElementById(id){return els[id]||(els[id]={innerHTML:'',textContent:'',style:{}})}},esc:v=>String(v),jsq:v=>String(v),exportCSV:(rows)=>rows,boardById:id=>ctx.DATA.board_catalog.find(b=>b.id===id),openDrawer:(...a)=>{ctx.drawer=a},setTimeout:()=>{}};
+-    vm.createContext(ctx);vm.runInContext(FORMATS,ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);vm.runInContext(ACTION,ctx);console.log(JSON.stringify({els:els,ids:ctx.msRows('radar').map(r=>r.code),drawer:ctx.drawer,formats:[ctx.fmt(null),ctx.pct(null),ctx.fmt(0),ctx.pct(0)]}));"""
++    script="""const fs=require('fs'),vm=require('vm');const els={};const ctx={DATA:INPUT,STATE:{boardFilterId:null,q:''},RENDERED:{},closeDrawer:()=>{},goPane:p=>{ctx.pane=p},defaultFilters:()=>({}),document:{activeElement:null,querySelector(){return {style:{}}},getElementById(id){return els[id]||(els[id]={innerHTML:'',textContent:'',style:{}})}},esc:v=>String(v),jsq:v=>String(v),exportCSV:(rows)=>{ctx.exported=rows.map(r=>r.code);return rows},boardById:id=>ctx.DATA.board_catalog.find(b=>b.id===id),openDrawer:(...a)=>{ctx.drawer=a},setTimeout:()=>{}};
++    vm.createContext(ctx);vm.runInContext(FORMATS,ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);vm.runInContext(ACTION,ctx);console.log(JSON.stringify({els:els,ids:ctx.msRows('stocks').map(r=>r.code),drawer:ctx.drawer,pane:ctx.pane,view:ctx.MS_VIEW.stocks,exported:ctx.exported,formats:[ctx.fmt(null),ctx.pct(null),ctx.fmt(0),ctx.pct(0)]}));"""
+     script=script.replace('INPUT',json.dumps(s,ensure_ascii=False)).replace('FORMATS',json.dumps(formats)).replace('ACTION',json.dumps(action))
+     r=subprocess.run(['node','--input-type=commonjs','-'],input=script,capture_output=True,text=True,encoding='utf8',check=True)
+     return json.loads(r.stdout)
+@@ -46,17 +46,20 @@
+         exported=list(csv.DictReader(io.StringIO(p.stdout.lstrip('\ufeff'))))
+         self.assertEqual(len(exported),8);self.assertEqual(exported[0]['趋势分'],'');self.assertEqual(exported[0]['规则版本'],M.VERSION)
+         self.assertEqual(exported[0]['情绪分'],'');self.assertIsNone(self.s['stocks'][0]['market_strength']['emotion_score'])
+-    def test_radar_discovery_cards_use_backend_focus(self):
+-        r=render(self.s);body=r['els']['radar-opportunities']['innerHTML'];self.assertEqual(body.count('<table'),0)
+-        self.assertEqual(set(r['ids']),set(self.s['market_strength']['stocks']['focus']));self.assertEqual(body.count('<article'),8)
+-        self.assertIn('近5日活跃',body);self.assertIn('完成日20日',body)
++    def test_merged_picker_and_rankings_use_backend_results(self):
++        r=render(self.s);body=r['els']['ms-stock-host']['innerHTML']
++        self.assertIn('<table',body);self.assertIn('按板块 / 题材选股',body)
++        lists=self.s['market_strength']['stocks']
++        self.assertEqual(r['ids'],[c for c in lists['sorts']['trend'] if c in lists['trend']])
++        focus=render(self.s,"msUpdate('stocks','scope','focus');")
++        self.assertEqual(set(focus['ids']),set(lists['focus']))
+     def test_no_process_groups_or_risk_filter(self):
+-        body=render(self.s)['els']['radar-opportunities']['innerHTML']
++        body=render(self.s,"msUpdate('stocks','scope','focus');")['els']['ms-stock-host']['innerHTML']
+         for word in ('待采样','确认计时','等待确认','判断暂停','受限机会'):self.assertNotIn(word,body)
+         self.assertIn('位置偏热',body);self.assertNotIn('雷达参考',body)
+-        self.s['session']='集合竞价';run(self.f);reference=render(self.s)
++        self.s['session']='集合竞价';run(self.f);reference=render(self.s,"renderStocks();")
+         self.assertEqual(reference['ids'],[])
+-        self.assertIn('参考行情',reference['els']['rad-sub']['innerHTML'])
++        self.assertIn('参考行情',reference['els']['stk-sub']['textContent'])
+     def test_null_render_is_dash_real_zero_zero(self):
+         self.assertEqual(render(self.s)['formats'],['—','—','0.00','0.00%'])
+     def test_render_emotion_only_detail(self):
+@@ -74,7 +77,7 @@
+         self.assertLess(M.sort_key(b,'b','trend'),M.sort_key(a,'a','trend'))
+     def test_search_can_find_not_selected(self):
+         code=self.s['stocks'][0]['code'];self.f[1][code].update(price=100.,high=101.,low=99.,open=100.,change_pct=0.);run(self.f)
+-        r=render(self.s,"MS_VIEW.radar.scope='all';MS_VIEW.radar.q='"+code+"';renderRadar();")
++        r=render(self.s,"MS_VIEW.stocks.scope='all';MS_VIEW.stocks.q='"+code+"';msRender('stocks');")
+         self.assertEqual(r['ids'],[code])
+     def test_current_model_ignores_legacy_cache_changes(self):
+         before=copy.deepcopy(self.s['market_strength'])
+--- baseline/test_market_strength_rework.py
++++ test_market_strength_rework.py
+@@ -95,9 +95,9 @@
+         script="""const vm=require('vm'),fs=require('fs');const els={};const ctx={DATA:INPUT,STATE:{boardFilterId:null,q:'old'},RENDERED:{},defaultFilters:()=>({}),closeDrawer:()=>{},goPane:()=>{},toast:()=>{},document:{getElementById:id=>els[id]||(els[id]={value:'old'}),activeElement:null},boardById:id=>ctx.DATA.board_catalog.find(b=>b.id===id)};vm.createContext(ctx);vm.runInContext(fs.readFileSync('radar_ui.js','utf8'),ctx);ctx.renderStocks=()=>{};ctx.MS_VIEW.stocks.phase='old';ctx.MS_VIEW.stocks.limit=900;ctx.pickBoardMembers('industry:test');const all=ctx.msRows('stocks').map(r=>r.code),view=JSON.parse(JSON.stringify(ctx.MS_VIEW.stocks));ctx.MS_VIEW.stocks.scope='trend';ctx.MS_VIEW.stocks.sort='trend';const trend=ctx.msRows('stocks').map(r=>r.code);ctx.MS_VIEW.stocks.scope='emotion';ctx.MS_VIEW.stocks.sort='emotion';const emotion=ctx.msRows('stocks').map(r=>r.code);ctx.clearMSMembers();console.log(JSON.stringify({all,trend,emotion,view,cleared:ctx.msRows('stocks').map(r=>r.code),board:ctx.STATE.boardFilterId}));"""
+         result=subprocess.run(['node','-'],input=script.replace('INPUT',json.dumps(s)),text=True,encoding='utf8',capture_output=True,check=True)
+         r=json.loads(result.stdout);members=set(s['board_catalog'][1]['member_codes']);lists=s['market_strength']['stocks']
+-        self.assertEqual(r['all'],[c for c in lists['sorts']['combined'] if c in members])
++        self.assertEqual(r['all'],[c for c in lists['sorts']['trend'] if c in members])
+         for key in ('trend','emotion'):self.assertEqual(r[key],[c for c in lists['sorts'][key] if c in members and c in lists[key]])
+-        self.assertEqual(r['view'],dict(axis='trend',scope='all',sort='trend',phase='',q='',limit=100));self.assertEqual(r['cleared'],lists['sorts']['trend']);self.assertIsNone(r['board'])
++        self.assertEqual(r['view']['scope'],'all');self.assertEqual(r['view']['industryIds'],['industry:test']);self.assertEqual(r['view']['phase'],'');self.assertEqual(r['view']['q'],'');self.assertEqual(r['view']['limit'],100);self.assertEqual(r['cleared'],lists['sorts']['trend']);self.assertIsNone(r['board'])
+ 
+     def test_detail_contains_member_entry(self):
+         from test_market_strength_integration import render
+--- baseline/test_owner_strength_rebuild.py
++++ test_owner_strength_rebuild.py
+@@ -60,25 +60,23 @@
+         b=copy.deepcopy(a);b['emotion_score']=100
+         self.assertEqual(M.sort_key(a,'same','trend'),M.sort_key(b,'same','trend'))
+ 
+-    def test_chart_detail_and_radar_cards_not_identical_table(self):
++    def test_chart_detail_overview_and_merged_stock_table(self):
+         f=fixture();code=next(iter(f[1]));prices(f,code,[100+i for i in range(20)],120);run(f)
+         body=render(f[0],"showStock('"+code+"');")['drawer'][2]
+         self.assertIn('id="k-cv"',body);self.assertIn('60日历史K线',body)
+-        radar=render(f[0])['els']['radar-opportunities']['innerHTML']
+-        stocks=render(f[0],"msRender('stocks');")['els']['ms-stock-host']['innerHTML']
+-        self.assertIn('<article',radar);self.assertNotIn('<table',radar)
+-        self.assertIn('<table',stocks);self.assertNotEqual(stocks,radar)
++        stocks=render(f[0])['els']['ms-stock-host']['innerHTML']
++        self.assertIn('<table',stocks);self.assertIn('按板块 / 题材选股',stocks)
+         overview=render(f[0],'renderOverview();')['els']['ms-overview-host']['innerHTML']
+         for section in ('市场温度','正在转强','趋势集中方向','情绪集中方向'):self.assertIn(section,overview)
+-        self.assertNotIn('<table',overview);self.assertNotEqual(overview,radar)
++        self.assertNotIn('<table',overview);self.assertNotEqual(overview,stocks)
+ 
+     def test_emotion_scope_automatically_uses_emotion_sort(self):
+         f=fixture();run(f)
+-        output=render(f[0],"msUpdate('radar','scope','emotion');")
+-        html=output['els']['radar-opportunities']['innerHTML']
+-        self.assertIn('value="emotion" selected>情绪强',html)
+-        self.assertIn('按情绪强度排序',html)
+-        output=render(f[0],"msUpdate('radar','scope','day_attack');")
++        output=render(f[0],"msStockAxis('emotion');")
++        html=output['els']['ms-stock-host']['innerHTML']
++        self.assertIn('value="emotion" selected>当前榜强势',html)
++        self.assertIn('当日进攻、区间保持与近期活跃决定情绪排名',html)
++        output=render(f[0],"msUpdate('stocks','scope','day_attack');")
+         self.assertEqual(output['ids'],f[0]['market_strength']['stocks']['day_attack'])
+ 
+     def test_history_return_uses_five_completed_intervals(self):
+--- baseline/test_page_roles.py
++++ test_page_roles.py
+@@ -36,26 +36,43 @@
+         all_rows=render(self.s,"msStockAll(true);")['els']['ms-stock-host']['innerHTML']
+         self.assertEqual(all_rows.count('data-strength-id='),8)
+ 
+-    def test_radar_same_type_union_cross_type_intersection(self):
+-        action="MS_VIEW.radar.industryIds=['industry:a','industry:b'];MS_VIEW.radar.themeIds=['theme:a'];renderRadar();"
++    def test_merged_same_type_union_cross_type_intersection(self):
++        action="MS_VIEW.stocks.scope='focus';MS_VIEW.stocks.industryIds=['industry:a','industry:b'];MS_VIEW.stocks.themeIds=['theme:a'];msRender('stocks');"
+         r=render(self.s,action)
+         self.assertEqual(set(r['ids']),set(self.codes[2:6]))
+-        html=r['els']['radar-opportunities']['innerHTML']
++        html=r['els']['ms-stock-host']['innerHTML']
+         self.assertIn('匹配方向：',html);self.assertIn('题材甲',html)
+-        r=render(self.s,"MS_VIEW.radar.industryIds=['industry:a'];MS_VIEW.radar.themeIds=['theme:a'];renderRadar();")
++        r=render(self.s,"MS_VIEW.stocks.industryIds=['industry:a'];MS_VIEW.stocks.themeIds=['theme:a'];msRender('stocks');")
+         self.assertEqual(set(r['ids']),set(self.codes[2:4]))
+ 
+-    def test_radar_both_and_all_members_do_not_mix_eligibility(self):
+-        r=render(self.s,"MS_VIEW.radar.scope='both';renderRadar();")
++    def test_merged_both_and_all_members_do_not_mix_eligibility(self):
++        r=render(self.s,"MS_VIEW.stocks.scope='both';msRender('stocks');")
+         self.assertEqual(set(r['ids']),set(self.codes[3:5]))
+-        r=render(self.s,"MS_VIEW.radar.scope='emotion';MS_VIEW.radar.themeIds=['theme:a'];renderRadar();")
++        r=render(self.s,"MS_VIEW.stocks.scope='emotion';MS_VIEW.stocks.themeIds=['theme:a'];msRender('stocks');")
+         self.assertEqual(set(r['ids']),set(self.codes[3:6]))
+-        r=render(self.s,"MS_VIEW.radar.scope='emotion';MS_VIEW.radar.themeIds=['theme:a'];msRadarAll(true);")
++        r=render(self.s,"MS_VIEW.stocks.scope='emotion';MS_VIEW.stocks.themeIds=['theme:a'];msStockAll(true);")
+         self.assertEqual(set(r['ids']),set(self.codes[2:6]))
+ 
+     def test_unknown_member_selection_does_not_fall_back_to_universe(self):
+-        r=render(self.s,"MS_VIEW.radar.themeIds=['theme:unknown'];renderRadar();")
++        r=render(self.s,"MS_VIEW.stocks.themeIds=['theme:unknown'];msRender('stocks');")
+         self.assertEqual(r['ids'],[])
++
++    def test_switching_axes_keeps_all_filters_and_csv_order(self):
++        action="MS_VIEW.stocks.themeIds=['theme:a'];MS_VIEW.stocks.scope='both';MS_VIEW.stocks.phase='';MS_VIEW.stocks.q='600';msStockAxis('emotion');msCSV('stocks');"
++        r=render(self.s,action)
++        self.assertEqual(r['view']['themeIds'],['theme:a']);self.assertEqual(r['view']['scope'],'both')
++        self.assertEqual(r['view']['q'],'600');self.assertEqual(r['exported'],r['ids'])
++        self.assertEqual(set(r['ids']),set(self.codes[3:5]))
++
++    def test_direction_deep_link_opens_stock_page_and_expected_axis(self):
++        r=render(self.s,"msOpenStocks('industry:a','emotion');")
++        self.assertEqual(r['pane'],'stocks');self.assertEqual(r['view']['axis'],'emotion')
++        self.assertEqual(r['ids'],[self.codes[3]])
++        r=render(self.s,"pickBoardMembers('industry:a');")
++        self.assertEqual(r['pane'],'stocks');self.assertEqual(r['view']['scope'],'all')
++        self.assertEqual(set(r['ids']),set(self.codes[:4]))
++        r=render(self.s,"MS_VIEW.stocks.themeIds=['theme:a'];msClearDirections();")
++        self.assertEqual(set(r['ids']),set(self.codes[:5]))
+ 
+     def test_overview_has_direction_sections_not_stock_leaderboards(self):
+         s=copy.deepcopy(self.s);s['board_catalog']=s['board_catalog'][:1]
+--- baseline/test_ui_payload.py
++++ test_ui_payload.py
+@@ -99,7 +99,7 @@
+         from test_market_strength import fixture,run
+         from test_market_strength_integration import render
+         f=fixture();q=f[1];code=next(iter(q));q[code].update(price=110.,open=100.,high=110.,low=100.,change_pct=10.)
+-        run(f);result=render(f[0])
++        run(f);result=render(f[0],"msUpdate('stocks','scope','focus');")
+         self.assertEqual(result['ids'],f[0]['market_strength']['stocks']['focus'])
+         self.assertIn(code,result['ids'])
+ 
+--- baseline/ui_client.js
++++ ui_client.js
+@@ -111,7 +111,7 @@
+       var x=window.scrollX,y=window.scrollY,drawer=UI_DRAWER;
+       UI_REQUEST++;UI_CACHE={};UI_PENDING={};DATA=next;PAGE_VERSION=status.data_version;
+       RENDERED={};renderOverview();RENDERED.overview=true;
+-      var render={stocks:renderStocks,radar:renderRadar,boards:renderBoards,themes:renderThemesPage,hold:renderHold}[STATE.pane];
++      var render={stocks:renderStocks,boards:renderBoards,themes:renderThemesPage,hold:renderHold}[STATE.pane];
+       if(render){render();RENDERED[STATE.pane]=true;}renderFresh();
+       var drawerPromise=drawer?(drawer.kind==='stock'?showStock(drawer.id,drawer.boardId):showBoardById(drawer.id)):Promise.resolve();
+       restoreScrolls();
