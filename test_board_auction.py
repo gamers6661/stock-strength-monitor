@@ -8,6 +8,15 @@ import config
 
 
 class BoardAuctionTest(unittest.TestCase):
+    def test_final_window_uses_supplier_timestamps_after_0925(self):
+        s=self.snapshot('2026-10-12 09:29:59')
+        for r in s['stocks']+s['coverage_catalog']:
+            r['auction_observation']['quote_at']='2026-10-12 09:28:00'
+        board_center.attach_auction(s)
+        a=s['board_catalog'][0]['member_auction']
+        self.assertTrue(a['ready'])
+        self.assertEqual(a['change_pct'],.5)
+
     def snapshot(self, at='2026-10-12 09:25:15'):
         codes=[f'60000{i}' for i in range(8)]
         rows=[dict(code=c, change_pct=99, auction_observation=dict(

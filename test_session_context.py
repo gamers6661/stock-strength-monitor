@@ -51,6 +51,20 @@ class ContextTests(unittest.TestCase):
         c,_=self.build(at='09:25:00',session='竞价结束',captured='2026-09-28 09:29:00')
         self.assertTrue(c['quote_valid']);self.assertEqual(c['auction_phase'],'竞价末价')
 
+    def test_final_window_uses_latest_quotes_without_expiring_0925_result(self):
+        for source in ('09:25:00', '09:26:00', '09:29:59'):
+            c,m=self.build(price=102,at=source,session='竞价结束',captured='2026-09-28 09:29:59')
+            self.assertTrue(c['quote_valid'],source)
+            self.assertEqual(c['price'],102)
+            self.assertEqual(m['price_judged_count'],1)
+        c,_=self.build(at='09:29:59',session='早盘',captured='2026-09-28 09:30:00')
+        self.assertFalse(c['quote_valid'])
+
+    def test_final_scheduler_reads_latest_quote_without_an_archive(self):
+        with patch.dict(serve.SNAPSHOT_META, snapshot_auction_latest_quote_at='2026-09-28 09:26:00'):
+            self.assertTrue(serve.boundary_capture_done(datetime(2026,9,28,9,26,30),'auction_final'))
+            self.assertFalse(serve.boundary_capture_done(datetime(2026,9,28,9,27,0),'auction_final'))
+
     def test_normal_zero_volume_does_not_reuse_auction_judgment(self):
         c,_=self.build(at='09:31:00',session='早盘')
         self.assertFalse(c['quote_valid'])

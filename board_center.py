@@ -8,7 +8,7 @@ from statistics import mean, median
 import config
 import stock_strength
 
-VERSION = '板块成员竞价5'
+VERSION = '板块成员竞价6-末段保留'
 
 
 def attach_auction(snapshot):
@@ -22,7 +22,7 @@ def attach_auction(snapshot):
             change, price = float(q['change_pct']), float(q['price'])
             age = (now-at).total_seconds()
             minute = at.hour*60+at.minute
-            if (at.date() == now.date() and 9*60+15 <= minute <= 9*60+25
+            if (at.date() == now.date() and 9*60+15 <= minute < 9*60+30
                     and -config.INTRADAY['max_quote_future_seconds'] <= age <= config.INTRADAY['max_quote_age_seconds']
                     and math.isfinite(change) and math.isfinite(price) and price > 0):
                 quotes[str(row['code'])] = dict(change_pct=change, quote_at=q['quote_at'])

@@ -10,7 +10,7 @@ import intraday
 import stock_strength
 import history_reference
 
-VERSION='收盘衔接与竞价观察4-有效样本'
+VERSION='收盘衔接与竞价观察5-末段保留'
 ATR_METHOD='ATR20-SMA：20个含跳空的真实波幅简单平均'
 
 def close_baseline(day):
@@ -31,10 +31,10 @@ def live_quote(q,captured_at,session):
     age=(captured_at-at).total_seconds();minute=at.hour*60+at.minute
     auction=session in ('集合竞价','竞价结束')
     retained=(session=='午间休市' and 690<=minute<780) or (session=='已收盘' and 900<=minute<960)
-    limit=24*60*60 if retained else 300 if session=='竞价结束' and minute==565 else 120 if auction else config.INTRADAY['max_quote_age_seconds']
+    limit=24*60*60 if retained else config.INTRADAY['max_quote_age_seconds'] if session=='竞价结束' and 565<=minute<570 else 120 if auction else config.INTRADAY['max_quote_age_seconds']
     if at.date()!=captured_at.date():return None,'当日逐股报价尚未到达'
     if age < -config.INTRADAY['max_quote_future_seconds'] or age>limit:return None,'逐股报价时间超出本阶段有效窗口'
-    allowed=(555<=minute<=565) if auction else ((570<=minute<=690) or (780<=minute<=900) or retained)
+    allowed=(555<=minute<570) if auction else ((570<=minute<=690) or (780<=minute<=900) or retained)
     if not allowed or session not in ('集合竞价','竞价结束','早盘','午盘','尾盘','午间休市','已收盘'):return None,'当前阶段只展示完成日结构'
     if not intraday._positive(q.get('price')):return None,'当日报价无有效价格'
     if not auction and not (intraday._positive(q.get('amount_wan')) or intraday._positive(q.get('volume_shou'))):

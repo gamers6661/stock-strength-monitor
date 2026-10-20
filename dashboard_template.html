@@ -1572,7 +1572,7 @@ function auctionDisplayQuote(s){
     +'-'+String(now.getDate()).padStart(2,'0');
   var final=savedBoundaryQuote(s,'auction_final');if(final)return final;
   var q=s.auction_observation||{},at=String(q.quote_at||''),minute=at.slice(11,16);
-  if(at.slice(0,10)!==today||minute<'09:15'||minute>'09:25'
+  if(at.slice(0,10)!==today||minute<'09:15'||minute>='09:30'
       ||!(Number(q.price)>0)||q.change_pct==null||!isFinite(Number(q.change_pct)))return null;
   return {price:Number(q.price),change:Number(q.change_pct),at:at,sourceAt:at,
     kind:now.getHours()*60+now.getMinutes()>=9*60+25?'竞价末价待确认':'集合竞价报价'};
@@ -1583,7 +1583,7 @@ function morningOpenBridgeQuote(s){
   var q=s&&s.auction_observation||{},at=String(q.quote_at||''),now=new Date();
   var today=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')
     +'-'+String(now.getDate()).padStart(2,'0');
-  if(at.slice(0,10)!==today||at.slice(11,16)<'09:15'||at.slice(11,16)>'09:25'
+  if(at.slice(0,10)!==today||at.slice(11,16)<'09:15'||at.slice(11,16)>='09:30'
       ||!(Number(q.price)>0)||q.change_pct==null||!isFinite(Number(q.change_pct)))return null;
   return {price:Number(q.price),change:Number(q.change_pct),at:at,sourceAt:at,kind:'最近竞价参考'};
 }
@@ -4680,6 +4680,7 @@ function pickThemeByName(name){
 }
 /*__RADAR_SCRIPT__*/
 /*__EMOTION_SCRIPT__*/
+/*__BOARD_DYNAMICS_SCRIPT__*/
 installLazyDetails();
 init();
 

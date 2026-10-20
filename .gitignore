@@ -53,6 +53,11 @@ probe/
 /research/repair_entry_20261016/
 /*.png
 
+# Local "before" snapshots kept as audit evidence, not project source
+# (includes a ~26MB dashboard.html.before; would bloat history permanently)
+*.before
+*.diff
+
 # Credentials and machine-specific settings
 .env
 .env.*

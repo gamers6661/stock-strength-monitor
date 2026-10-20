@@ -183,9 +183,16 @@ def build(snap=None):
         board_trend.attach(snap, fetch=False)
     tpl = TPL.read_text(encoding="utf-8")
     import board_chart
-    snap = board_chart.attach(snap)
-    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_rank_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'ma_trend_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
+    snap = board_chart.attach(snap, refresh=True)
+    # Board-page observations are a separate projection; shared strength results stay intact.
+    import board_dynamics
+    snap['board_dynamics'] = board_dynamics.build(snap)
+    # Isolated stock-page projection; shared rows and board/radar scores stay untouched.
+    import stock_activity
+    snap['stock_activity'] = stock_activity.prepare_page(snap,live=True)
+    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_rank_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_activity_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'ma_trend_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
     tpl=tpl.replace('/*__EMOTION_SCRIPT__*/',(config.ROOT/'emotion_ui.js').read_text(encoding='utf-8'))
+    tpl=tpl.replace('/*__BOARD_DYNAMICS_SCRIPT__*/',(config.ROOT/'board_dynamics_ui.js').read_text(encoding='utf-8')+'\n'+(config.ROOT/'auction_ui.js').read_text(encoding='utf-8'))
     if PLACEHOLDER not in tpl:
         print("[ERR] 模板缺少数据占位符")
         return None
@@ -203,6 +210,8 @@ def build(snap=None):
     config.atomic_write_text(OUT, html)   # 原子写：避免浏览器读到半截页面
     if lazy:
         ui_payload.activate(generation, OUT)
+    if OUT == config.ROOT / 'dashboard.html':
+        stock_activity.save_state(snap['stock_activity'])
     print(f"[OK] 看板已生成：{OUT}  ({len(html)/1024:.0f} KB)")
     return OUT
 

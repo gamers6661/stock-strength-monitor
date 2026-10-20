@@ -253,12 +253,12 @@ def setup_logging():
 
 # ---------------------------------------------------------------- 刷新循环
 def is_trading_time(now=None):
-    """9:15开始竞价观察，连续交易及刚收盘窗口自动扫描。"""
+    """9:15开始竞价观察；常规扫描15:00结束，收盘终值由定点任务处理。"""
     now = now or datetime.now()
     if now.weekday() >= 5:
         return False
     hm = now.hour * 60 + now.minute
-    return (9 * 60 + 15 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60 + 5)
+    return (9 * 60 + 15 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm < 15 * 60)
 
 
 def close_review_done(now, snapshot=None):
@@ -330,15 +330,13 @@ def boundary_capture_done(now, boundary):
     """各阶段报价按逐股源时间判断；定点参考价只保存一次。"""
     if boundary == 'close_review':
         return close_review_done(now)
-    if boundary in ("auction_start", "auction_mid"):
+    if boundary in ("auction_start", "auction_mid", "auction_final"):
         latest = str(SNAPSHOT_META.get("snapshot_auction_latest_quote_at") or "")
-        cutoff = "09:15" if boundary == "auction_start" else "09:20"
+        cutoff = {"auction_start": "09:15", "auction_mid": "09:20", "auction_final": "09:25"}[boundary]
         try:
             at=datetime.fromisoformat(latest)
             return at.date()==now.date() and latest[11:16]>=cutoff and 0<=(now-at).total_seconds()<60
         except ValueError:return False
-    if boundary == "auction_final":
-        return str(SNAPSHOT_META.get("snapshot_auction_final_captured_at") or "").startswith(now.strftime("%Y-%m-%d"))
     if boundary in ("morning_open", "afternoon_open"):
         latest = str(SNAPSHOT_META.get("snapshot_latest_valid_quote_at") or "")
         cutoff = "09:30" if boundary == "morning_open" else "13:00"
@@ -730,6 +728,20 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(403, 'Local requests only')
             return
         path = self.path.split("?")[0]
+        if path == '/__stock_activity':
+            target = config.CACHE_DIR / 'stock_activity_v21' / 'latest.json'
+            try:
+                body = target.read_bytes()
+            except OSError:
+                self.send_error(503, 'Stock strength is not ready')
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/__ping":
             self._send_body(b"pong", "text/plain; charset=utf-8")
             return
@@ -960,6 +972,8 @@ def run_service():
     threading.Thread(target=init_worker, daemon=True).start()
 
     if not no_loop:
+        import stock_activity_sampler
+        threading.Thread(target=stock_activity_sampler.loop, daemon=True).start()
         threading.Thread(target=refresh_loop, args=(interval, always), daemon=True).start()
         threading.Thread(target=boundary_capture_loop, daemon=True).start()
         threading.Thread(target=weekly_members.loop, args=(_SCAN_LOCK,), daemon=True).start()

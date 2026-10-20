@@ -1,0 +1,10 @@
+import json, pathlib, urllib.request
+root=pathlib.Path(r'D:\股票强势监测')
+with urllib.request.urlopen('http://127.0.0.1:8848/__status', timeout=5) as f: s=json.load(f)
+with urllib.request.urlopen('http://127.0.0.1:8848/__stock_activity',timeout=10) as f: d=json.load(f)
+disk=json.loads((root/'cache'/'stock_activity_v21'/'latest.json').read_text(encoding='utf-8'))
+print('SERVICE',s.get('pid'),s.get('phase'),s.get('last_scan_ok'))
+print('RESULT',d.get('version'),d.get('score_version'),d.get('source_at'),d.get('counts'))
+print('FILE_MATCH',d.get('result_version')==disk.get('result_version'))
+print('RULE_VERSION_EXPECTED',d.get('version')=='个股主动强度V2.1-20261020.4')
+print('DATA_QUALITY',d.get('data_quality'))

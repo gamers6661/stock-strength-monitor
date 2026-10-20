@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import board_chart
 
@@ -79,6 +80,65 @@ class BoardChartTests(unittest.TestCase):
             self.assertEqual(out['market_strength'], full['market_strength'])
             self.assertEqual(out['board_catalog'][0]['market_strength'], self.board['market_strength'])
             self.assertFalse(missing.exists())
+
+    def test_stale_completed_bar_rechecked_without_changing_model_history(self):
+        class Clock(datetime):
+            @classmethod
+            def now(cls):return cls(2026,10,13,16,10)
+        with tempfile.TemporaryDirectory() as folder:
+            cache=Path(folder)/'display.json'
+            stale=copy.deepcopy(self.bars);stale[-1]['close']=101
+            histories={'881001':stale};original=copy.deepcopy(self.board)
+            with patch.object(board_chart,'datetime',Clock):
+                meta=board_chart.repair_completed([self.board],histories,self.clock,cache,True,
+                    lambda *_:('示例',copy.deepcopy(self.bars)))
+            self.assertEqual(meta['repaired'],1);self.assertEqual(self.board,original)
+            self.assertEqual(board_chart.project(self.board,histories['881001'],self.clock)['asof'],'2026-10-13')
+            # Later publications reuse verified display data without another request.
+            with patch.object(board_chart,'datetime',Clock):
+                again={'881001':stale[:-1]}
+                meta=board_chart.repair_completed([self.board],again,self.clock,cache,True,
+                    lambda *_:self.fail('verified cached close should be reused'))
+            self.assertEqual(meta['attempted'],0);self.assertEqual(again['881001'][-1]['close'],102)
+
+    def test_bad_official_response_keeps_old_chart(self):
+        for bad_name,price in [('别的指数',102),('示例',999)]:
+            with self.subTest(name=bad_name,price=price),tempfile.TemporaryDirectory() as folder:
+                history={'881001':copy.deepcopy(self.bars[:-1])}
+                fresh=copy.deepcopy(self.bars);fresh[-1].update(close=price,high=max(103,price))
+                meta=board_chart.repair_completed([self.board],history,self.clock,Path(folder)/'cache.json',True,
+                    lambda *_:(bad_name,fresh))
+                self.assertEqual(meta['failed'],1);self.assertEqual(len(history['881001']),1)
+
+    def test_intraday_does_not_fetch_or_complete_today(self):
+        with tempfile.TemporaryDirectory() as folder:
+            meta=board_chart.repair_completed([self.board],{'881001':self.bars[:-1]},datetime(2026,10,13,14),
+                Path(folder)/'cache.json',True,lambda *_:self.fail('no close repair during trading'))
+            self.assertEqual(meta['attempted'],0)
+
+    def test_partial_year_response_uses_official_complete_today_ohlc(self):
+        class Clock(datetime):
+            @classmethod
+            def now(cls):return cls(2026,10,13,16,10)
+        with tempfile.TemporaryDirectory() as folder:
+            partial=copy.deepcopy(self.bars);partial[-1]['close']=101
+            histories={'881001':partial}
+            with patch.object(board_chart,'datetime',Clock),patch('board_trend.parse_year',return_value=('示例',partial)),patch.object(board_chart,'fetch_today',return_value=('示例',self.bars[-1])) as today:
+                meta=board_chart.repair_completed([self.board],histories,self.clock,Path(folder)/'cache.json',True)
+            self.assertEqual(meta['repaired'],1);today.assert_called_once_with('881001','2026-10-13')
+            self.assertEqual(board_chart.project(self.board,histories['881001'],self.clock)['bars'][-1]['close'],102)
+
+    def test_today_endpoint_checks_code_date_and_full_ohlc(self):
+        import json
+        base={'1':'20261013','7':'100','8':'103','9':'99','11':'102','13':12000,'name':'示例'}
+        for code,date,low in [('881001','20261013','99'),('881999','20261013','99'),('881001','20261012','99'),('881001','20261013','104')]:
+            row=dict(base,**{'1':date,'9':low})
+            response='callback('+json.dumps({'bk_'+code:row})+')'
+            with patch('datafeed.http_get',return_value=response):
+                if code=='881001' and date=='20261013' and low=='99':
+                    self.assertEqual(board_chart.fetch_today('881001','2026-10-13')[1]['close'],102)
+                else:
+                    with self.assertRaises((ValueError,KeyError)):board_chart.fetch_today('881001','2026-10-13')
 
 
 if __name__ == '__main__':

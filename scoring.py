@@ -39,7 +39,7 @@ import scan_cache
 import market_strength
 import ma_trend
 
-CLOSE_REFRESH_VERSION = '收盘价格优先发布3'
+CLOSE_REFRESH_VERSION = '收盘价格优先发布4-竞价留存'
 
 
 class DataNotReady(RuntimeError):
@@ -114,13 +114,13 @@ def _auction_snapshot(previous_snapshot, mode, scan_started_at, boundary=None):
     future_limit = config.INTRADAY["max_quote_future_seconds"]
     candidate = {}
     for code, quote in quotes.items():
-        at = intraday.parse_quote_timestamp(quote.get("ts"), captured_at)
+        at = intraday.parse_quote_timestamp(quote.get("quote_at") or quote.get("ts"), captured_at)
         price = num(quote.get("price"))
         if not at or at.date() != captured_at.date() or not math.isfinite(price) or price <= 0:
             continue
         minute = at.hour * 60 + at.minute
         age = (captured_at - at).total_seconds()
-        if not (9 * 60 + 15 <= minute <= 9 * 60 + 25 and -future_limit <= age <= age_limit):
+        if not (9 * 60 + 15 <= minute < 9 * 60 + 30 and -future_limit <= age <= age_limit):
             continue
         candidate[code] = (at, quote, price)
     if not candidate:
@@ -136,7 +136,7 @@ def _auction_snapshot(previous_snapshot, mode, scan_started_at, boundary=None):
     snap.pop('reference_view',None)
     snap.pop('scan_performance',None)
     snap.pop('kline_acquisition',None)
-    auction_phase = df.session_label(captured_at)
+    auction_phase = '竞价结束' if captured_at.hour * 60 + captured_at.minute >= 565 else '集合竞价'
     snap.update(session=auction_phase, mode="auction",
                 scan_started_at=scan_started_at.isoformat(sep=" ", timespec="seconds"),
                 quote_capture_at=captured_at.isoformat(sep=" ", timespec="seconds"))
@@ -144,29 +144,6 @@ def _auction_snapshot(previous_snapshot, mode, scan_started_at, boundary=None):
     prior_boundaries = previous_snapshot.get("boundary_prices") or {}
     boundaries = (dict(prior_boundaries) if prior_boundaries.get("date") == auction_day
                   else {"date": auction_day})
-    if boundary == "auction_final":
-        final_quotes = {}
-        for code, (at, quote, price) in observed.items():
-            if at.hour * 60 + at.minute < 9 * 60 + 25:
-                continue
-            last_close = num(quote.get("last_close"))
-            change = round((price / last_close - 1) * 100, 2) if last_close > 0 else None
-            if change is None:
-                try:
-                    change = float(quote.get("change_pct"))
-                except (TypeError, ValueError):
-                    continue
-            if not math.isfinite(change):
-                continue
-            final_quotes[code] = {"price": round(price, 3), "change_pct": change,
-                                  "source_at": at.isoformat(sep=" ", timespec="seconds")}
-        minimum = max(100, int(len(codes) * 0.6))
-        if len(final_quotes) < minimum:
-            raise DataNotReady(f"9:25 竞价结束报价尚未更新：{len(final_quotes)}/{len(codes)} 只，"
-                               f"需至少 {minimum} 只；稍后重试")
-        boundaries["auction_final"] = {"cutoff": "09:25",
-                                       "captured_at": snap["quote_capture_at"],
-                                       "count": len(final_quotes), "prices": final_quotes}
     snap["boundary_prices"] = boundaries
 
     def auction_row(old):
