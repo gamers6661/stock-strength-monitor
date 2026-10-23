@@ -51,7 +51,7 @@ def owner():
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def capture_once():
+def capture_once(publish=True):
     """8个400只串行批次；单批不重试，不触发备用源和逐股补采。"""
     started = time.monotonic()
     at=datetime.now()
@@ -80,9 +80,9 @@ def capture_once():
         intraday_path.save_acquisition(directory(), quotes, at, datafeed.session_label(at))
         config.atomic_write_text(directory()/'latest.json',json.dumps(dict(captured_at=str(at),session=datafeed.session_label(at),quotes=quotes),ensure_ascii=False,separators=(',',':')))
         # 个股页独立发布，不等待全站重算；失败不丢弃已经落盘的原始报价。
-        if config.SNAPSHOT_JSON.exists():
+        if publish and config.SNAPSHOT_JSON.exists():
             try:
-                import stock_activity
+                import stock_selection as stock_activity
                 projection_started = time.monotonic()
                 model = stock_activity.refresh_projection()
                 status['result_version'] = model.get('result_version')
@@ -90,29 +90,48 @@ def capture_once():
                 status['projection_seconds'] = round(time.monotonic()-projection_started,3)
                 published = datetime.now()
                 status['published_at'] = str(published)
-                source = stock_activity.stamp(model.get('source_at'))
+                source = stock_activity.parse_at(model.get('source_at'))
                 status['quote_age_at_publication_seconds'] = round((published-source).total_seconds(),3) if source else None
             except Exception:
-                logging.exception('个股V2.1独立发布失败，保留最后结果并等待下一次采样')
+                logging.exception('个股V3独立发布失败，保留最后结果并等待下一次采样')
                 status['projection_error'] = '本页计算失败；原始采样已保存'
     status['total_seconds'] = round(time.monotonic()-started,3)
     config.atomic_write_text(directory()/'status.json',json.dumps(status,ensure_ascii=False))
     return status
 
 
-def loop(until_close=False):
-    """单独计时，不等待全站扫描锁；跨进程只允许一个采样者。"""
+def loop(until_close=False, publish=True):
+    """两分钟记录原始路径；服务传publish=False，判断仅由全站同轮发布。"""
     while True:
         with owner() as acquired:
             if acquired:
                 due = time.monotonic()
                 finalized_day=None
+                amount_attempt_at=0
                 while True:
                     now = datetime.now()
                     if until_close and now.weekday()>=5:return
-                    if now.weekday()<5 and now.hour>=15 and finalized_day!=str(now.date()):
+                    if now.weekday()<5 and now.hour>=16 and time.monotonic()-amount_attempt_at>=1800:
+                        amount_attempt_at=time.monotonic()
+                        # 独立进程限制可选金额源的网络超时，不改变行情线程的socket设置。
+                        def update_amounts():
+                            try:
+                                import subprocess,sys
+                                executable=sys.executable.replace('pythonw.exe','python.exe')
+                                kwargs={'creationflags':0x08000000} if os.name=='nt' else {}
+                                result=subprocess.run([executable,'-X','utf8',str(config.ROOT/'stock_selection_data.py'),
+                                    '--maintain','--days','25','--budget','60'],cwd=str(config.ROOT),
+                                    capture_output=True,timeout=95,**kwargs)
+                                import stock_selection_maintenance
+                                stock_selection_maintenance.publish_and_validate()
+                                subprocess.run([executable,'-X','utf8',str(config.ROOT/'stock_selection_maintenance.py')],
+                                    cwd=str(config.ROOT),capture_output=True,timeout=360,check=True,**kwargs)
+                            except Exception:logging.exception('真实成交额盘后补采未完成；保留现有档案')
+                        import threading
+                        threading.Thread(target=update_amounts,daemon=True).start()
+                    if publish and now.weekday()<5 and now.hour>=15 and finalized_day!=str(now.date()):
                         try:
-                            import stock_activity
+                            import stock_selection as stock_activity
                             model=stock_activity.refresh_projection()
                             if model.get('close_finalized') and model.get('day')==str(now.date()):
                                 finalized_day=str(now.date())
@@ -121,7 +140,7 @@ def loop(until_close=False):
                             logging.exception('收盘本地回放未完成，保留最后结果；不再请求行情')
                     if sampling_time(now) and time.monotonic() >= due:
                         try:
-                            status = capture_once()
+                            status = capture_once(publish=publish)
                             logging.info('个股强度独立采样 %s',status)
                         except Exception:
                             logging.exception('个股强度独立采样失败；保留已有真实记录')

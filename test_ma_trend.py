@@ -5,6 +5,7 @@ import subprocess
 import unittest
 from datetime import datetime,timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import intraday
 import ma_trend as T
@@ -58,6 +59,25 @@ def rebound_minutes(f):
 
 
 class MAStages(unittest.TestCase):
+    def test_supplied_price_context_reuses_same_quote_without_changing_results(self):
+        f=sample();baseline=run(copy.deepcopy(f));s,q,p,h,cal,now=f;code=next(iter(q))
+        context=intraday.align_price_basis(q[code],h[code],cal,observation_day=str(now.date()))
+        supplied={code:copy.deepcopy(context)}
+        with patch.object(T,'live',wraps=T.live) as live,patch.object(intraday,'align_price_basis',wraps=intraday.align_price_basis) as align:
+            T.attach(s,q,p,h,cal,now=now,contexts=supplied,minute_data={},fetch_minutes=False)
+        self.assertIs(live.call_args.args[-1],supplied[code])
+        align.assert_not_called()
+        self.assertEqual(s['stocks'][0]['ma_trend'],baseline)
+        self.assertEqual(supplied,{code:context})
+
+    def test_context_from_an_earlier_quote_is_recomputed(self):
+        f=sample();s,q,p,h,cal,now=f;code=next(iter(q))
+        context=intraday.align_price_basis(q[code],h[code],cal,observation_day=str(now.date()))
+        context['quote_at']=str(now-timedelta(minutes=1))
+        with patch.object(intraday,'align_price_basis',wraps=intraday.align_price_basis) as align:
+            T.attach(s,q,p,h,cal,now=now,contexts={code:context},minute_data={},fetch_minutes=False)
+        self.assertTrue(align.called)
+
     def test_above_ma5_without_strong_origin_is_not_selected(self):
         f=fixture(1);m=run(f);self.assertFalse(m['eligible']);self.assertIsNone(m['origin'])
 
@@ -293,6 +313,23 @@ class MinuteSupport(unittest.TestCase):
         bars,ctx,q,at=self.inputs('09:50','09:55');before=T.minutes_status(bars,ctx,q,at)
         bars.append(dict(bars[-1],at=at[:10]+' 10:05',open=50,close=50,low=49,high=51))
         self.assertEqual(before,T.minutes_status(bars,ctx,q,at))
+
+
+class DailyCache(unittest.TestCase):
+    def test_reuses_completed_day_and_clears_on_data_or_day_change(self):
+        f=sample();bars=f[3][next(iter(f[3]))];calendar=f[4]
+        T._DAILY_CACHE.clear();T._DAILY_CACHE_DAY=None
+        T._DAILY_STATS.update(hits=0,misses=0,clears=0)
+        first=T.daily(bars,calendar);second=T.daily(bars,calendar)
+        self.assertEqual(first,second)
+        self.assertGreaterEqual(T._DAILY_STATS['hits'],1)
+        changed=copy.deepcopy(bars);changed[-1]['close']+=.01
+        T.daily(changed,calendar)
+        self.assertGreaterEqual(T._DAILY_STATS['misses'],2)
+        clears=T._DAILY_STATS['clears']
+        T.daily(changed,calendar+['2099-01-01'])
+        self.assertGreater(T._DAILY_STATS['clears'],clears)
+        T._DAILY_CACHE.clear();T._DAILY_CACHE_DAY=None
 
 
 if __name__=='__main__':unittest.main()

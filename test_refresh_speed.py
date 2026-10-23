@@ -79,7 +79,7 @@ class RefreshSpeedTests(unittest.TestCase):
             return {'scan_performance':{}}
         with TemporaryDirectory() as tmp,patch.object(config,'CACHE_DIR',Path(tmp)), \
              patch.dict(serve.INIT,{'phase':'ready'}), \
-             patch.object(serve.scoring.df,'in_trading_session',return_value=True), \
+             patch.object(serve.scoring.df,'session_label',return_value='午间休市'), \
              patch.object(serve.board_trend,'identities',return_value={'industry:x':'881001'}), \
              patch.object(serve.board_quote,'fetch',return_value=quotes) as fetch, \
              patch.object(serve.scoring,'run',side_effect=score), \

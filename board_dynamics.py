@@ -8,14 +8,19 @@ import json
 import math
 from collections import Counter
 from datetime import datetime
-from statistics import mean, median
+from statistics import median
 
-VERSION = 'board-dynamics-2026-10-16.1'
+
+def mean(values):
+    values = list(values)
+    return sum(values) / len(values) if values else 0.0
+
+VERSION = 'board-dynamics-2026-10-22.trading-two'
 PARAMETERS = dict(min_members=6, min_coverage_pct=80., strong_min=65.,
-    window_minutes=15., window_min=10., window_max=30., max_quote_skew_seconds=120,max_source_age_seconds=600,
-    advance_pp15=.30, excess_pp15=.10, acceleration_pp15=.15,
+    max_quote_skew_seconds=120,max_source_age_seconds=600,
+    advance_pp=.30, excess_pp=.10,
     breadth_change_pp=5., breadth_members=2, breadth_up_pct=55.,
-    fade_pp15=-.30, confirm_minutes=5., confirm_max_minutes=15.,
+    fade_pp=-.30,
     structure_min=.85, health_min=.75, waiting_score_min=45., overlap_min=.70,
     priority_strong_pct=30.,concentration_min_members=10,concentration_top3_pct=70.)
 
@@ -35,9 +40,9 @@ def session(at):
     if not at:
         return None
     seconds=at.hour*3600+at.minute*60+at.second
-    if 34200 <= seconds <= 41459:
+    if 34200 <= seconds <= 41400:
         return (at.date().isoformat(), 'morning')
-    if 46800 <= seconds <= 54090:
+    if 46800 <= seconds <= 54000:
         return (at.date().isoformat(), 'afternoon')
     return None
 
@@ -55,11 +60,14 @@ def samples(snap):
     """Use each member's real timestamp, deduplicating frozen closing reads."""
     version=(snap.get('market_strength') or {}).get('implementation_hash')
     verified=stamp(snap.get('close_daily_verified_at'))
+    captured=stamp(snap.get('quote_capture_at') or snap.get('generated_at'))
     result={}
     for raw in snap.get('direction_observations') or []:
         if raw.get('version') != version:
             continue
         record_at=stamp(raw.get('at'))
+        if not record_at or (captured and record_at>captured):
+            continue
         quotes=raw.get('quote_evidence') or {}
         valid={}
         for code,values in (raw.get('stocks') or {}).items():
@@ -68,7 +76,10 @@ def samples(snap):
             if (len(values)<3 or not number(values[0]) or not any(number(v) for v in values[1:3]) or not at or not record_at or
                     at>record_at or not (session(at) or closing) or at.date()!=record_at.date()):
                 continue
-            valid[code]=(values,at)
+            # Verified post-close reads belong to ONE 15:00 closing observation.
+            # Acquisition timestamps must never create extra market observations.
+            market_at=at.replace(hour=15,minute=0,second=0,microsecond=0) if closing else at
+            valid[code]=(values,market_at)
         source=max((v[1] for v in valid.values()),default=None)
         if not source:
             continue
@@ -77,25 +88,16 @@ def samples(snap):
         if not valid:
             continue
         actual_source=source
-        if verified and snap.get('session')=='已收盘' and source.date()==verified.date() and source.hour>=15:
-            # Completed-close reads have one trading boundary. Preserve their real
-            # quote timestamps separately; 15:05 is not five more trading minutes.
-            source=source.replace(hour=15,minute=0,second=0,microsecond=0)
-            valid={c:(v[0],min(v[1],source)) for c,v in valid.items()}
-        item=dict(at=source, source_at=actual_source, stocks=valid, boards=raw.get('boards') or {}, pool_hash=raw.get('pool_hash'))
+        item=dict(at=source, source_at=actual_source, acquired_at=record_at, stocks=valid, boards=raw.get('boards') or {}, pool_hash=raw.get('pool_hash'))
         # Same source time cannot provide a second confirmation, even if rescored.
-        result[source]=item
+        if source not in result or record_at>result[source]['acquired_at']:
+            result[source]=item
     return [result[k] for k in sorted(result)]
 
 
 def baseline(ring, end):
-    candidates=[]
-    for r in ring:
-        minutes=(end['at']-r['at']).total_seconds()/60
-        if (session(r['at'])==session(end['at']) and r['pool_hash']==end['pool_hash'] and
-                PARAMETERS['window_min']<=minutes<=PARAMETERS['window_max']):
-            candidates.append((abs(minutes-PARAMETERS['window_minutes']),r['at'],r))
-    return min(candidates,key=lambda r:(r[0],r[1]))[2] if candidates else None
+    earlier = [point for point in ring if point['at'] < end['at']]
+    return max(earlier, key=lambda point: point['at']) if earlier else None
 
 
 def strong(values):
@@ -107,13 +109,27 @@ def consistent(board, points):
     return all((s['boards'].get(board['id']) or {}).get('membership')==identity for s in points)
 
 
+_FORWARD_CACHE = {}
+
+
+def _forward_codes(points):
+    key=tuple(p['at'] for p in points)
+    cached=_FORWARD_CACHE.get(key)
+    if cached is None:
+        codes=set(points[0]['stocks']) if points else set()
+        for point in points[1:]:
+            codes.intersection_update(point['stocks'])
+        # Every member must have a distinct, forward-moving source at each point.
+        cached=frozenset(c for c in codes if all(points[i]['stocks'][c][1]<points[i+1]['stocks'][c][1]
+                                                 for i in range(len(points)-1)))
+        _FORWARD_CACHE[key]=cached
+    return cached
+
+
 def common_codes(expected, points):
-    codes=set(expected)
-    for s in points:
-        codes.intersection_update(s['stocks'])
-    # Every member must have a distinct, forward-moving source at each point.
-    return sorted(c for c in codes if all(points[i]['stocks'][c][1]<points[i+1]['stocks'][c][1]
-                                          for i in range(len(points)-1)))
+    if not points:
+        return []
+    return sorted(set(expected) & _forward_codes(points))
 
 
 def fixed_weights(codes, point):
@@ -130,12 +146,13 @@ def stats(codes, point):
 
 
 def window(board, ring, end):
-    start=baseline(ring,end)
-    if not start or not consistent(board,[start,end]):
-        return None
     expected=set((board.get('market_strength') or {}).get('expected_codes') or board.get('member_codes') or [])
-    codes=common_codes(expected,[start,end])
-    if not eligible(codes,expected):
+    start=None; codes=[]
+    for candidate in sorted((p for p in ring if p['at']<end['at']),key=lambda p:p['at'],reverse=True):
+        comparable=common_codes(expected,[candidate,end])
+        if eligible(comparable,expected):
+            start=candidate; codes=comparable; break
+    if start is None:
         return None
     market=common_codes(set(start['stocks'])&set(end['stocks']),[start,end])
     if not market:
@@ -146,51 +163,35 @@ def window(board, ring, end):
     delta=mean(increments[c] for c in weights)
     market_delta=mean(end['stocks'][c][0][0]-start['stocks'][c][0][0] for c in market)
     before,after=stats(codes,start),stats(codes,end)
-    result=dict(from_at=str(start['at']),to_at=str(end['at']),minutes=round(elapsed,2),
-        delta_pp=round(delta,4),speed_pp15=round(delta*15/elapsed,4),
-        excess_pp15=round((delta-market_delta)*15/elapsed,4),market_delta_pp=round(market_delta,4),
+    return dict(from_at=str(start['at']),to_at=str(end['at']),minutes=round(elapsed,2),
+        delta_pp=round(delta,4),excess_pp=round(delta-market_delta,4),
+        market_delta_pp=round(market_delta,4),
         up_delta_pp=round(after['up_pct']-before['up_pct'],2),
         strong_delta=after['strong_count']-before['strong_count'],
         strong_delta_pp=round(after['strong_pct']-before['strong_pct'],2),
         median_delta_pp=round(median(increments.values()),4),
         up_pct=round(after['up_pct'],2),strong_count=after['strong_count'],strong_pct=round(after['strong_pct'],2),
         common_count=len(codes),expected=len(expected),coverage_pct=round(len(codes)*100/len(expected),2),
-        common_codes=codes,weighted_codes=weights,previous_speed_pp15=None,acceleration_pp15=None)
-    earlier=baseline(ring,start)
-    if earlier and consistent(board,[earlier,start,end]):
-        three=common_codes(expected,[earlier,start,end])
-        market_three=common_codes(set(earlier['stocks'])&set(start['stocks'])&set(end['stocks']),[earlier,start,end])
-        if eligible(three,expected) and market_three:
-            fixed=fixed_weights(three,earlier)
-            prior_minutes=(start['at']-earlier['at']).total_seconds()/60
-            old=mean(start['stocks'][c][0][0]-earlier['stocks'][c][0][0] for c in fixed)*15/prior_minutes
-            new=mean(end['stocks'][c][0][0]-start['stocks'][c][0][0] for c in fixed)*15/elapsed
-            result.update(previous_speed_pp15=round(old,4),acceleration_speed_pp15=round(new,4),
-                          acceleration_pp15=round(new-old,4),acceleration_count=len(three),previous_from_at=str(earlier['at']))
-    return result
+        common_codes=codes,weighted_codes=weights,
+        comparison_basis='当前成员固定回看最近两条有效交易时点；盘后重复收盘数据合并至15:00；跨日时比较各自当日涨幅的变化，不作为区间收益')
 
 
 def signals(w, board, start, end, prior_strong):
-    p=PARAMETERS
     if not w:
         return dict(attack=False,turning=False,accelerating=False,spreading=False,fading=False,decelerating=False)
+    p=PARAMETERS
     old=start['boards'].get(board['id']) or {}; new=end['boards'].get(board['id']) or {}
-    entered=any(number(new.get(k)) and new[k]>=p['strong_min'] and number(old.get(k)) and old[k]<p['strong_min']
-                for k in ('trend','emotion'))
-    advance=(w['speed_pp15']>=p['advance_pp15'] and w['excess_pp15']>=p['excess_pp15']
+    entered=old.get('membership')==new.get('membership') and any(
+        number(new.get(k)) and new[k]>=p['strong_min'] and number(old.get(k)) and old[k]<p['strong_min']
+        for k in ('trend','emotion'))
+    advance=(w['delta_pp']>=p['advance_pp'] and w['excess_pp']>=p['excess_pp']
              and w['median_delta_pp']>0 and w['up_pct']>=p['breadth_up_pct'])
     spreading=(w['delta_pp']>0 and w['median_delta_pp']>0 and w['up_delta_pp']>=p['breadth_change_pp']
                and w['strong_delta_pp']>=p['breadth_change_pp'] and w['strong_delta']>=p['breadth_members'])
-    accelerating=(advance and w.get('previous_speed_pp15') is not None and w['previous_speed_pp15']>0
-                  and w['acceleration_speed_pp15']>=p['advance_pp15']
-                  and w['acceleration_pp15']>=p['acceleration_pp15']
-                  and w['strong_delta']>=0 and w['up_delta_pp']>=0)
-    fading=(prior_strong and w['speed_pp15']<=p['fade_pp15'] and w['median_delta_pp']<0
+    fading=(prior_strong and w['delta_pp']<=p['fade_pp'] and w['median_delta_pp']<0
             and (w['strong_delta']<=-p['breadth_members'] or w['up_delta_pp']<=-p['breadth_change_pp']))
     return dict(attack=advance,turning=advance and entered and w['strong_delta']>=0,
-        accelerating=accelerating,spreading=spreading,fading=fading,
-        decelerating=w.get('acceleration_pp15') is not None and w['previous_speed_pp15']>0
-            and w['acceleration_pp15']<=-p['acceleration_pp15'] and not fading)
+                accelerating=False,spreading=spreading,fading=fading,decelerating=False)
 
 
 def official(board):
@@ -206,7 +207,7 @@ def evaluate(board, ring, rows, paused, stale=False):
     m=board.get('market_strength') or {}; expected=set(m.get('expected_codes') or board.get('member_codes') or [])
     end=ring[-1] if ring else None
     codes=sorted(expected&set(end['stocks'])) if end else []
-    ready=bool(end and consistent(board,[end]) and eligible(codes,expected))
+    ready=bool(end and eligible(codes,expected))
     daily=any(number(x.get('score')) and x['score']>=PARAMETERS['strong_min'] for x in m.get('history_trend') or [])
     part=(m.get('trend_parts_by_period') or {}).get(str(m.get('dominant_period'))) or {}
     structure=(number(part.get('K')) and part['K']>=PARAMETERS['structure_min']
@@ -217,15 +218,7 @@ def evaluate(board, ring, rows, paused, stale=False):
         (start['boards'].get(board['id']) or {}).items() if k in ('trend','emotion')))
     sig=signals(w,board,start,end,prior_strong)
     confirmation=None
-    for point in reversed(ring[:-1]):
-        minutes=(end['at']-point['at']).total_seconds()/60
-        if PARAMETERS['confirm_minutes']<=minutes<=PARAMETERS['confirm_max_minutes'] and session(point['at'])==session(end['at']):
-            previous_window=window(board,ring,point)
-            if previous_window:
-                earlier=next(s for s in ring if str(s['at'])==previous_window['from_at'])
-                confirmation=(signals(previous_window,board,earlier,point,prior_strong),str(point['at']))
-                break
-    confirmed={k:bool(sig[k] and confirmation and confirmation[0][k]) for k in sig}
+    confirmed=dict(sig)
     current=stats(codes,end) if ready else {}
     if current:
         weight=fixed_weights(codes,end)
@@ -234,15 +227,14 @@ def evaluate(board, ring, rows, paused, stale=False):
         current.update(excess_pp=current['return_pct']-market,valid=len(codes),expected=len(expected),
                        coverage_pct=len(codes)*100/len(expected))
     tags=[]; reason=[]; lane='ordinary'; status='平稳观察'; priority=8
-    trigger='成员推进转正并跑赢主板，上涨与强股参与同步改善，连续有效报价确认。'
+    trigger='最近两条数据中成员涨幅改善并跑赢可比样本，上涨与强股参与同步改善。'
     invalidate='推进转负且成员参与收缩，或结构受损时下调关注。'
-    if not ready or not w or paused or stale:
-        status='待开盘' if paused else '报价待更新' if stale else '比较不足';lane='pending';priority=9
+    if not ready or not w or paused:
+        status='待开盘' if paused else '比较不足';lane='pending';priority=9
         reason=[('竞价与盘前不沿用连续竞价变化作当前判断。' if paused else
-                 '源报价已过期或尚未跨过当前开盘边界，保留原时点数据供核对。' if stale else
                  '当前报价成员不足6只或覆盖不足80%。' if not ready else
-                 '缺少同一交易时段、同成员且源报价向前更新的10—30分钟比较。')]
-        trigger='等待正式开盘及足够的可比源报价；重复读取不增加确认次数。'
+                 '尚未取得两条不同源时点且成员覆盖合格的数据。')]
+        trigger='使用最近两条不同源时点的有效数据；相同源时点只保留一条。'
     else:
         if sig['spreading']:tags.append('扩散' if confirmed['spreading'] else '扩散待确认')
         if sig['accelerating']:tags.append('加速' if confirmed['accelerating'] else '加速待确认')
@@ -251,7 +243,7 @@ def evaluate(board, ring, rows, paused, stale=False):
         if sig['fading']:
             status='退潮' if confirmed['fading'] else '退潮待确认';lane='cooling';priority=6
             reason=['此前有强势背景；当前推进与成员参与同时回落。']
-            trigger='重新向上推进并修复参与广度，连续确认后再上调关注。'
+            trigger='下一条数据的涨幅与参与广度改善后上调关注。'
             invalidate='持续回落或结构受损，退出轮动候选。'
         elif confirmed['attack']:
             new_turn=sig['turning'] or bool(confirmation and confirmation[0]['turning'])
@@ -259,24 +251,24 @@ def evaluate(board, ring, rows, paused, stale=False):
             lane='priority' if (confirmed['spreading'] or confirmed['accelerating'] or
                                 current.get('strong_pct',0)>=PARAMETERS['priority_strong_pct'] and w['up_delta_pp']>=0 and w['strong_delta']>=0) else 'watch'
             priority=1 if lane=='priority' and confirmed['spreading'] else 2 if lane=='priority' else 3
-            reason=['向上推进、跑赢主板与多数成员跟随已在两次有效观察中成立。']
+            reason=['最近两条数据对比：成员涨幅改善、跑赢可比样本，且多数成员跟随。']
             if confirmed['spreading']:reason.append('上涨比例和强股数量同步增加。')
             if confirmed['accelerating']:reason.append('同一批成员的后段推进速度超过前段。')
             if lane=='watch':reason.append('强股占比尚不足30%或参与有所收缩，继续观察扩散。')
         elif sig['attack'] or sig['spreading']:
             status='转强待确认' if sig['turning'] else '局部转强';lane='watch';priority=4
-            reason=['已观察到推进或扩散，尚缺连续确认或完整共振。']
+            reason=['已观察到推进或扩散，尚未形成完整共振。']
         elif (daily and structure and number(m.get('trend_score')) and m['trend_score']>=PARAMETERS['waiting_score_min']
-              and not sig['fading'] and w['speed_pp15']>PARAMETERS['fade_pp15']):
+              and not sig['fading'] and w['delta_pp']>PARAMETERS['fade_pp']):
             status='整理等待';lane='waiting';priority=5
             reason=['按当前确认成员回看，近3个完成日曾趋势强势，当前结构保持，眼下缺少已确认进攻。']
-            trigger='近约15分钟推进至少0.30个百分点且跑赢主板0.10个百分点；上涨比例≥55%、成员中位数改善，两次观察相隔≥5分钟确认。'
-            invalidate='结构系数低于0.85、健康度低于0.75，或出现连续退潮，退出候选。'
+            trigger='最近两条数据的成员涨幅改善至少0.30个百分点、相对可比样本改善0.10个百分点，上涨比例≥55%、成员中位数改善。'
+            invalidate='结构系数低于0.85、健康度低于0.75，或出现参与持续收缩，退出候选。'
         elif m.get('trend_strong') or m.get('emotion_strong'):
             status='强势保持';lane='watch';priority=4
-            reason=['现有强度仍达标，当前窗口尚未形成已确认的加速或扩散。']
+            reason=['现有强度仍达标，最近两条数据尚未形成进一步扩散。']
         else:
-            reason=['本窗口尚未出现符合条件的推进、扩散或历史强势整理候选。']
+            reason=['本次对比尚未出现符合条件的推进、扩散或历史强势整理候选。']
     if not structure and ready and daily:
         tags.append('结构需修复')
     leaders=[]; new_members=[]; concentration=None
@@ -294,7 +286,7 @@ def evaluate(board, ring, rows, paused, stale=False):
     if '指数/主板成员分歧' in (m.get('reasons') or []):tags.append('指数与成员分歧')
     series=[]
     if end:
-        points=[s for s in ring if session(s['at'])==session(end['at']) and consistent(board,[s])]
+        points=[start,end] if w else [end]
         fixed=set(expected)
         for s in points:fixed.intersection_update(s['stocks'])
         if eligible(fixed,expected):
@@ -311,19 +303,20 @@ def evaluate(board, ring, rows, paused, stale=False):
 
 
 def build(snap):
+    _FORWARD_CACHE.clear()
     ring=samples(snap)
-    # Never carry an intraday change across dates or the midday break.
+    # Comparison uses ordered source records, independent of the gap between them.
     captured=stamp(snap.get('quote_capture_at') or snap.get('generated_at'))
     paused=snap.get('session') in ('盘前','集合竞价','竞价结束')
-    if captured and ring and captured.date()!=ring[-1]['at'].date():paused=True
+    if captured: ring=[point for point in ring if point['at']<=captured]
     stale=bool(captured and ring and snap.get('session') not in ('已收盘','午间休市')
         and ((captured-ring[-1]['source_at']).total_seconds()>PARAMETERS['max_source_age_seconds']
              or session(captured)!=session(ring[-1]['at'])))
     rows={r['code']:r for key in ('stocks','coverage_catalog') for r in snap.get(key) or []}
     boards=[b for b in snap.get('board_catalog') or [] if official(b)]
     items=[evaluate(b,ring,rows,paused,stale) for b in boards]
-    items.sort(key=lambda r:(r['priority'],-((r['change'] or {}).get('excess_pp15') or 0),
-        -((r['change'] or {}).get('strong_delta_pp') or 0),-((r['change'] or {}).get('speed_pp15') or 0),r['name']))
+    items.sort(key=lambda r:(r['priority'],-((r['change'] or {}).get('excess_pp') or 0),
+        -((r['change'] or {}).get('strong_delta_pp') or 0),-((r['change'] or {}).get('delta_pp') or 0),r['name']))
     members={b['id']:set(b.get('member_codes') or []) for b in boards}
     candidates=[r for r in items if r['lane'] in ('priority','watch','waiting')]
     for i,row in enumerate(candidates):

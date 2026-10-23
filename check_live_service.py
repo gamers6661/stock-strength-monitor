@@ -217,7 +217,12 @@ def run(base="http://127.0.0.1:8848"):
         if evidence.get('valid'):
             assert evidence['count']>=evidence['required']==40
         if c['quote_valid'] and c['price_basis_valid']:
-            assert c.get('current_label') and c.get('structure_state'), '有效报价没有最新结构解释'
+            assert c.get('current_label'), '有效报价没有最新观察说明'
+            if c.get('partial_history'):
+                assert not c['monitor_candidate'], '短历史样本不能产生完整结构候选'
+                assert c.get('available_ma') and c.get('reason'), '短历史样本缺少可用周期和原因'
+            else:
+                assert c.get('structure_state'), '完整历史有效报价没有最新结构解释'
         if c['stage'] in ('午间休市','已收盘'):
             assert not c['monitor_candidate'], '休市参考不应产生新候选'
         if c['monitor_candidate']:

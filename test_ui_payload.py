@@ -13,6 +13,50 @@ import ui_payload
 
 
 class PayloadTests(unittest.TestCase):
+    def test_offline_generation_pins_independent_result_and_rejects_another_day(self):
+        import stock_activity
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp);page=root/'page.html';folder=root/'stock_activity_v21';folder.mkdir()
+            data={'stocks':[],'runtime_contract':{},'generated_at':'2026-10-20 10:00:00'}
+            model=dict(version=stock_activity.VERSION,implementation_hash=stock_activity.IMPLEMENTATION_HASH,
+                       day='2026-10-20',source_at='2026-10-20 10:00:00',result_version='result-A',items={'600001':{'score':80}})
+            latest=folder/'latest.json';latest.write_text(json.dumps(model),encoding='utf8')
+            store=ui_payload.store_root(page)
+            with patch.object(config,'CACHE_DIR',root),patch.object(ui_payload,'store_root',return_value=store):
+                packet,token=ui_payload.prepare(data,'var DATA = /*__DATA__*/null;',page)
+                self.assertNotIn('stock_activity',ui_payload.unpack(packet))  # keep the live list small
+                self.assertEqual(ui_payload.unpack(packet)['stock_activity_snapshot']['result_version'],'result-A')
+                def offline(version):
+                    return json.JSONDecoder().raw_decode(ui_payload.offline_html(version).decode('utf8').split('var DATA = ',1)[1])[0]
+                model.update(result_version='result-B',day='2026-10-21',source_at='2026-10-21 10:00:00')
+                latest.write_text(json.dumps(model),encoding='utf8')
+                saved=offline(token)
+                self.assertEqual(saved['stock_activity']['result_version'],'result-A')
+                self.assertEqual(saved['stock_activity']['day'],'2026-10-20')
+                _,without_activity=ui_payload.prepare(data,'var DATA = /*__DATA__*/null;',page)
+                self.assertNotIn('stock_activity',offline(without_activity))
+                model.update(day='2026-10-20',source_at='2026-10-20 10:01:00')
+                latest.write_text(json.dumps(model),encoding='utf8')
+                _,newer=ui_payload.prepare(data,'var DATA = /*__DATA__*/null;',page)
+                self.assertNotEqual(token,newer)
+                self.assertEqual(offline(newer)['stock_activity']['result_version'],'result-B')
+
+    def test_stock_beyond_inline_limit_freezes_current_ohlc_for_detail_and_offline(self):
+        from test_market_strength import fixture,run
+        f=fixture(1);run(f);full=f[0];code=full['stocks'][0]['code']
+        full['stocks'][0].pop('k',None);full['stocks'][0].pop('chart_history',None)
+        with TemporaryDirectory() as tmp:
+            page=Path(tmp)/'dashboard.html'
+            _,token=ui_payload.prepare(full,'var DATA = /*__DATA__*/null;',page)
+            expected=ui_payload.detail(token,'stock',code,page)
+            self.assertEqual(expected['chart_history'][-1]['date'],str(f[5].date()))
+            with patch.object(config,'KLINE_DB',Path(tmp)/'later-market.db'),patch('datafeed.load_kline',side_effect=AssertionError('detail must use frozen data')):
+                self.assertEqual(ui_payload.detail(token,'stock',code,page),expected)
+                with patch.object(ui_payload,'store_root',return_value=ui_payload.store_root(page)):
+                    html=ui_payload.offline_html(token).decode('utf8')
+                offline,_=json.JSONDecoder().raw_decode(html.split('var DATA = ',1)[1])
+                self.assertEqual(offline['stocks'][0]['chart_history'],expected['chart_history'])
+
     def test_numeric_parameter_keys_match_persisted_json_and_browser_objects(self):
         data={'parameters':{5:.1,10:.2,20:.3},'other':{None:1,True:2,1.5:3}}
         expected=json.loads(ui_payload.dumps(data))

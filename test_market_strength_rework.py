@@ -15,6 +15,11 @@ from test_market_strength import fixture
 
 
 class TimeProtection(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        self.archive_patch=patch.object(M,'archived_close_input',return_value=None)
+        self.archive_patch.start();self.addCleanup(self.archive_patch.stop)
+
     def evaluate(self, at, session, now, verified=None):
         s,q,p,h,c,_=fixture()
         s['session']=session

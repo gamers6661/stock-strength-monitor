@@ -1,5 +1,5 @@
 """Main-board relay facts, cohorts and candidates, independent of MA eligibility."""
-import copy,gzip,hashlib,json,math
+import copy,gzip,hashlib,json,math,time
 from collections import Counter,defaultdict
 from datetime import datetime,timedelta
 from pathlib import Path
@@ -137,6 +137,11 @@ def cohort(models,codes):
 
 def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=None,fetch=True,persist=True):
     now=now or datetime.fromisoformat(snap['quote_capture_at']);day=now.date().isoformat();session=snap.get('session')
+    profile_started=time.monotonic();profile_cpu_started=time.process_time();profile_last=[profile_started];profile={}
+    def mark_profile(label):
+        now_mono=time.monotonic()
+        profile[label]=round(now_mono-profile_last[0],3)
+        profile_last[0]=now_mono
     rows={r['code']:r for r in snap.get('stocks',[])+snap.get('coverage_catalog',[])}
     dates=[d for d in calendar if d<day];days=dates[-P['history_days']:];replay_days=dates[-(P['history_days']+P['warmup_days']):]
     effective={c:effective_quote(snap,r,quotes) for c,r in rows.items()}
@@ -145,21 +150,24 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
     proofs={}
     if session=='已收盘':
         proofs={c:p for c in rows if (p:=H.close_proof(snap,effective[c],histories.get(c) or [],calendar,now,code=c))}
+    mark_profile("行情与证明")
     if evidence is None:
         H.ingest_close(snap,effective,now,proofs)
         evidence=H.load(rows,replay_days,dates,day,fetch=fetch and session not in ('盘前','集合竞价','非交易日'))
+    mark_profile("证据加载")
     if 'emotion_pool_capture' in snap:
         evidence=dict(evidence,current_pool=snap['emotion_pool_capture'])
     if 'reference' in evidence:H.index(evidence)
-    reg=evidence.get('regulation')
-    if reg is None:
-        selected=C.focus(evidence,rows) if 'reference' in evidence else []
-        completed_dates=dates+([day] if session=='已收盘' and (proofs or any((r.get('market_strength') or {}).get('mode')=='正式收盘' for r in rows.values())) else [])
-        reg=R.load(selected,completed_dates,now,fetch=fetch and bool(selected)) if selected else dict(notices=[],indices={},scope_codes=[],covered_codes=[])
-    evidence['verified_halts']=reg.get('suspension_intervals',evidence.get('verified_halts',[]))
+    mark_profile("证据索引")
+    # Suspension is inferred from verified data availability, not announcement
+    # backfills. Callers may still inject explicit evidence for replay/tests.
+    reg=evidence.get('regulation') or dict(notices=[],indices={},scope_codes=[],covered_codes=[],suspension_intervals=[],errors=[],rule_sources=R.RULE_SOURCES)
+    mark_profile("监管规则")
+    evidence['verified_halts']=reg.get('suspension_intervals',[])
     evidence['inferred_halts']={c:q['data_availability'] for c,q in effective.items()
         if (q.get('data_availability') or {}).get('kind')=='inferred_suspension'}
     paths={c:chain(c,replay_days,dates,histories.get(c) or [],evidence) for c in rows}
+    mark_profile("历史链")
     times=[intraday.parse_quote_timestamp(q.get('quote_at') or q.get('ts'),now) for q in effective.values()]
     times=sorted(t for t in times if t and t.date()==now.date() and abs((now-t).total_seconds())<=config.INTRADAY['max_quote_age_seconds'])
     center=times[len(times)//2] if times else None
@@ -167,6 +175,7 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
     old={r['code']:r.get('emotion_relay') or {} for r in previous.get('stocks',[])+previous.get('coverage_catalog',[])} if same else {}
     models={c:current(c,r,effective[c],paths[c],now,session,center,old.get(c),
         regime_ready=sum(b.get('date','')<day and number(b.get('volume')) and b['volume']>0 for b in histories.get(c) or [])>=5,daily_proof=proofs.get(c)) for c,r in rows.items()}
+    mark_profile("逐股模型")
     verified=[m for m in models.values() if m['valid'] and m['height_exact'] and (m['height'] or 0)>=P['leader_min_height']]
     maximum=max((m['height'] or 0 for m in verified),default=0)
     for m in verified:
@@ -191,13 +200,18 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
                 else:kind='题材分化观察'
             peers['state']=kind;m['relations'].append(peers)
             if board['type']=='theme' and m in leaders and m['height']==top and peers['reliable']:m['roles'].append('题材领先候选')
+    mark_profile("板块统计")
     cycles=C.attach(rows,models,paths,boards,evidence,reg,dates,day)
     watch=W.attach(rows,models,paths,effective,evidence,dates,day,now,fetch=fetch and session not in ('盘前','集合竞价','非交易日'))
+    mark_profile("周期与池")
     for m in models.values():
         rivals=[r['code'] for r in verified if r['code']!=m['code'] and r['prior_height']==m['prior_height'] and (m['prior_height'] or 0)>=2]
         if m['valid'] and rivals:m['roles'].append('同身位竞争');m['rivals']=rivals
         m['roles']=list(dict.fromkeys(m['roles']));m['relations'].sort(key=lambda b:(not b['reliable'],-b['limit_count'],-(b['up_pct'] or 0),b['id']))
         rows[m['code']]['emotion_relay']=m
+    mark_profile("角色关系")
+    # Roles from board diffusion and cycle attribution are part of the order.
+    order_map={c:order_key(m) for c,m in models.items()}
     yesterday=[c for c,m in models.items() if m['prior_sealed'] is True]
     broken=[c for c,m in models.items() if m['broken_yesterday']]
     feedback=cohort(models,yesterday);broken_feedback=cohort(models,broken)
@@ -211,11 +225,11 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
     rankings={}
     for board in snap.get('board_catalog',[])+[dict(id='all',member_codes=list(rows))]:
         codes=list(dict.fromkeys(board.get('member_codes') or []));base=(snap.get('stock_board_ranking') or {}).get('all') if board['id']=='all' else board.get('stock_ranking')
-        base=base or {};emotion=sorted((c for c in codes if c in models and (models[c]['valid'] or models[c]['suspended_current']) and models[c]['eligible']),key=lambda c:order_key(models[c]));ranks={c:i+1 for i,c in enumerate(emotion)}
+        base=base or {};emotion=sorted((c for c in codes if c in models and (models[c]['valid'] or models[c]['suspended_current']) and models[c]['eligible']),key=lambda c:order_map[c]);ranks={c:i+1 for i,c in enumerate(emotion)}
         ordered=emotion+[c for c in base.get('all',codes) if c not in ranks]
         items={}
         for c in codes:
-            item=copy.deepcopy((base.get('items') or {}).get(c) or {});m=models.get(c) or {}
+            item=dict((base.get('items') or {}).get(c) or {});m=models.get(c) or {}
             labels=[v for v in item.get('style_labels',[]) if v not in ('情绪强势','情绪前排','暂未强势')]
             if c in ranks:labels+=['接力观察']+(m.get('roles') or [])
             if not labels:labels=['暂无接力事件']
@@ -225,6 +239,7 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
         # explicit emotion order/column adopts the new relay evidence ordering.
         rankings[board['id']]=dict(base,all=base.get('all',codes),trend=base.get('trend',codes),emotion=ordered,items=items,
             expected=len(codes),emotion_valid=len(emotion),emotion_basis='高度、角色、在板状态、反馈、成交额；证据排序，不是成功概率')
+    mark_profile("排名")
     daily_ladder=Counter(str(m['prior_height']) for m in models.values() if m['prior_exact'] and m['prior_sealed'])
     live_ladder=Counter(str(m['height']) for m in models.values() if m['valid'] and m['sealed'] and m['height_exact'])
     promotion=[dict(height=n,**cohort(models,[c for c in yesterday if models[c]['prior_exact'] and models[c]['prior_height']==n])) for n in sorted({models[c]['prior_height'] for c in yesterday if models[c]['prior_exact']})]
@@ -238,7 +253,7 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
         completed=[m['history'][-1] for m in models.values() if m.get('history') and m['history'][-1]['date']==day and (m['history'][-1]['sealed'] is not None or m['history'][-1]['halted'])]
         timeline=(timeline+[dict(date=day,valid=len(completed),expected=len(rows),suspended=sum(p['halted'] for p in completed),limit_count=sum(p['sealed'] is True for p in completed),
             highest=max((p['height'] or 0 for p in completed if p['exact'] and p['sealed']),default=0),retained_highest=max(cycles['cycle_highest'],max((p['height'] or 0 for p in completed if p['exact']),default=0)),unknown=len(rows)-len(completed))])[-P['history_days']:]
-    ordered=sorted(models,key=lambda c:order_key(models[c]));lists={
+    ordered=sorted(models,key=lambda c:order_map[c]);lists={
         'all':[c for c in ordered if (models[c]['valid'] or models[c]['suspended_current']) and models[c]['eligible']],
         'leaders':[c for c in ordered if (models[c]['valid'] or models[c]['suspended_current']) and any(r in models[c]['roles'] for r in ('周期核心观察','空间高标','题材领先候选','同身位竞争'))],
         'continuation':[c for c in ordered if models[c]['valid'] and models[c]['continuation']],
@@ -262,8 +277,12 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,evidence=N
         promotion_height_pending=sum(not models[c]['prior_exact'] for c in yesterday),
         yesterday_feedback=feedback,yesterday_chain_feedback=chain_feedback,broken_feedback=broken_feedback,
         lists=lists,pools=watch,boards=[board_stats(b,models) for b in boards],rankings=rankings,timeline=timeline,cycles=cycles,fetch=evidence.get('fetch') or {},
-        limitations=['未提供连板成功概率','封板强度使用已核对字段的供应商统计，非逐笔重建；封单可撤销','题材同步不等于因果带动，不推断躲异动动机'])
+        limitations=['未提供连板成功概率','封板强度使用已核对字段的供应商统计，非逐笔重建；封单可撤销','题材同步不等于因果带动，不推断躲异动动机'],
+        profile=dict(profile,total=round(time.monotonic()-profile_started,3),
+                    cpu_total=round(time.process_time()-profile_cpu_started,3)))
     if persist and any(m['valid'] for m in models.values()):save_observation(snap)
+    snap['emotion_relay']['profile']['total']=round(time.monotonic()-profile_started,3)
+    snap['emotion_relay']['profile']['cpu_total']=round(time.process_time()-profile_cpu_started,3)
     return snap['emotion_relay']
 
 def save_observation(snap):
@@ -297,4 +316,6 @@ def validate(snap):
     for rank in meta['rankings'].values():
         assert len(rank['all'])==len(set(rank['all']))==rank['expected']
         assert set(rank['all'])==set(rank['emotion'])==set(rank['trend'])
+        eligible=[c for c in rank['emotion'] if c in rows and (rows[c]['valid'] or rows[c]['suspended_current']) and rows[c]['eligible']]
+        assert rank['emotion'][:len(eligible)]==sorted(eligible,key=lambda c:order_key(rows[c])), '接力排序与最终角色不一致'
     return True

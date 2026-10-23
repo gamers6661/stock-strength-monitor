@@ -12,13 +12,22 @@ from functools import wraps
 
 import config
 
-VERSION = '后台增量缓存1'
+VERSION = '后台增量缓存2-启动源码绑定'
 _lock = threading.RLock()
 _memory = OrderedDict()
 _connections = {}
 _rules = {}
 COUNTS = Counter()
 PROGRESS = {'active': False, 'stage': None}
+
+# Capture before any scan, including modules imported lazily later in this
+# process. A later disk edit must never label an old calculation as new code.
+_SOURCE_HASHES = {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in config.ROOT.glob('*.py')}
+
+
+class SourceChanged(RuntimeError):
+    """A restart is required before this process may calculate with edited rules."""
 
 
 def signature(value):
@@ -27,7 +36,7 @@ def signature(value):
 
 
 def rules(*files):
-    """Source fingerprint, including modifications made without a version bump."""
+    """Bind cache keys to startup sources; reject edits until service restart."""
     parts = []
     for file in files:
         path = config.ROOT / file
@@ -35,7 +44,10 @@ def rules(*files):
         with _lock:
             if stamp not in _rules:
                 _rules[stamp] = hashlib.sha256(path.read_bytes()).hexdigest()
-            parts.append(_rules[stamp])
+            fingerprint = _rules[stamp]
+            if fingerprint != _SOURCE_HASHES.get(str(path.resolve())):
+                raise SourceChanged('源码已变化，请重启服务后重新计算：' + file)
+            parts.append(fingerprint)
     return parts
 
 

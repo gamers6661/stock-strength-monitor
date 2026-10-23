@@ -139,6 +139,23 @@ class Closing(unittest.TestCase):
         self.assertNotIn('行情已过期',r['els']['ms-stock-host']['innerHTML'])
         self.assertIn('收盘缓存已核验',r['drawer'][2])
 
+    def test_online_previous_day_close_is_not_a_current_core_or_startup(self):
+        f=closing_fixture();m=calculate(f)
+        C.finalize(m,dict(market_close_at='2026-10-13 15:00:00'),A.stamp('2026-10-13 17:00:00'))
+        f[0].update(stock_activity=m,quote_capture_at='2026-10-14 09:35:00')
+        r=render(f[0],"location={protocol:'http:'};STATE.pane='stocks';MS_VIEW.stocks.activityScope='core';msRender('stocks');var calls=0;fetch=function(){calls++;return new Promise(function(){});};saPoll();document.getElementById('poll-proof').textContent=String(calls);")
+        self.assertEqual(r['ids'],[])
+        self.assertIn('行情已过期',r['els']['ms-stock-host']['innerHTML'])
+        self.assertEqual(r['els']['poll-proof']['textContent'],'1')
+
+    def test_exported_close_snapshot_remains_viewable_on_a_later_day(self):
+        f=closing_fixture();m=calculate(f)
+        C.finalize(m,dict(market_close_at='2026-10-13 15:00:00'),A.stamp('2026-10-13 17:00:00'))
+        f[0].update(stock_activity=m,quote_capture_at='2026-10-14 09:35:00')
+        r=render(f[0],"location={protocol:'file:'};STATE.pane='stocks';fetch=function(){throw Error('离线快照不能请求实时接口');};MS_VIEW.stocks.activityScope='core';msRender('stocks');saPoll();")
+        self.assertEqual(r['ids'],['600000'])
+        self.assertNotIn('行情已过期',r['els']['ms-stock-host']['innerHTML'])
+
     def test_selective_minute_cache_is_evidence_without_filling_score_or_timing(self):
         f=closing_fixture();m=calculate(f);before=copy.deepcopy(m['items']['600000']['factors'])
         bars=[dict(at='2026-10-13 '+t,open=p,high=p,low=p,close=p,price_basis='raw',source='本地分钟缓存') for t,p in [('14:30',100.),('14:59',101.2),('15:00',101.2)]]

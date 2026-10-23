@@ -8,6 +8,8 @@ import sqlite3
 import subprocess
 import tempfile
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from pathlib import Path
 
 import config
@@ -42,6 +44,7 @@ def json_key(key):
 
 def pack(value):
     keys, strings, shapes, ki, si, shape_index = [], [], [], {}, {}, {}
+    shape_codes, string_codes = [], []
 
     def base36(n):
         chars = '0123456789abcdefghijklmnopqrstuvwxyz'
@@ -64,14 +67,16 @@ def pack(value):
             if identity not in shape_index:
                 shape_index[identity] = len(shapes)
                 shapes.append(shape)
-            return ['^' + base36(shape_index[identity])] + [visit(v) for v in x.values()]
+                shape_codes.append('^' + base36(len(shapes) - 1))
+            return [shape_codes[shape_index[identity]]] + [visit(v) for v in x.values()]
         if isinstance(x, list):
             return [visit(v) for v in x]
         if isinstance(x, str) and (len(x) >= 4 or x.startswith(('~', '^'))):
             if x not in si:
                 si[x] = len(strings)
                 strings.append(x)
-            return '~' + base36(si[x])
+                string_codes.append('~' + base36(len(strings) - 1))
+            return string_codes[si[x]]
         return x
     root = visit(value)
     return {'format': VERSION, 'keys': keys, 'strings': strings, 'shapes': shapes, 'root': root}
@@ -97,12 +102,31 @@ def unpack(packet):
     return visit(packet['root'])
 
 
+def selection_summary(model):
+    fields = ('code', 'name', 'score', 'rank', 'dimensions', 'eligible', 'list_name',
+              'pattern', 'daily_at', 'quote_at', 'quote', 'data_status', 'pattern_order')
+    result = {k: v for k, v in model.items() if k not in ('items', 'universe_exclusions')}
+    result['details_deferred'] = True
+    result['items'] = {}
+    for code, item in model.get('items', {}).items():
+        row = {k: item[k] for k in fields if k in item}
+        row['board'] = {k: item.get('board', {}).get(k) for k in ('label', 'industry')}
+        row['fund'] = {k: item.get('fund', {}).get(k) for k in ('available', 'main_net', 'asof')}
+        row['intraday'] = {k: item.get('intraday', {}).get(k) for k in ('state', 'available', 'at', 'return_pct')}
+        result['items'][code] = row
+    return result
+
+
 def summary(full, token):
     result = dict(full)
     result.pop('direction_observations', None)
     result.pop('emotion_observations', None)
     result.pop('market_strength_close_input', None)
     result.pop('market_strength_morning_input', None)
+    if full.get('stock_selection'):
+        result['stock_selection'] = selection_summary(full['stock_selection'])
+    if full.get('board_journal'):
+        result['board_journal'] = dict(full['board_journal'], archives={})
     list_fields = set(json.loads((config.ROOT / 'stock_list_fields.json').read_text(encoding='utf-8')))
     list_fields.add('market_strength')
     list_fields.add('ma_trend')
@@ -131,6 +155,8 @@ def summary(full, token):
                                for b in full.get('board_catalog', [])]
     for b in result['board_catalog']:
         b.pop('index_chart', None)  # Frozen OHLC is loaded with the full board detail.
+        if full.get('emotion_relay'):
+            b.pop('stock_ranking', None)  # Same ranking is already served under emotion_relay.rankings.
     if full.get('market_strength'):
         import market_strength
         for b in result['board_catalog']:
@@ -183,11 +209,12 @@ def connect(token, page=None):
     return sqlite3.connect(db_path(token, page).as_uri() + '?mode=ro', uri=True)
 
 
-def csv_row(row):
+def csv_row(row, fields=None):
     if row.get('market_strength'):
         return {k:row.get(k) for k in ('code','name','change_pct','market_strength','ma_trend','emotion_relay') if k in row}
-    source = (config.ROOT / 'csv_export.js').read_text(encoding='utf-8')
-    fields = set(re.findall(r'\bs\.([A-Za-z_][A-Za-z0-9_]*)', source))
+    if fields is None:
+        source = (config.ROOT / 'csv_export.js').read_text(encoding='utf-8')
+        fields = set(re.findall(r'\bs\.([A-Za-z_][A-Za-z0-9_]*)', source))
     result = {k: v for k, v in row.items() if k in fields}
     if 'theme_relations' in result:
         result['theme_relations'] = [{k: t.get(k) for k in ('name', 'state', 'peers')} for t in result['theme_relations']]
@@ -214,6 +241,16 @@ def chart_projection(full):
     if not captured:
         return full
     day = captured.date().isoformat()
+    # Some accepted quotes are a few seconds ahead of the batch capture clock.
+    # Bound display to the validated round and actual scan completion, never now.
+    from datetime import timedelta
+    meta = full.get('intraday_model') or {}
+    latest = intraday.parse_quote_timestamp(meta.get('latest_valid_quote_at'))
+    completed = intraday.parse_quote_timestamp(full.get('scan_completed_at'))
+    accepted_until = captured
+    if latest and completed and latest.date() == captured.date() and completed >= captured:
+        accepted_until = max(captured, min(latest, completed, captured + timedelta(
+            seconds=float(meta.get('max_quote_future_seconds') or 0))))
     archived_quotes = None
 
     def display_quote(row, at):
@@ -274,7 +311,11 @@ def chart_projection(full):
                     prior=[dict(b,**{k:b[k]*factor for k in ('open','high','low','close')}) for b in prior if valid(b)]
                     bars=prior
             if (not context.get('valid') or not at or at.date() != captured.date()
-                    or at > captured or context.get('quote_day') != day or not bars
+                    or (at > captured and not (
+                        row.get('intraday_quote_fresh') is True
+                        and intraday.parse_quote_timestamp(row.get('intraday_quote_at')) == at
+                        and at <= accepted_until))
+                    or context.get('quote_day') != day or not bars
                     or not prior or context.get('last_history_date') != prior[-1].get('date')):
                 projected.append(row)
                 continue
@@ -307,61 +348,150 @@ def chart_projection(full):
     return result
 
 
-def prepare(full, template, page):
-    full = chart_projection(full)
-    # Content hash also includes rendering/export implementation, not just market time.
+def frozen_stock_activity(full):
+    """Read an optional same-day independent result once, when publishing."""
+    path = config.CACHE_DIR / 'stock_activity_v21' / 'latest.json'
+    if full.get('stock_activity') or full.get('stock_selection') or not path.is_file():
+        return None
+    try:
+        model = json.loads(path.read_text(encoding='utf-8'))
+        day = str(full.get('quote_capture_at') or full.get('generated_at') or '')[:10]
+        import stock_activity
+        if (day and isinstance(model, dict) and model.get('items') and model.get('result_version')
+                and model.get('day') == day and str(model.get('source_at') or '')[:10] == day
+                and model.get('version') == stock_activity.VERSION
+                and model.get('implementation_hash') == stock_activity.IMPLEMENTATION_HASH):
+            return model
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def prepare(full, template, page, project_charts=True):
+    if project_charts:
+        full = chart_projection(full)
+    activity = frozen_stock_activity(full)
+    activity_bytes = dumps(activity).encode('utf-8') if activity else None
+    if activity:
+        full = dict(full, stock_activity_snapshot={k: activity.get(k) for k in
+                    ('day', 'source_at', 'version', 'implementation_hash', 'result_version')})
+    # Store each frozen row once. Full offline data is assembled from this same
+    # generation only when requested, rather than serializing every row twice.
+    groups = ('stocks', 'coverage_catalog', 'board_catalog')
+    root = {k: v for k, v in full.items() if k not in groups}
+    layout = {group: [row['id' if group == 'board_catalog' else 'code'] for row in full[group]]
+              for group in groups if group in full}
+    root_bytes = dumps(root).encode('utf-8')
     digest = hashlib.sha256()
-    text = dumps(full)
-    digest.update(text.encode('utf-8'))
+    digest.update(root_bytes)
+    digest.update(dumps(layout).encode('utf-8'))
     digest.update(template.encode('utf-8'))
     digest.update(IMPLEMENTATION_HASH.encode('ascii'))
+    if activity_bytes:
+        digest.update(activity_bytes)
     for name in ('ui_client.js', 'csv_export.js', 'csv_runner.js', 'stock_list_fields.json'):
         digest.update((config.ROOT / name).read_bytes())
-    token = digest.hexdigest()[:24]
-    brief = summary(full, token)
-    packet = pack(brief)
     directory = store_root(page)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / (token + '.db')
-    if not path.exists():
-        fd, tmp = tempfile.mkstemp(prefix='ui-', suffix='.tmp', dir=str(directory))
-        import os
-        os.close(fd)
-        try:
-            with closing(sqlite3.connect(tmp)) as con:
-                con.execute('CREATE TABLE detail(kind TEXT,id TEXT,value TEXT,PRIMARY KEY(kind,id))')
-                con.execute('CREATE TABLE meta(id TEXT PRIMARY KEY,value BLOB)')
-                for group in ('stocks', 'coverage_catalog'):
-                    con.executemany('INSERT INTO detail VALUES(?,?,?)',
-                                    [('stock', s['code'], encode_detail(s)) for s in full.get(group, [])])
-                    con.executemany('INSERT INTO detail VALUES(?,?,?)',
-                                    [('csv', s['code'], encode_detail(csv_row(s))) for s in full.get(group, [])])
-                con.executemany('INSERT INTO detail VALUES(?,?,?)',
-                                [('board', b['id'], encode_detail(b)) for b in full.get('board_catalog', [])])
-                # Full data is read on demand for offline export/verification. Do not
-                # write a second uncompressed 250MB copy on every market refresh.
-                con.execute('INSERT INTO meta VALUES(?,?)', ('full.gz', gzip.compress(text.encode('utf-8'), compresslevel=1)))
-                for key, value in [('summary', dumps(packet).encode('utf-8'))]:
-                    con.execute('INSERT INTO meta VALUES(?,?)', (key, value))
-                    con.execute('INSERT INTO meta VALUES(?,?)', (key + '.gz', gzip.compress(value, compresslevel=1)))
-                con.execute('INSERT INTO meta VALUES(?,?)', ('template', template.encode('utf-8')))
-                con.execute('INSERT INTO meta VALUES(?,?)', ('csv_formatter', (config.ROOT / 'csv_export.js').read_bytes()))
-                csv_meta={k:full.get(k) for k in ('quote_capture_at','generated_at','scan_completed_at','strength_model','market_strength','ma_trend','stock_board_ranking','emotion_relay') if k in full}
-                csv_meta['board_stock_rankings']={b['id']:dict(name=b['name'],ranking=b.get('stock_ranking')) for b in full.get('board_catalog',[]) if b.get('stock_ranking')}
-                csv_meta['ui_generation']=token
-                con.execute('INSERT INTO meta VALUES(?,?)', ('csv_meta', dumps(csv_meta).encode('utf-8')))
-                html = template.replace('/*__DATA__*/null', config.script_json(packet)).encode('utf-8')
-                con.execute('INSERT INTO meta VALUES(?,?)', ('page.gz', gzip.compress(html, compresslevel=1)))
-                con.commit()
+    fd, tmp = tempfile.mkstemp(prefix='ui-', suffix='.tmp', dir=str(directory))
+    import os
+    os.close(fd)
+    try:
+        with closing(sqlite3.connect(tmp)) as con:
+            con.execute('CREATE TABLE detail(kind TEXT,id TEXT,value TEXT,PRIMARY KEY(kind,id))')
+            con.execute('CREATE TABLE meta(id TEXT PRIMARY KEY,value BLOB)')
+            con.execute('INSERT INTO meta VALUES(?,?)', ('full_root.gz', gzip.compress(root_bytes, compresslevel=1)))
+            con.execute('INSERT INTO meta VALUES(?,?)', ('full_layout', dumps(layout).encode('utf-8')))
+            def encode_row(group, row):
+                encoded = dumps(row).encode("utf-8")
+                return group, row["id" if group == "board_catalog" else "code"], encoded, gzip.compress(encoded, compresslevel=1)
+
+            # Bound queued rows so parallel compression never holds a second
+            # whole snapshot; SQLite and digest ordering stay on this thread.
+            rows = ((group, row) for group in groups for row in full.get(group, []))
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                pending = deque()
+                for _ in range(6):
+                    item = next(rows, None)
+                    if item is not None:
+                        pending.append(pool.submit(encode_row, *item))
+                while pending:
+                    group, identity, encoded, compressed = pending.popleft().result()
+                    kind = "board" if group == "board_catalog" else "stock"
+                    digest.update(group.encode("ascii"))
+                    digest.update(encoded)
+                    con.execute("INSERT INTO detail VALUES(?,?,?)", (kind, identity, compressed))
+                    item = next(rows, None)
+                    if item is not None:
+                        pending.append(pool.submit(encode_row, *item))
+            # Freeze the journal's quote/membership basis for independent news reads.
+            if full.get('board_journal'):
+                con.execute('INSERT INTO detail VALUES(?,?,?)',
+                            ('journal', 'current', encode_detail(full['board_journal']['current'])))
+            # Freeze historical board journals under this same publication token.
+            for day, journal in (full.get('board_journal') or {}).get('archives', {}).items():
+                con.execute('INSERT INTO detail VALUES(?,?,?)', ('journal', day, encode_detail(journal)))
+            token = digest.hexdigest()[:24]
+            brief = summary(full, token)
+            packet = pack(brief)
+            if full.get('stock_selection'):
+                con.execute('INSERT INTO meta VALUES(?,?)',
+                            ('stock_selection.gz', encode_detail(full['stock_selection'])))
+            publication = {k: full.get(k) for k in ('publication_sources', 'generated_at', 'runtime_contract')}
+            publication['selection_input_revision'] = (full.get('stock_selection') or {}).get('input_revision')
+            con.execute('INSERT INTO meta VALUES(?,?)', ('publication', dumps(publication).encode('utf-8')))
+            if activity_bytes:
+                con.execute('INSERT INTO meta VALUES(?,?)', ('stock_activity.gz', gzip.compress(activity_bytes, compresslevel=1)))
+            csv_source = (config.ROOT / 'csv_export.js').read_text(encoding='utf-8')
+            csv_fields = sorted(set(re.findall(r'\bs\.([A-Za-z_][A-Za-z0-9_]*)', csv_source)))
+            con.execute('INSERT INTO meta VALUES(?,?)', ('csv_fields', dumps(csv_fields).encode('utf-8')))
+            value = dumps(packet).encode('utf-8')
+            con.execute('INSERT INTO meta VALUES(?,?)', ('summary', value))
+            con.execute('INSERT INTO meta VALUES(?,?)', ('summary.gz', gzip.compress(value, compresslevel=1)))
+            con.execute('INSERT INTO meta VALUES(?,?)', ('template', template.encode('utf-8')))
+            con.execute('INSERT INTO meta VALUES(?,?)', ('csv_formatter', (config.ROOT / 'csv_export.js').read_bytes()))
+            csv_meta = {k: full.get(k) for k in ('quote_capture_at', 'generated_at', 'scan_completed_at', 'strength_model', 'market_strength', 'ma_trend', 'stock_board_ranking', 'emotion_relay') if k in full}
+            csv_meta['board_stock_rankings'] = {b['id']: dict(name=b['name'], ranking=b.get('stock_ranking')) for b in full.get('board_catalog', []) if b.get('stock_ranking')}
+            csv_meta['ui_generation'] = token
+            con.execute('INSERT INTO meta VALUES(?,?)', ('csv_meta', dumps(csv_meta).encode('utf-8')))
+            html = template.replace('/*__DATA__*/null', config.script_json(packet)).encode('utf-8')
+            con.execute('INSERT INTO meta VALUES(?,?)', ('page.gz', gzip.compress(html, compresslevel=1)))
+            con.commit()
+        path = directory / (token + '.db')
+        if not path.exists():
             Path(tmp).replace(path)
-        finally:
-            Path(tmp).unlink(missing_ok=True)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
     return packet, token
 
 
+def restore_full(con):
+    root = con.execute('SELECT value FROM meta WHERE id=?', ('full_root.gz',)).fetchone()
+    layout = con.execute('SELECT value FROM meta WHERE id=?', ('full_layout',)).fetchone()
+    if not root or not layout:
+        raise KeyError('Unknown payload')
+    full = json.loads(gzip.decompress(root[0]))
+    groups = json.loads(layout[0])
+    rows = {(kind, identity): decode_detail(value)
+            for kind, identity, value in con.execute('SELECT kind,id,value FROM detail')}
+    for group, identities in groups.items():
+        kind = 'board' if group == 'board_catalog' else 'stock'
+        full[group] = [rows[(kind, identity)] for identity in identities]
+    return full
+
+
 def detail(token, kind, identity, page=None):
-    if kind not in ('stock', 'board') or not isinstance(identity, str) or len(identity) > 160:
+    if kind not in ('stock', 'board', 'journal') or not isinstance(identity, str) or len(identity) > 160:
         raise ValueError('Invalid detail request')
+    if kind == 'journal' and identity == 'news':
+        with closing(connect(token, page)) as con:
+            row = con.execute("SELECT value FROM detail WHERE kind='journal' AND id='current'").fetchone()
+        if row is None:
+            raise LookupError('This publication has no board journal')
+        import board_journal
+        return board_journal.live_news(decode_detail(row[0]))
+    if kind == 'journal' and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', identity):
+        raise ValueError('Invalid journal date')
     with closing(connect(token, page)) as con:
         row = con.execute('SELECT value FROM detail WHERE kind=? AND id=?', (kind, identity)).fetchone()
     if not row:
@@ -376,6 +506,7 @@ def blob(token, key, page=None):
             compressed = con.execute('SELECT value FROM meta WHERE id=?', ('full.gz',)).fetchone()
             if compressed:
                 return gzip.decompress(compressed[0])
+            return dumps(restore_full(con)).encode('utf-8')
     if not row:
         raise KeyError('Unknown payload')
     return row[0]
@@ -403,6 +534,9 @@ def activate(token, page):
 
 
 def full(token, page=None):
+    with closing(connect(token, page)) as con:
+        if con.execute('SELECT 1 FROM meta WHERE id=?', ('full_root.gz',)).fetchone():
+            return restore_full(con)
     return json.loads(blob(token, 'full', page))
 
 
@@ -445,12 +579,18 @@ def export_csv(token, codes, contexts):
     # Indexed rows only; do not parse the full market snapshot for each export.
     with closing(connect(token)) as con:
         meta = json.loads(con.execute("SELECT value FROM meta WHERE id='csv_meta'").fetchone()[0])
+        csv_fields_row = con.execute("SELECT value FROM meta WHERE id='csv_fields'").fetchone()
+        csv_fields = set(json.loads(csv_fields_row[0])) if csv_fields_row else None
         rows = []
         for code in codes:
             if not isinstance(code, str) or not re.fullmatch(r'\d{6}', code):
                 raise ValueError('Invalid code')
             row = con.execute("SELECT value FROM detail WHERE kind='csv' AND id=?", (code,)).fetchone()
             if not row:
+                source = con.execute("SELECT value FROM detail WHERE kind='stock' AND id=?", (code,)).fetchone()
+                if source:
+                    rows.append(csv_row(decode_detail(source[0]), csv_fields))
+                    continue
                 ranking=(meta.get('board_stock_rankings',{}).get(contexts.get('rankBoardId'),{}).get('ranking') or {})
                 item=(ranking.get('items') or {}).get(code)
                 if contexts.get('view')!='ranking' or not item:raise ValueError('Unknown code')
@@ -478,4 +618,8 @@ def offline_html(token):
     template = blob(token, 'template').decode('utf-8')
     data = full(token)
     data['ui_generation'] = token
+    try:
+        data['stock_activity'] = json.loads(gzip.decompress(blob(token, 'stock_activity.gz')))
+    except KeyError:
+        pass  # Older generations may have no independent result; never use latest.
     return template.replace('/*__DATA__*/null', config.script_json(data)).encode('utf-8')

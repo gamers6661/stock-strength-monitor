@@ -1,6 +1,7 @@
 /* Loaded after all page renderers: every auction view reads the same backend judgment. */
 (function(){
  function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+ function selection(){return typeof ssModel==='function'&&ssModel();}
  function active(){return sessionNow()==='竞价结束'&&String(DATA.quote_capture_at||'').slice(0,10)===today();}
  function model(){return DATA.session_context||{};}
  function rows(){return model().auction_rows||[];}
@@ -20,10 +21,10 @@
  var oldRender=msRender,oldRows=msRows;
  var oldTable=msTable;
  msTable=function(items,key,count){if(active()&&key==='members'){var codes={};items.forEach(function(r){codes[r.code]=true;});return table(rows().filter(function(c){return codes[c.code];}),count);}return oldTable(items,key,count);};
- msRows=function(key,axis){if(active()&&key==='stocks'){var map=stockMap();return selected(key).map(function(c){return map[c.code];}).filter(Boolean);}return oldRows(key,axis);};
- msRender=function(key){if(!active())return oldRender(key);if(key==='industry'||key==='theme')return drawBoards(key);draw(key);};
+ msRows=function(key,axis){if(active()&&key==='stocks'&&!selection()){var map=stockMap();return selected(key).map(function(c){return map[c.code];}).filter(Boolean);}return oldRows(key,axis);};
+ msRender=function(key){if(key==='stocks'&&selection())return oldRender(key);if(!active())return oldRender(key);if(key==='industry'||key==='theme')return drawBoards(key);draw(key);};
  var oldStocks=renderStocks;
- renderStocks=function(){oldStocks();if(active()){document.getElementById('stk-sub').textContent=stamp();draw('stocks');}};
+ renderStocks=function(){oldStocks();if(active()&&!selection()){document.getElementById('stk-sub').textContent=stamp();draw('stocks');}};
  function drawBoards(kind){var host=document.getElementById(kind==='theme'?'theme-center':'board-center');if(host)host.innerHTML=notice()+boardTable(boardRows(kind==='industry'?null:kind));var metric=document.getElementById('bd-metrics');if(metric)metric.innerHTML='';}
  var oldBoards=renderBoards,oldThemes=renderThemesPage,oldRadar=mtRender,oldEmotion=renderEmotion;
  renderBoards=function(){return active()?drawBoards('industry'):oldBoards();};

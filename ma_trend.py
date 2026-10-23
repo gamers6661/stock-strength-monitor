@@ -17,6 +17,9 @@ VERSION = P['version']
 IMPLEMENTATION_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('board_stock_rank.py').read_bytes() + Path(closing_price.__file__).read_bytes() + Path(intraday.__file__).read_bytes() + Path(observed_history.__file__).read_bytes() + json.dumps(P,sort_keys=True).encode()).hexdigest()
 LABELS = {5:'MA5初期推进',10:'MA10承接整理',20:'MA20横盘再启动'}
 _DAILY_CACHE = {}
+_DAILY_CACHE_DAY = None
+_DAILY_STATS = {'hits': 0, 'misses': 0, 'clears': 0}
+_DAILY_CACHE_LIMIT = 8000
 
 
 def number(v):
@@ -367,11 +370,17 @@ def wave_gain(bars,i,root,features):
 
 def daily(bars,calendar,limit_pct=None):
     """Replay one cycle: a strong MA5 entry, sequential handoffs, and real exits."""
+    global _DAILY_CACHE_DAY
     bars=observed_history.traded_bars(bars)
     if not bars:return dict(stage=None,reason='暂无有效成交日',pending=False,sample_only=True)
     dates=[b['date'] for b in bars]
     if dates!=sorted(dates) or len(set(dates))!=len(dates):
         return dict(stage=None,reason='完成日历史日期重复或逆序',pending=True)
+    cache_day=calendar[-1] if calendar else dates[-1]
+    if _DAILY_CACHE_DAY != cache_day:
+        _DAILY_CACHE.clear()
+        _DAILY_CACHE_DAY=cache_day
+        _DAILY_STATS['clears'] += 1
     modes={(b.get('price_basis'),b.get('price_basis_source')) for b in bars}
     allowed={('qfq',s) for s in intraday._QFQ_HISTORY_SOURCES}|{('raw',s) for s in intraday._RAW_HISTORY_SOURCES}
     if len(modes)!=1 or not modes.issubset(allowed) or not all(intraday._valid_historical_price_bar(b) for b in bars):
@@ -380,7 +389,10 @@ def daily(bars,calendar,limit_pct=None):
         pending=False,sample_only=True,asof=dates[-1],history_days=len(bars),history_from=dates[0],
         ma={str(n):r(average(bars,len(bars)-1,n)) for n in LABELS})
     key=(limit_pct,tuple((b['date'],b['open'],b['high'],b['low'],b['close'],b.get('volume'),b.get('price_basis'),b.get('price_basis_source')) for b in bars))
-    if key in _DAILY_CACHE:return copy.deepcopy(_DAILY_CACHE[key])
+    if key in _DAILY_CACHE:
+        _DAILY_STATS['hits'] += 1
+        return copy.deepcopy(_DAILY_CACHE[key])
+    _DAILY_STATS['misses'] += 1
     features={'ma':{n:[average(bars,i,n) for i in range(len(bars))] for n in LABELS},
               'atr':[atr(bars,i) for i in range(len(bars))],'limit_pct':limit_pct}
     active=None;root=None;leg=None;last_exit=None;roots=[];platform={};entered=None;exits=[]
@@ -502,7 +514,9 @@ def daily(bars,calendar,limit_pct=None):
         ma20_restart_observation=restart if active==20 else None,last_phase=last_phase,
         ma10_gain=gain,ma10_candidate=(candidates.get(10) if active else None) or (catchment(bars,i,root,features) if active==5 else platform if active==10 else {}),
         history_days=len(bars),history_from=dates[0])
-    if len(_DAILY_CACHE)>3500:_DAILY_CACHE.clear()
+    if len(_DAILY_CACHE) >= _DAILY_CACHE_LIMIT:
+        _DAILY_CACHE.clear()
+        _DAILY_STATS['clears'] += 1
     _DAILY_CACHE[key]=copy.deepcopy(out)
     return out
 
@@ -604,7 +618,7 @@ def scale_setup(setup,factor):
     return out
 
 
-def live(row,q,bars,calendar,now,session,previous=None,center=None,daily_proof=None):
+def live(row,q,bars,calendar,now,session,previous=None,center=None,daily_proof=None,context=None):
     import market_strength as M
     code=row['code'];m=empty(code);old=previous or {};day=now.date().isoformat()
     formal=session=='已收盘' and (bool(daily_proof) or (row.get('market_strength') or {}).get('mode')=='正式收盘')
@@ -656,7 +670,12 @@ def live(row,q,bars,calendar,now,session,previous=None,center=None,daily_proof=N
     elif session=='已收盘':m['valid_until']=day+' 23:59:59'
     if old.get('quote_at') and m['quote_at']<old['quote_at']:
         m.update(pending=True,status='报价待核验',reason='逐股报价倒退',data_reasons=['逐股报价倒退']);return m,None
-    context=intraday.align_price_basis(q,bars,calendar,observation_day=day)
+    if not (context and context.get('valid') and context.get('version') == intraday.PRICE_BASIS_VERSION
+            and context.get('quote_day') == day and context.get('quote_at') == str(at)
+            and context.get('quote_basis') == q.get('price_basis')
+            and context.get('quote_basis_source') == q.get('price_basis_source')
+            and (not formal or context.get('last_history_date') == (completed[-1] if completed else None))):
+        context=intraday.align_price_basis(q,bars,calendar,observation_day=day)
     if not context.get('valid') or not positive(context.get('atr20')):
         error=context.get('reason') or context.get('atr20_reason') or 'ATR20待核验'
         m.update(pending=True,status='价格口径待核验',reason=error,data_reasons=[error]);return m,None
@@ -969,9 +988,25 @@ def progress(m,old):
         m['events'].append('平台上沿突破');m['status']='平台突破·推进延续';m['advance']=True;m['eligible']=False
 
 
+_DETAIL_ONLY = ('last_exit','last_phase','leg_origin','transitions','history_observation','ma10_gain')
+
+
 def brief(m):
-    return {k:v for k,v in m.items() if k not in ('tracking','minute_evidence','price_context','minute_needed','board_relations')
-            and (k!='recovery_candidate' or m.get('recovery_current'))}
+    result = {k:v for k,v in m.items()
+              if k not in _DETAIL_ONLY + ('tracking','minute_evidence','price_context','minute_needed','board_relations')
+              and (k!='recovery_candidate' or m.get('recovery_current'))}
+    # The list keeps only the fields needed for its labels; the full history is
+    # fetched from the immutable detail generation when the drawer is opened.
+    if m.get('last_exit'):
+        result['last_exit'] = {}
+    if isinstance(result.get('last_confirmation'), dict):
+        result['last_confirmation'] = {'date': result['last_confirmation'].get('date')}
+    if isinstance(result.get('restart_observation'), dict):
+        result['restart_observation'] = {'date': result['restart_observation'].get('date')}
+    if isinstance(result.get('restart_event'), dict):
+        result['restart_event'] = {'date': result['restart_event'].get('date'),
+                                   'confirmation': {'date': (result['restart_event'].get('confirmation') or {}).get('date')}}
+    return result
 
 
 def finalize_recovery(m):
@@ -985,11 +1020,13 @@ def finalize_recovery(m):
     if m.get('candidate_mode'):m['startup_pending']=m['recovery_current']
 
 
-def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,minute_data=None,fetch_minutes=True):
+def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,minute_data=None,fetch_minutes=True,contexts=None):
     import close_monitor as C
+    daily_stats_before=dict(_DAILY_STATS)
     now=closing_price.assessment_time(snap,now or datetime.fromisoformat(snap['quote_capture_at']));day=now.date().isoformat()
     prior_meta=(previous or {}).get('ma_trend') or {}
     prior_rows={r['code']:r.get('ma_trend') or {} for r in (previous or {}).get('stocks',[])+(previous or {}).get('coverage_catalog',[])} if prior_meta.get('implementation_hash')==IMPLEMENTATION_HASH else {}
+    supplied_contexts=contexts or {}
     models={};contexts={};rows=snap.get('stocks',[])+snap.get('coverage_catalog',[])
     owners={row['code']:row for row in rows}
     # Respect the canonical preserved morning/closing batch and its actual clock.
@@ -1017,7 +1054,7 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,minute_dat
     times.sort()
     center=times[len(times)//2] if times else None
     for row in rows:
-        code=row['code'];m,ctx=live(row,quotes.get(code) or {},histories.get(code) or [],calendar,now,snap.get('session'),prior_rows.get(code),center,proofs.get(code))
+        code=row['code'];m,ctx=live(row,quotes.get(code) or {},histories.get(code) or [],calendar,now,snap.get('session'),prior_rows.get(code),center,proofs.get(code),supplied_contexts.get(code))
         models[code]=m;row['ma_trend']=m
         if ctx:contexts[code]=ctx
     # Reference-only copies can retain yesterday's minute_needed flag. They have
@@ -1066,6 +1103,11 @@ def attach(snap,quotes,pool,histories,calendar,now=None,previous=None,minute_dat
         boards=sorted((b for b in boards if b['eligible'] and b['count']),key=lambda b:(-b['trend_pct'],-b['count'],b['id'])),
         minute_cursor=0,minute_requested=fetch_stats.get('requested',0),minute_needed=len(needed),minute_fetch=fetch_stats,
         sorting={'5':'事件、起点新近度、起点实体、量比、行业同步','10':'事件、整理量比、整理区间、行业同步','20':'事件、横盘区间、整理量比、行业同步'})
+    snap['ma_trend']['daily_cache']=dict(
+        hits=_DAILY_STATS['hits']-daily_stats_before['hits'],
+        misses=_DAILY_STATS['misses']-daily_stats_before['misses'],
+        clears=_DAILY_STATS['clears']-daily_stats_before['clears'],
+        entries=len(_DAILY_CACHE), day=_DAILY_CACHE_DAY)
     import board_stock_rank
     board_stock_rank.attach(snap)
     return snap['ma_trend']

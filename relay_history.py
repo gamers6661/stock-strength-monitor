@@ -52,21 +52,38 @@ def halt_on(evidence,code,day):
     return None
 
 
+_FILE_CACHE = {}
+
+
+def _cached_read(path):
+    """Reuse parsed raw/reference files until their file signature changes."""
+    try:
+        stat = path.stat()
+    except OSError:
+        _FILE_CACHE.pop(str(path), None)
+        return None
+    key = str(path)
+    signature = (stat.st_mtime_ns, stat.st_size)
+    item = _FILE_CACHE.get(key)
+    if item and item[0] == signature:
+        return item[1]
+    value = D.read(path)
+    if value is not None:
+        _FILE_CACHE[key] = (signature, value)
+    return value
+
+
 def load(codes,days,calendar,today,fetch=True,verified_halts=None):
     result=D.load(days,fetch=False);result.update(reference={},halts={},verified_halts=verified_halts or []);start=time.monotonic();errors=[]
     asof=days[-1] if days else None
     if not asof:return result
     for c in codes:
-        r=D.read(D.root()/'raw'/(c+'.json'))
+        r=_cached_read(D.root()/'raw'/(c+'.json'))
         if r:result['raw'][c]=r
-        r=D.read(D.root()/'reference'/(c+'.json'))
+        r=_cached_read(D.root()/'reference'/(c+'.json'))
         if r:result['reference'][c]=r
-    for day in days+[today]:
-        r=D.read(D.root()/'halts'/(day+'.json'))
-        if not r and fetch:
-            try:r=fetch_halts(day);D.write(D.root()/'halts'/(day+'.json'),r)
-            except Exception as e:errors.append(dict(day=day,reason=str(e)))
-        if r:result['halts'][day]=r
+    # Announcement/halt-table backfills are retired. Missing bars are already
+    # classified as suspended by classify(), including on the current day.
     # A normal refresh is warm. The one-time history backfill is resumable, with
     # a time budget; missing data never turns into a false non-limit day.
     need=[c for c in codes if not any(b.get('date')==asof for b in result['raw'].get(c,{}).get('bars',[])) and not halt_on(result,c,asof)
@@ -93,7 +110,7 @@ def load(codes,days,calendar,today,fetch=True,verified_halts=None):
         except Exception as e:
             errors.append(dict(reason='原价参考补采暂停：'+str(e)));break
         time.sleep(.8)
-    result['fetch'].update(history_errors=errors,full_history_seconds=round(time.monotonic()-start,3),raw_codes=len(result['raw']),reference_codes=len(result['reference']))
+    result['fetch'].update(history_errors=errors,full_history_seconds=round(time.monotonic()-start,3),raw_codes=len(result['raw']),reference_codes=len(result['reference']),file_cache_entries=len(_FILE_CACHE))
     return result
 
 
@@ -142,10 +159,8 @@ def close_proof(snap,q,bars,calendar,now,code=None):
     context=intraday.align_price_basis(q,bars,calendar,observation_day=now.date().isoformat())
     suspension_days=[]
     if not context.get('valid') and code and '历史窗口缺口' in str(context.get('reason')):
-        import relay_regulation
-        reg=relay_regulation.load([code],calendar,now,fetch=False)
-        evidence=dict(verified_halts=reg['suspension_intervals']);native_dates={b['date'] for b in bars if b.get('volume',0)>0}
-        suspension_days=[d for d in calendar if d not in native_dates and halt_on(evidence,code,d)]
+        native_dates={b['date'] for b in bars if b.get('volume',0)>0}
+        suspension_days=[d for d in calendar if d not in native_dates]
         if suspension_days:context=intraday.align_price_basis(q,bars,[d for d in calendar if d not in suspension_days],observation_day=now.date().isoformat())
     if not suspension_days:return None
     proof=closing_price.verify(snap,q,bars,[d for d in calendar if d not in suspension_days],now)

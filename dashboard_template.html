@@ -1005,7 +1005,7 @@ body:has(#p-overview.on) .stratbar{display:none}
       <div class="sl"></div>
       <button data-s="trend" class="on">强势观察</button>
     </nav>
-    <button class="btn ghost" id="btn-refresh" title="立刻重新抓取行情并重建本页数据（约 1-2 分钟，同一分钟内只能刷一次）">
+    <button class="btn ghost" id="btn-refresh" title="立即获取一轮行情，全部页面计算完成后统一更新；常规每5分钟刷新，同一分钟内只能手动刷一次">
       <span id="rf-ico">↻</span>
       <span id="rf-txt">刷新数据</span>
     </button>
@@ -1820,7 +1820,7 @@ function rfLabel(txt,busy){
        }
        if(RF.followBackground){
          if(s.scan_active){
-           rfLabel(((s.scan_progress||{}).stage||'后台刷新中')+' '+sec+'s',true);
+           rfLabel((s.refresh_waiting_for_lock?'等待更新锁':(s.scan_progress||{}).stage||'后台刷新中')+' '+sec+'s',true);
            if(sec>180&&!RF.warned){
              RF.warned=true;
              toast('后台仍在获取行情与历史数据，完成后本页自动更新');
@@ -1837,7 +1837,7 @@ function rfLabel(txt,busy){
          return;
        }
        if(rf.running){
-         rfLabel(((s.scan_progress||{}).stage||'刷新中')+' '+sec+'s',true);
+         rfLabel((s.refresh_waiting_for_lock?'等待更新锁':(s.scan_progress||{}).stage||'刷新中')+' '+sec+'s',true);
         // 分类成员与概念指数映射由明确的分类更新命令维护；这里仅等待行情扫描。
         if(sec>180&&!RF.warned){
           RF.warned=true;
@@ -1924,10 +1924,12 @@ function refreshData(){
    var error=s.last_scan_error||s.last_publish_error||'';
    var published=s.snapshot_generated_at;
    var different=published&&loaded&&published!==loaded;
-   el.textContent=s.scan_active?'更新中 '+seconds+'s':s.last_publish_ok===false?'发布失败':
+   var stage=(s.scan_progress||{}).stage||'更新中';
+    el.textContent=s.refresh_waiting_for_lock?'等待更新锁':s.scan_active?stage+' '+seconds+'s':s.last_publish_ok===false?'发布失败':
      s.last_scan_ok===false?(error.indexOf('尚未更新')>=0||error.indexOf('门槛')>=0?'报价待更新':'采集失败'):
      different?'版本待核验':'已同步';
-   el.title=s.scan_active?'后台正在获取行情并计算，完成后自动载入；当前价格仍以显示的源时间为准':error||'页面已载入最近发布的数据';
+   el.title=s.refresh_waiting_for_lock?'更新锁正在使用，释放后短时重试；当前保留最后成功结果':s.scan_active?'后台正在获取行情并计算，完成后自动载入；当前价格仍以显示的源时间为准':error||'页面已载入最近发布的数据';
+    if(s.last_publish_at)el.title+=' · 最近成功发布 '+s.last_publish_at.replace('T',' ');
  }
  function watchDataVersion(){
    if(location.protocol!=='http:'&&location.protocol!=='https:')return;

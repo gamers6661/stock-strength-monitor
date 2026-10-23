@@ -6,6 +6,7 @@
 """
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
+from functools import lru_cache
 from hashlib import sha256
 import json
 import math
@@ -294,11 +295,8 @@ def align_minute_bars(price_context, minute_bars):
             "scale_factor": 1.0, "basis": basis, "source": source}
 
 
-def parse_quote_timestamp(value, fallback_date=None):
-    """解析腾讯/新浪的逐股报价时间；不把未知格式伪装成扫描时间。"""
-    raw = str(value or "").strip()
-    if not raw:
-        return None
+@lru_cache(maxsize=65536)
+def _parse_quote_timestamp(raw, fallback_date):
     for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y-%m-%d %H:%M:%S",
                 "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
         try:
@@ -312,6 +310,18 @@ def parse_quote_timestamp(value, fallback_date=None):
         except ValueError:
             continue
     return None
+
+
+def parse_quote_timestamp(value, fallback_date=None):
+    """解析腾讯/新浪的逐股报价时间；不把未知格式伪装成扫描时间。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    # Only time-only formats need the scan clock; keeping it out of the cache
+    # key lets full timestamps reuse one parse across every observation frame.
+    if ":" not in raw or len(raw) > 8:
+        fallback_date = None
+    return _parse_quote_timestamp(raw, fallback_date)
 
 
 def quote_day(value, fallback_date=None):

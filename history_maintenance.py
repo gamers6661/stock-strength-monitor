@@ -20,8 +20,15 @@ def current_inputs():
     return {r['code']:r for r in rows},(brief.get('strength_model') or {}).get('asof')
 
 
-@config.single_writer
 def run_if_due(scan_lock, state, publish, now=None):
+    now = now or datetime.now()
+    if now.hour < 18 or state.get('phase') != 'ready':
+        return False
+    return _run_if_due(scan_lock, state, publish, now)
+
+
+@config.single_writer
+def _run_if_due(scan_lock, state, publish, now=None):
     now=now or datetime.now()
     if now.hour<18 or state.get('phase')!='ready' or not scan_lock.acquire(blocking=False):
         return False
@@ -61,4 +68,4 @@ def loop(scan_lock,state,publish):
             run_if_due(scan_lock,state,publish)
         except Exception as exc:
             print(f'[HISTORY] 盘后历史核验未完成：{exc}')
-        time.sleep(300)
+        time.sleep(60)

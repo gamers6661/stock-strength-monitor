@@ -555,6 +555,14 @@ def current_observation(daily, bars, calendar, quote, now, session, previous=Non
 
 def attach(snapshot, calendar=None, fetch=True, path=None, quote_fetch=None, previous_snapshot=None,
            quote_future=None):
+    profile = {}
+    profile_start = [time.monotonic()]
+
+    def mark(label):
+        now = time.monotonic()
+        profile[label] = round(now - profile_start[0], 3)
+        profile_start[0] = now
+
     asof = (snapshot.get("strength_model") or {}).get("asof")
     if not asof:
         return {}
@@ -589,6 +597,7 @@ def attach(snapshot, calendar=None, fetch=True, path=None, quote_fetch=None, pre
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(work, candidates))
+    mark("完成日观察")
     import board_quote
     quote_fetch = fetch if quote_fetch is None else quote_fetch
     # 页面离线生成保持同一快照的报价和计算结果，不另取一批报价混入。
@@ -603,11 +612,13 @@ def attach(snapshot, calendar=None, fetch=True, path=None, quote_fetch=None, pre
             now = datetime.fromisoformat(str(snapshot.get('quote_capture_at') or snapshot.get('generated_at')))
         except ValueError:
             now = datetime.now()  # 缺少快照时钟时仍无报价，不能产生当日结论。
+    mark("指数报价")
     # 请求可跨越11:30/13:00边界；指数阶段以完成采集时的时钟为准。
     session = datafeed.session_label(now) if quote_fetch else saved_model.get('phase') if reuse else snapshot.get('session')
     session = session or datafeed.session_label(now)
     revalidation = (revalidate_history(candidates, quotes, calendar, now, session, path)
                     if quote_fetch else saved_model.get('history_revalidation'))
+    mark("历史复核")
     # 补核耗时期间报价可能过期，当前判断仍使用完成补核后的真实时钟。
     if quote_fetch:
         now = datetime.now()
@@ -624,6 +635,7 @@ def attach(snapshot, calendar=None, fetch=True, path=None, quote_fetch=None, pre
                 calendar, quotes.get(code) or {}, now, session,
                 (previous_boards.get(board['id']) or {}).get('index_current'))
             board['index_quote'] = quotes.get(code) or {}
+    mark("当前状态")
     for board in boards:
         if board["id"] not in mapping:
             board["index_trend"] = None
@@ -648,6 +660,7 @@ def attach(snapshot, calendar=None, fetch=True, path=None, quote_fetch=None, pre
                  atr_basis="20个含跳空TR的简单平均；最新22日连续对齐，完整历史逐日重放",
                  pullback_criterion="既有强势背景；回踩固定前日ATR，浅破≤0.3ATR缓冲2日，破位>1ATR或第三日仍失守则降级；连续2日守MA10或重新满足强势推进才确认修复",
                  exit_criterion="本段观察连续2日站上MA20后才建立最终支撑，后续收盘跌破即退出；尚未建立MA20支撑时允许沿MA5启动",
-                 breadth_basis="当前有效主板成员的近3日趋势比例；非历史全市场成分回测")
+                 breadth_basis="当前有效主板成员的近3日趋势比例；非历史全市场成分回测",
+                 profile=dict(profile, total=round(time.monotonic() - profile_start[0] + sum(profile.values()), 3)))
     snapshot["board_trend_model"] = model
     return model

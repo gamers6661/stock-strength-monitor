@@ -46,7 +46,7 @@ def main():
         print(f"[FAIL] 打分失败：{type(e).__name__}: {e}")
         return 1
 
-    # 2. 看板
+    # 3. 看板
     try:
         import make_dashboard
         page = make_dashboard.build(snap)
@@ -56,7 +56,7 @@ def main():
         print(f"[FAIL] 看板生成失败：{type(e).__name__}: {e}")
         return 1
 
-    # 3. 报告
+    # 4. 报告
     try:
         import report
         text = report.build(snap)
@@ -65,7 +65,7 @@ def main():
         print(f"[FAIL] 报告生成失败：{type(e).__name__}: {e}")
         return 1
 
-    # 4. 摘要行（便于自动化快速判断是否需要提醒）
+    # 5. 摘要行（便于自动化快速判断是否需要提醒）
     al = snap.get("alerts", [])
     print(f"--- 摘要 ---")
     print(f"数据时间: {snap.get('generated_at')}")

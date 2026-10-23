@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """发布轻量看板及同版本地详情；完整离线看板由服务端按需导出。"""
 import json
+import hashlib
 import sqlite3
 import sys
+import time
 from contextlib import closing
 
 import config
@@ -150,15 +152,35 @@ def chart_acquisition_state(row, bars, state, day, asof):
         evidence=state)
 
 
+def publication_source_hash():
+    names = ['config.py', 'make_dashboard.py', 'ui_payload.py', 'dashboard_template.html', 'stock_list_fields.json', 'board_journal.py', 'board_journal_ui.css']
+    names += sorted(p.name for p in config.ROOT.glob('*.js'))
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode())
+        digest.update((config.ROOT / name).read_bytes())
+    return digest.hexdigest()
+
+
 @config.single_writer
 def build(snap=None):
+    profile = {}
+    profile_start = [time.monotonic()]
+
+    def mark(label):
+        now = time.monotonic()
+        profile[label] = round(now - profile_start[0], 3)
+        profile_start[0] = now
+
     if snap is None and not config.SNAPSHOT_JSON.exists():
         print("[ERR] 还没有数据快照，请先运行：python scoring.py full")
         return None
     if snap is None:
         snap = json.loads(config.SNAPSHOT_JSON.read_text(encoding="utf-8"))
+    source_snap = snap
     import price_only
     price_only.sanitize(snap)
+    mark("准备快照")
     import scoring
     import attack_model
     import board_opportunity
@@ -177,22 +199,38 @@ def build(snap=None):
     snap['runtime_contract']['code_ma_trend_hash']=ma_trend.IMPLEMENTATION_HASH
     snap['runtime_contract']['code_emotion_relay_version']=emotion_relay.VERSION
     snap['runtime_contract']['code_emotion_relay_hash']=emotion_relay.IMPLEMENTATION_HASH
-    attach_klines(snap)
+    attach_klines(snap, config.RUNTIME['kline_inline_top'])
+    mark("K线附加")
     import board_trend
     if not snap.get('board_opportunity_model'):
         board_trend.attach(snap, fetch=False)
+    mark("板块趋势")
     tpl = TPL.read_text(encoding="utf-8")
     import board_chart
     snap = board_chart.attach(snap, refresh=True)
+    mark("板块图")
     # Board-page observations are a separate projection; shared strength results stay intact.
     import board_dynamics
     snap['board_dynamics'] = board_dynamics.build(snap)
-    # Isolated stock-page projection; shared rows and board/radar scores stay untouched.
-    import stock_activity
-    snap['stock_activity'] = stock_activity.prepare_page(snap,live=True)
-    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_rank_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_activity_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'ma_trend_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
+    mark("板块动态")
+    import board_journal
+    snap["board_journal"] = board_journal.build(snap)
+    mark("题材日报")
+    # V3独立采样与全站发布共享同一后端结果，完整离线版固定发布时证据。
+    import stock_selection
+    snap['stock_selection'] = stock_selection.page_model(snap)
+    snap['runtime_contract']['code_refresh_policy_version'] = 'shared-round-5m-v1'
+    snap['refresh_policy'] = dict(mode='shared', interval_seconds=config.RUNTIME['refresh_seconds'],
+                                  source_round_at=snap.get('quote_capture_at'), path_sampling_seconds=120)
+    snap['runtime_contract']['code_stock_selection_version']=stock_selection.VERSION
+    snap['runtime_contract']['code_stock_selection_hash']=stock_selection.IMPLEMENTATION_HASH
+    mark('个股强度V3')
+    tpl = tpl.replace('</head>', '<style id="board-journal-style">'+(config.ROOT/'board_journal_ui.css').read_text(encoding='utf-8')+'</style></head>')
+    tpl = tpl.replace('</head>', '<style>'+ (config.ROOT/'stock_selection_ui.css').read_text(encoding='utf-8')+'</style></head>')
+    tpl = tpl.replace('/*__RADAR_SCRIPT__*/',(config.ROOT/'radar_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_rank_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'stock_selection_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'ma_trend_ui.js').read_text(encoding='utf-8') + '\n' + (config.ROOT/'board_chart_ui.js').read_text(encoding='utf-8'))
     tpl=tpl.replace('/*__EMOTION_SCRIPT__*/',(config.ROOT/'emotion_ui.js').read_text(encoding='utf-8'))
-    tpl=tpl.replace('/*__BOARD_DYNAMICS_SCRIPT__*/',(config.ROOT/'board_dynamics_ui.js').read_text(encoding='utf-8')+'\n'+(config.ROOT/'auction_ui.js').read_text(encoding='utf-8'))
+    tpl=tpl.replace('/*__BOARD_DYNAMICS_SCRIPT__*/',(config.ROOT/'board_dynamics_ui.js').read_text(encoding='utf-8')+'\n'+(config.ROOT/'auction_ui.js').read_text(encoding='utf-8')+'\n'+(config.ROOT/'board_journal_ui.js').read_text(encoding='utf-8')+'\n'+"var ssFallbackStock=showStock;showStock=function(code,boardId){return typeof ssModel==='function'&&ssModel()&&ssModel().items[code]?ssShow(code):ssFallbackStock(code,boardId);};")
+    mark("模板与脚本")
     if PLACEHOLDER not in tpl:
         print("[ERR] 模板缺少数据占位符")
         return None
@@ -202,7 +240,9 @@ def build(snap=None):
         snap['runtime_contract']['code_ui_payload_version'] = ui_payload.VERSION
         tpl = tpl.replace('/*__CSV_SCRIPT__*/', (config.ROOT / 'csv_export.js').read_text(encoding='utf-8'))
         tpl = tpl.replace('/*__UI_SCRIPT__*/', (config.ROOT / 'ui_client.js').read_text(encoding='utf-8'))
+        snap['publication_sources'] = publication_source_hash()
         package, generation = ui_payload.prepare(snap, tpl, OUT)
+        mark("UI生成")
         payload = config.script_json(package)
     else:
         payload = config.script_json(snap)
@@ -210,8 +250,10 @@ def build(snap=None):
     config.atomic_write_text(OUT, html)   # 原子写：避免浏览器读到半截页面
     if lazy:
         ui_payload.activate(generation, OUT)
-    if OUT == config.ROOT / 'dashboard.html':
-        stock_activity.save_state(snap['stock_activity'])
+    mark("写盘与激活")
+    publish_profile = dict(profile, total=round(sum(profile.values()), 3))
+    snap['publish_performance'] = publish_profile
+    source_snap['publish_performance'] = publish_profile
     print(f"[OK] 看板已生成：{OUT}  ({len(html)/1024:.0f} KB)")
     return OUT
 

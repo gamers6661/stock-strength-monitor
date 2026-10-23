@@ -38,6 +38,7 @@ import report
 import scoring
 import strength
 import stock_strength
+import stock_selection
 import intraday
 import attack_model
 import trend_consolidation
@@ -91,7 +92,7 @@ SNAPSHOT_META = {
     "snapshot_intraday_rule_version": None,
 }
 SERVICE_INSTANCE_VERSION = 'workspace-single-service-2026-10-14.1'
-STATE = {"port": None, "pid": os.getpid(), "code_service_instance_version": SERVICE_INSTANCE_VERSION,
+STATE = {"code_refresh_policy_version": "shared-round-5m-v1", "stock_independent_publication": False, "path_sampling_interval_seconds": 120, "port": None, "pid": os.getpid(), "code_service_instance_version": SERVICE_INSTANCE_VERSION,
          "code_model_version": strength.VERSION,
          "code_market_strength_version": market_strength.VERSION,
          "code_market_strength_hash": market_strength.IMPLEMENTATION_HASH,
@@ -135,15 +136,21 @@ _SCAN_LOCK = threading.Lock()
 
 
 @config.single_writer
-def publish_outputs(snapshot=None):
+def publish_outputs(snapshot=None, reuse_page=False):
     """后台每次完成扫描后同步发布看板和文字日报。"""
     try:
+        publish_started = time.monotonic()
         if snapshot is None:
             snapshot = json.loads(config.SNAPSHOT_JSON.read_text(encoding='utf-8'))
-        page = make_dashboard.build(snapshot)
+        page = config.ROOT / "dashboard.html" if reuse_page else make_dashboard.build(snapshot)
+        publish_profile = snapshot.setdefault('publish_performance', {})
+        publish_profile['make_dashboard_call'] = round(time.monotonic() - publish_started, 3)
         if page is None or not page.exists():
             raise RuntimeError("看板页面未生成")
+        report_started = time.monotonic()
         config.atomic_write_text(config.ROOT / "snapshot_report.md", report.build(snapshot))
+        publish_profile['report'] = round(time.monotonic() - report_started, 3)
+        publish_profile['publish_outputs'] = round(time.monotonic() - publish_started, 3)
         radar_opportunity.record_publication(snapshot,ui_payload.active_generation(),page.stat().st_mtime_ns)
         try:
             SNAPSHOT_META.update({
@@ -292,7 +299,7 @@ def scan_and_publish(mode, **kwargs):
     try:
         # Index quotes and stock calculations are independent. Preserve their
         # actual source clocks and run the same validation after both finish.
-        if mode == 'quick' and INIT['phase'] == 'ready' and scoring.df.in_trading_session():
+        if mode == 'quick' and INIT['phase'] == 'ready' and scoring.df.session_label() in ('早盘', '午盘', '尾盘', '午间休市'):
             index_worker = ThreadPoolExecutor(max_workers=1)
             kwargs['board_quote_future'] = index_worker.submit(board_quote.fetch, set(board_trend.identities().values()))
         snapshot = scoring.run(mode=mode, **kwargs)
@@ -303,10 +310,13 @@ def scan_and_publish(mode, **kwargs):
         source_at = intraday.parse_quote_timestamp(quote_model.get('auction_latest_quote_at')
             if snapshot.get('session') in ('集合竞价','竞价结束') else
             (snapshot.get('reference_view') or {}).get('source_quote_at') or quote_model.get('latest_valid_quote_at'))
+        INIT['last_round_started_monotonic'] = started
         INIT['last_pipeline_performance'] = dict(version=scan_cache.VERSION,
             seconds=round(time.monotonic()-started, 3), scan_seconds=round(scan_seconds, 3),
             publish_seconds=round(time.monotonic()-started-scan_seconds, 3),
             phases=(snapshot.get('scan_performance') or {}).get('phases'),
+            subphases=(snapshot.get('scan_performance') or {}).get('subphases'),
+            publish_subphases=snapshot.get('publish_performance'),
             cache=(snapshot.get('scan_performance') or {}).get('cache'),
             kline_acquisition=snapshot.get('kline_acquisition'),
             latest_quote_at=source_at.isoformat(sep=' ',timespec='seconds') if source_at else None,
@@ -411,9 +421,9 @@ def boundary_capture_loop():
         time.sleep(5)
 
 
-def next_refresh_run(scheduled, now, interval):
+def next_refresh_run(scheduled, now, interval, lock_busy=False):
     # Keep one future attempt, never replay the missed ticks as a queue.
-    return now + min(15, interval) if scheduled <= now else scheduled
+    return now + min(15, interval) if lock_busy or scheduled <= now else scheduled
 
 
 def refresh_loop(interval, always=False):
@@ -426,7 +436,12 @@ def refresh_loop(interval, always=False):
     while True:
         time.sleep(max(0.0, next_run - time.monotonic()))
         next_run += interval
+        lock_busy = False
         try:
+            last_round = INIT.get('last_round_started_monotonic')
+            if last_round is not None and time.monotonic() < last_round + interval:
+                next_run = last_round + interval
+                continue  # A manual/boundary round already refreshed every page.
             now = datetime.now()
             trading = is_trading_time(now)
             mode = pick_mode()
@@ -444,7 +459,7 @@ def refresh_loop(interval, always=False):
                 continue
             INIT.update(scan_active=True,
                         scan_started_at=datetime.now().isoformat(timespec="seconds"),
-                        scan_mode=mode)
+                        scan_mode=mode, refresh_waiting_for_lock=False)
             try:
                 print(f"[LOOP] {datetime.now():%H:%M:%S} 开始 {mode} 扫描 ...")
                 scan_and_publish(mode)
@@ -453,7 +468,12 @@ def refresh_loop(interval, always=False):
                 INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
                 INIT["last_scan_ok"] = True
                 INIT["last_scan_error"] = None
+                INIT["last_scan_note"] = None
                 print(f"[LOOP] {datetime.now():%H:%M:%S} 完成")
+            except config.PipelineBusy as e:
+                lock_busy = True
+                INIT.update(refresh_waiting_for_lock=True, last_scan_note=str(e))
+                print(f"[LOOP] 等待更新锁，15秒内重试：{e}")
             except scoring.DataNotReady as e:
                 # 数据未就绪时保留上一份快照（竞价期全池无成交，或盘中源覆盖不足），
                 # 属于保护性跳过，不是服务崩溃，不要打堆栈吓人
@@ -474,7 +494,7 @@ def refresh_loop(interval, always=False):
             # Slow scans must not add an entire idle interval to old quotes.
             # Resume after a short pause, without overlap or catch-up requests.
             now = time.monotonic()
-            next_run = next_refresh_run(next_run, now, interval)
+            next_run = next_refresh_run(next_run, now, interval, lock_busy=lock_busy)
 
 
 def snapshot_refresh_due(snapshot, now):
@@ -489,8 +509,35 @@ def snapshot_refresh_due(snapshot, now):
             or (now-source).total_seconds()>=config.RUNTIME['refresh_seconds'])
 
 
+def reusable_publication(snapshot):
+    token = ui_payload.active_generation()
+    if not token or not (config.ROOT / 'dashboard.html').is_file():
+        return False
+    try:
+        saved = json.loads(ui_payload.blob(token, 'publication'))
+    except (LookupError, OSError, ValueError):
+        return False
+    expected = dict(STATE, code_stock_selection_version=stock_selection.VERSION,
+                    code_stock_selection_hash=stock_selection.IMPLEMENTATION_HASH,
+                    code_ui_payload_version=ui_payload.VERSION)
+    return (saved.get('selection_input_revision') == stock_selection.input_revision()
+            and saved.get('publication_sources') == make_dashboard.publication_source_hash()
+            and saved.get('generated_at') == snapshot.get('generated_at')
+            and all(expected.get(k) == v for k, v in (saved.get('runtime_contract') or {}).items()))
+
+
 def publish_reused_snapshot(snapshot, now):
-    publish_outputs(snapshot)
+    reusable = reusable_publication(snapshot)
+    if snapshot_refresh_due(snapshot, now) and not reusable:
+        print('[INIT] 源行情已旧，直接采集新数据，跳过旧快照重建 ...')
+        INIT.update(scan_active=True, scan_started_at=datetime.now().isoformat(timespec='seconds'), scan_mode='quick')
+        try:
+            scan_and_publish(mode=pick_mode(now, snapshot))
+        finally:
+            INIT.update(scan_active=False, scan_started_at=None, scan_mode=None)
+        return
+    publish_outputs(snapshot, reuse_page=reusable)
+    now = datetime.now()
     if snapshot_refresh_due(snapshot, now):
         # Make the retained page usable first, then refresh under the existing
         # scan lock. Restarting must not add another full scheduler interval.
@@ -593,7 +640,15 @@ def _refresh_worker(mode):
         close_missing = (now.weekday() < 5 and now.hour >= 15
                          and not boundary_capture_done(now, 'close')
                          and boundary_trading_evidence(now))
-        scan_and_publish(mode, **({'boundary': 'close'} if close_missing else {}))
+        while True:
+            try:
+                INIT['refresh_waiting_for_lock'] = False
+                scan_and_publish(mode, **({'boundary': 'close'} if close_missing else {}))
+                break
+            except config.PipelineBusy as exc:
+                INIT.update(refresh_waiting_for_lock=True, last_scan_note=str(exc))
+                print(f'[MANUAL] 等待更新锁，15秒内重试：{exc}')
+                time.sleep(15)
         INIT["phase"] = "ready"
         INIT["needs_model_refresh"] = False
         REFRESH["ok"] = True
@@ -602,6 +657,7 @@ def _refresh_worker(mode):
         INIT["last_scan"] = datetime.now().isoformat(timespec="seconds")
         INIT["last_scan_ok"] = True
         INIT["last_scan_error"] = None
+        INIT["last_scan_note"] = None
         print(f"[MANUAL] {datetime.now():%H:%M:%S} 手动刷新完成")
     except scoring.DataNotReady as e:
         # 行情没就绪不是"失败"，而是"这轮不该写" —— 单独报，
@@ -728,16 +784,32 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(403, 'Local requests only')
             return
         path = self.path.split("?")[0]
-        if path == '/__stock_activity':
-            target = config.CACHE_DIR / 'stock_activity_v21' / 'latest.json'
+        if path in ('/__stock_activity', '/__stock_selection'):
+            token = ui_payload.active_generation()
+            key = 'stock_selection.gz' if path == '/__stock_selection' else 'stock_activity.gz'
+            etag = '"' + str(token) + '|' + key + '"'
             try:
-                body = target.read_bytes()
-            except OSError:
-                self.send_error(503, 'Stock strength is not ready')
+                body = ui_payload.blob(token, key)
+            except (OSError, LookupError, KeyError):
+                self.send_error(503, 'Published stock strength is not ready')
                 return
+            if self.headers.get('If-None-Match') == etag:
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.end_headers()
+                return
+            compressed = 'gzip' in self.headers.get('Accept-Encoding', '')
+            if compressed:
+                pass  # The immutable generation already stores gzip bytes.
+            else:
+                body = gzip.decompress(body)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('ETag', etag)
+            self.send_header('X-UI-Generation', str(token))
+            self.send_header('Vary', 'Accept-Encoding')
+            if compressed:
+                self.send_header('Content-Encoding', 'gzip')
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -748,6 +820,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/__status":
             body = json.dumps(
                 {**STATE, **INIT, **SNAPSHOT_META,
+                 'code_stock_selection_version': stock_selection.VERSION,
+                 'code_stock_selection_hash': stock_selection.IMPLEMENTATION_HASH,
                  'member_refresh': weekly_members.status(),
                  'scan_progress': __import__('scan_cache').progress(),
                  'code_scan_cache_version': __import__('scan_cache').VERSION,
@@ -827,9 +901,14 @@ class Handler(SimpleHTTPRequestHandler):
                 item = ui_payload.detail(version, query.get('kind', [''])[0], query.get('id', [''])[0])
                 self._send_body(ui_payload.dumps({'version': version, 'item': item}).encode('utf-8'),
                                 'application/json; charset=utf-8')
-            elif path == '/__ui/summary':
+            elif path in ('/__ui/summary', '/__ui/stock_selection'):
                 compressed = 'gzip' in self.headers.get('Accept-Encoding', '')
-                body = ui_payload.blob(version, 'summary.gz' if compressed else 'summary')
+                if path == '/__ui/stock_selection':
+                    body = ui_payload.blob(version, 'stock_selection.gz')
+                    if not compressed:
+                        body = gzip.decompress(body)
+                else:
+                    body = ui_payload.blob(version, 'summary.gz' if compressed else 'summary')
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.send_header('Content-Length', str(len(body)))
@@ -973,7 +1052,7 @@ def run_service():
 
     if not no_loop:
         import stock_activity_sampler
-        threading.Thread(target=stock_activity_sampler.loop, daemon=True).start()
+        threading.Thread(target=stock_activity_sampler.loop, kwargs={'publish': False}, daemon=True).start()
         threading.Thread(target=refresh_loop, args=(interval, always), daemon=True).start()
         threading.Thread(target=boundary_capture_loop, daemon=True).start()
         threading.Thread(target=weekly_members.loop, args=(_SCAN_LOCK,), daemon=True).start()

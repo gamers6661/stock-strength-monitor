@@ -70,3 +70,7 @@ probe/
 *secret*
 .DS_Store
 Thumbs.db
+
+# Local source snapshots retained for rollback
+/research/perf_p0_20261020/before_p*/
+/research/stock_selection_optimize_20261022/before-publication-fix/

@@ -757,6 +757,39 @@ def load_klines(conn, codes, quotes, refresh=False, progress=True,
 # ─────────────────────────────────────────────────────
 # 全流程
 # ─────────────────────────────────────────────────────
+def retain_missing_quote_rows(stocks, catalog, quotes, previous_rows, pool, asof):
+    """Retain missing quotes only for the current universe; retired codes stay in history."""
+    visible_codes = {str(row.get("code")) for row in stocks + catalog}
+    for old in previous_rows:
+        code = str(old.get("code") or "")
+        if (not code or code not in pool or code in quotes or code in visible_codes
+                or old.get("signal_date") != asof):
+            continue
+        stale = dict(old)
+        stale.update({
+            "coverage_only": True, "quote_stale": True, "stale_carried": True,
+            "intraday_quote_fresh": False, "intraday_score_stale": True,
+            "intraday_observation_available": False, "intraday_judgment_at": None,
+            "intraday_quote_status": "本轮报价缺失，沿用上次有效值",
+            "intraday_score_delta": None, "intraday_delta_state": "报价缺失，停止比较",
+            "intraday_transition": None, "intraday_trend_state": "数据不可判断（报价缺失）",
+            "intraday_risk_level": "未知", "intraday_risk_flags": ["本轮报价缺失"],
+            "intraday_risk_priority": 0, "intraday_serious_weakness": False,
+            "current_strong_candidate": False, "current_pullback_candidate": False,
+            "startup_candidate": False, "entry_watch": False,
+            "intraday_active_candidate": False, "intraday_repair_candidate": False,
+            "turn_weak_repair_candidate": False,
+            "intraday_observation_state": "数据不可判断（报价缺失）",
+            "last_valid_price": old.get("price"),
+            "last_valid_change_pct": old.get("change_pct"),
+            "last_valid_quote_at": old.get("intraday_quote_at"),
+            "last_valid_intraday_score": old.get("intraday_score"),
+            "reason_text": "本轮报价缺失；显示上次有效报价，当前状态未知",
+        })
+        catalog.append(stale)
+        visible_codes.add(code)
+
+
 def _apply_intraday_close_confirmation(snap, previous_snapshot):
     """每日只固定一次最后有效盘中判断；后续刷新读取原结果，不覆盖对照。"""
     day = (snap.get("strength_model") or {}).get("asof")
@@ -988,6 +1021,16 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
         snap['boundary_prices'][boundary]['captured_at'] = snap['quote_capture_at']
     intraday.intraday_path.save_acquisition(intraday.HISTORY_DIR, quotes, quote_capture_at, snap['session'], boundary)
 
+    # Overlap raw minute I/O with local work; never publish or change evidence cutoffs.
+    if mode == "quick" and snap["session"] in ("早盘", "午盘", "尾盘"):
+        day = quote_capture_at.date().isoformat()
+        if str(previous_snapshot.get("quote_capture_at") or "")[:10] == day:
+            prior_rows = (previous_snapshot.get("stocks") or []) + (previous_snapshot.get("coverage_catalog") or [])
+            minute_codes = [r["code"] for r in prior_rows
+                            if r.get("code") in quotes and (r.get("ma_trend") or {}).get("minute_needed")]
+            close_monitor.prefetch_minutes(minute_codes, day,
+                                           {c: quotes[c].get("quote_at") for c in minute_codes})
+
     # 3. 外围
     outer = df.fetch_outer_resilient()
     snap["outer"] = outer
@@ -1200,16 +1243,25 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
         if not (item["fund_covered"] or item["fund_today_covered"]):
             item["fund_observed_at"] = None
     completed_bars = {c: strength.completed(v) for c, v in klines.items()}
+    completed_calendar = strength.trading_calendar(completed_bars)
     timer.mark("个股计算", "板块趋势与最新指数")
     import board_trend
     snap["board_trend_model"] = board_trend.attach(
-        snap, strength.trading_calendar(completed_bars), fetch=True,
+        snap, completed_calendar, fetch=True,
         previous_snapshot=previous_snapshot, quote_future=board_quote_future)
     timer.mark("板块趋势与最新指数", "盘中与结构")
+    subphases = {}
+    sub_started = [time.monotonic()]
+
+    def mark_subphase(label):
+        now = time.monotonic()
+        subphases[label] = round(now - sub_started[0], 3)
+        sub_started[0] = now
+
     catalog, catalog_stats = coverage.build(
         quotes, klines, {s["code"] for s in stocks}, raw_reasons,
         {m["code"]: m for m in raw_all}, model["asof"],
-        strength.trading_calendar(completed_bars),
+        completed_calendar,
         previous_rows=(previous_snapshot.get("stocks") or [])
                       + (previous_snapshot.get("coverage_catalog") or []))
     for row in catalog:
@@ -1229,15 +1281,24 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
         row["fund_today_source"] = fund_meta.get("source") if fund else None
         row["fund_today_at"] = fund_meta.get("fetched_at") if fund else None
         row["fund_state"] = "资金未知（完整多日覆盖不足）"
+    # Preserve provenance from this exact acquisition for every page's projection.
+    for row in stocks + catalog:
+        quote = quotes.get(row['code']) or {}
+        for key in ('price_basis', 'price_basis_source', 'last_close_semantics',
+                    'last_close_precision_digits', 'volume_shou'):
+            if key in quote:
+                row[key] = quote[key]
     snap["coverage_catalog"] = catalog
     snap["coverage_stats"] = catalog_stats
+    mark_subphase("覆盖目录")
     # 盘中观察在日线模型之后独立计算；基础分由完整25根对齐完成日线决定。
     snap["intraday_model"] = intraday.enrich(
         stocks, catalog, quotes, klines, list(pool), captured_at=quote_capture_at,
         session=snap["session"], previous_snapshot=previous_snapshot,
-        trading_calendar=strength.trading_calendar(completed_bars))
+        trading_calendar=completed_calendar)
     price_contexts = snap["intraday_model"].pop("_price_contexts", {})
     path_history = snap['intraday_model'].pop('_history_context', {})
+    mark_subphase("盘中评分")
     # 9:30 后逐股正式报价可能分批到达；保留同日竞价参考，供未更新的股票标注来源。
     prior_auction = {str(row.get("code")): row.get("auction_observation")
                      for row in (previous_snapshot.get("stocks") or [])
@@ -1247,44 +1308,18 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
         observation = prior_auction.get(str(row.get("code"))) or {}
         if str(observation.get("quote_at") or "").startswith(scan_started_at.strftime("%Y-%m-%d")):
             row["auction_observation"] = observation
-    # 报价完全缺失的旧行保留最后一次有效值，但明确过期并停止产生新状态。
-    visible_codes = {str(row.get("code")) for row in stocks + catalog}
-    previous_rows = (previous_snapshot.get("stocks", []) +
-                     previous_snapshot.get("coverage_catalog", []))
-    for old in previous_rows:
-        code = str(old.get("code") or "")
-        if (not code or code in quotes or code in visible_codes
-                or old.get("signal_date") != model.get("asof")):
-            continue
-        stale = dict(old)
-        stale.update({
-            "coverage_only": True, "quote_stale": True, "stale_carried": True,
-            "intraday_quote_fresh": False, "intraday_score_stale": True,
-            "intraday_observation_available": False, "intraday_judgment_at": None,
-            "intraday_quote_status": "本轮报价缺失，沿用上次有效值",
-            "intraday_score_delta": None, "intraday_delta_state": "报价缺失，停止比较",
-            "intraday_transition": None, "intraday_trend_state": "数据不可判断（报价缺失）",
-            "intraday_risk_level": "未知", "intraday_risk_flags": ["本轮报价缺失"],
-            "intraday_risk_priority": 0, "intraday_serious_weakness": False,
-            "current_strong_candidate": False, "current_pullback_candidate": False,
-            "startup_candidate": False, "entry_watch": False,
-            "intraday_active_candidate": False, "intraday_repair_candidate": False,
-            "turn_weak_repair_candidate": False,
-            "intraday_observation_state": "数据不可判断（报价缺失）",
-            "last_valid_price": old.get("price"),
-            "last_valid_change_pct": old.get("change_pct"),
-            "last_valid_quote_at": old.get("intraday_quote_at"),
-            "last_valid_intraday_score": old.get("intraday_score"),
-            "reason_text": "本轮报价缺失；显示上次有效报价，当前状态未知",
-        })
-        catalog.append(stale)
-        visible_codes.add(code)
+    # Current-pool quote gaps retain their last value; removed codes are not new candidates.
+    retain_missing_quote_rows(stocks, catalog, quotes,
+                              (previous_snapshot.get("stocks") or []) +
+                              (previous_snapshot.get("coverage_catalog") or []),
+                              opportunity_pool, model.get("asof"))
     _apply_intraday_close_confirmation(snap, previous_snapshot)
     # 资金抓取可能晚于扫描开始；以实际判断时刻核验时效，避免把本轮资金误判成未来数据。
     snap["attack_assessment_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
     attack_model.enrich(snap, quotes, price_contexts, previous_snapshot)
     intraday.intraday_path.attach(snap, path_history)
     attack_model.retain_missing_observations(snap)
+    mark_subphase("进攻与路径")
     # Current strength is built once below, after all price/data contexts are complete.
     visible_rows = stocks + catalog
     model["entry_watch_count"] = sum(bool(row.get("entry_watch")) for row in visible_rows)
@@ -1345,6 +1380,7 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
 
     # 10. 完成日线突破观察
     snap["alerts"] = strength.breakout_alerts(stocks)
+    mark_subphase("汇总与广度")
 
     # 附：东财状态
     snap["em_status"] = df.em_status()
@@ -1354,23 +1390,31 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
     snap["scan_completed_at"] = scan_completed_at.isoformat(sep=" ", timespec="seconds")
     snap["generated_at"] = scan_completed_at.strftime("%Y-%m-%d %H:%M:%S")
     close_monitor.attach(snap, quotes, klines, price_contexts=price_contexts,
-                         trading_calendar=strength.trading_calendar(completed_bars))
+                         trading_calendar=completed_calendar)
+    mark_subphase("分钟与MA")
     trend_consolidation.attach(snap, klines, quotes, price_contexts,
-        strength.trading_calendar(completed_bars), history=path_history,
+        completed_calendar, history=path_history,
         previous=previous_snapshot, persist=True,
         close_history_loader=lambda code: history_cache[code] if code in history_cache else df.load_kline(conn,'kline','code',code))
-    wyckoff_structure.attach(snap, klines, strength.trading_calendar(completed_bars),
+    mark_subphase("整理观察")
+    wyckoff_structure.attach(snap, klines, completed_calendar,
                             contexts=price_contexts, history=path_history, persist=True,
                             daily_history_loader=lambda code: history_cache[code] if code in history_cache else df.load_kline(conn,'kline','code',code))
+    mark_subphase("量价结构")
     price_only.sanitize(snap)
     session_context.attach(snap,quotes,formal,formal_calendar,contexts=price_contexts)
+    mark_subphase("收盘衔接")
     market_strength.attach(snap, quotes, opportunity_pool, formal, formal_calendar,
                            contexts=price_contexts, now=quote_capture_at, previous=previous_snapshot)
+    mark_subphase("市场强度")
     ma_trend.attach(snap, quotes, opportunity_pool, formal, formal_calendar,
-                    now=quote_capture_at, previous=previous_snapshot)
+                    now=quote_capture_at, previous=previous_snapshot, contexts=price_contexts)
+    mark_subphase("均线阶段")
     import emotion_relay
     emotion_relay.attach(snap,quotes,opportunity_pool,formal,formal_calendar,
                          now=quote_capture_at,previous=previous_snapshot)
+    mark_subphase("情绪接力")
+    subphases["合计"] = round(sum(subphases.values()), 3)
 
     timer.mark("盘中与结构", "观察留档与研究")
     append_history(snap)
@@ -1380,7 +1424,9 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
     snap["intraday_research"] = intraday.build_validation_report()
     scan_cache.flush()
     timer.mark("观察留档与研究", "快照写盘")
-    snap['scan_performance'] = timer.result()
+    performance = timer.result()
+    performance['subphases'] = dict(subphases)
+    snap['scan_performance'] = performance
     snap['elapsed'] = round(time.time()-t_start, 3)
     # generated_at remains the judgment clock; performance clocks are separate.
     # 研究报告随快照更新，页面与磁盘快照继续保持同一版本。
@@ -1388,7 +1434,9 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
         config.SNAPSHOT_JSON,
         json.dumps(snap, ensure_ascii=False, separators=(",", ":")))
     timer.mark("快照写盘", "页面发布")
-    snap['scan_performance'] = timer.result()
+    performance = timer.result()
+    performance['subphases'] = dict(subphases)
+    snap['scan_performance'] = performance
     snap['elapsed'] = round(time.time()-t_start, 3)
     print(f"[RUN] 扫描完成（含写盘），耗时 {snap['elapsed']}s -> {config.SNAPSHOT_JSON.name}")
     return snap

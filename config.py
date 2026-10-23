@@ -48,7 +48,7 @@ MA_TREND = {
     'ma20_below_atr': .3, 'ma20_below_pct': 1.5,
     'near_atr': .4, 'entry_near_atr': .8, 'rebound_atr': .3,
     'repair_minutes': 15, 'break_atr': .5,
-    'minute_fetch_workers': 6, 'minute_fetch_seconds': 45,
+    'minute_fetch_workers': 6, 'minute_fetch_seconds': 12,
     'limit_recovery_candidate_enabled': True,
     'limit_recovery_candidate_days': 5,
     'limit_recovery_follow_days': 1,
@@ -904,7 +904,7 @@ ALERT = {
 # 七、运行时参数
 # ═══════════════════════════════════════════════════════
 RUNTIME = {
-    "refresh_seconds": 120,      # 盘中每2分钟；上一轮未完成则跳过，禁止排队
+    "refresh_seconds": 300,      # 全站每5分钟同轮发布；上一轮未完成则跳过，禁止排队
     "server_port": 8848,
     "report_time": "15:30",      # 收盘报告时间
     "top_n": 30,                 # 榜单条数

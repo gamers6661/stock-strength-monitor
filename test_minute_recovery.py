@@ -6,6 +6,7 @@ from unittest.mock import patch
 import close_monitor as C
 import ma_trend as T
 import intraday
+import config
 from test_ma_trend import sample,run
 from test_ma_radar_transition import minutes
 from test_market_strength_integration import render
@@ -83,6 +84,28 @@ class RecoveryCandidate(unittest.TestCase):
 
 class MinuteAcquisition(unittest.TestCase):
     DAY='2026-10-15'
+    def test_timed_out_running_request_rotates_behind_unattempted_tail(self):
+        import threading
+        entered=threading.Event();release=threading.Event();completed=threading.Event();calls=[]
+        def loader(code,day):
+            calls.append(code)
+            if code=='first':
+                entered.set();release.wait(2);completed.set()
+            return []
+        with tempfile.TemporaryDirectory() as tmp,patch.object(C,'MINUTE_DIR',Path(tmp)), \
+             patch.object(C,'_load_minute_cache',return_value={'stocks':{}}), \
+             patch.object(C,'_minute_bars',side_effect=loader), \
+             patch.object(C,'_MINUTE_ATTEMPT',{'day':None,'at':{}}), \
+             patch.dict(config.MA_TREND,minute_fetch_workers=1,minute_fetch_seconds=.05):
+            try:
+                C._get_minutes(['first','tail'],self.DAY,dict(first=self.DAY+' 09:50:30',tail=self.DAY+' 09:50:30'))
+                self.assertTrue(entered.is_set());self.assertEqual(calls,['first'])
+                self.assertIn('first',C._MINUTE_ATTEMPT['at']);self.assertNotIn('tail',C._MINUTE_ATTEMPT['at'])
+            finally:
+                release.set();completed.wait(2)
+            C._get_minutes(['first','tail'],self.DAY,dict(first=self.DAY+' 09:50:30',tail=self.DAY+' 09:50:30'))
+            self.assertEqual(calls[:2],['first','tail'])
+
     def bars(self):
         f=sample();data=minutes(f,101.);out=next(iter(data.values()))[:20]
         for b in out:b['at']=self.DAY+b['at'][10:]

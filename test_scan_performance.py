@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime
 from datetime import timedelta
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -166,6 +167,28 @@ class IncrementTests(unittest.TestCase):
 class CacheTests(unittest.TestCase):
     setUp = IncrementTests.setUp
     tearDown = IncrementTests.tearDown
+    def test_source_edit_cannot_cache_old_code_under_new_disk_hash(self):
+        source=Path(self.tmp.name)/'audit_rule.py'
+        source.write_text('def calculate(): return 1\n',encoding='utf8')
+        initial=hashlib.sha256(source.read_bytes()).hexdigest()
+        with patch.object(config,'ROOT',source.parent),patch.dict(C._SOURCE_HASHES,{str(source.resolve()):initial}):
+            old={};exec(source.read_text(encoding='utf8'),old)
+            self.assertEqual(C.cached('source-test','a',C.rules(source.name),old['calculate']),1)
+            source.write_text('def calculate(): return 200\n',encoding='utf8')
+            with self.assertRaisesRegex(C.SourceChanged,'重启服务'):
+                C.cached('source-test','a',C.rules(source.name),old['calculate'])
+            # A new process captures the changed source before using the cache.
+            C._SOURCE_HASHES[str(source.resolve())]=hashlib.sha256(source.read_bytes()).hexdigest()
+            new={};exec(source.read_text(encoding='utf8'),new)
+            self.assertEqual(C.cached('source-test','a',C.rules(source.name),new['calculate']),200)
+
+    def test_source_edit_before_first_cache_lookup_also_requires_restart(self):
+        source=Path(self.tmp.name)/'lazy_rule.py';source.write_text('old-source',encoding='utf8')
+        initial=hashlib.sha256(source.read_bytes()).hexdigest()
+        with patch.object(config,'ROOT',source.parent),patch.dict(C._SOURCE_HASHES,{str(source.resolve()):initial}):
+            source.write_text('new-lazy-source',encoding='utf8')
+            with self.assertRaises(C.SourceChanged):C.rules(source.name)
+
     def test_cache_content_calendar_and_rule_changes_invalidate(self):
         count = []
         compute = lambda: (count.append(1) or {'score': 5})

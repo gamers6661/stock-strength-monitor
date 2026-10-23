@@ -68,7 +68,7 @@ function installLazyDetails(){
   var offlineHost=document.getElementById('stk-actions');
   if(offlineHost&&DATA.ui_lazy){
     var button=document.createElement('button');button.id='ui-offline-button';button.className='btn ms-offline-button';button.innerHTML='<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4" stroke-linecap="round" stroke-linejoin="round"/></svg><span>完整离线看板</span>';
-    button.title='保存同一版全部详情、图表和导出功能，双击即可离线查看';
+    button.title='保存本轮全部页面、详情、图表及个股结果，使用同一发布版本。双击即可离线查看';
     button.onclick=function(){
       if(!uiLocal()){toast('请先通过打开看板.bat启动本地服务');return;}
       var a=document.createElement('a');a.href='/__ui/offline?version='+encodeURIComponent(DATA.ui_generation);
@@ -108,8 +108,10 @@ function updateDashboardData(status){
         });
       function restoreScrolls(){scrolls.forEach(function(s){var el=s[0]&&document.querySelector(s[0]);if(el){el.scrollTop=s[1];el.scrollLeft=s[2];}});}
       var folds=Array.from(document.querySelectorAll('#dr-b details[open]')).map(function(el){return el.querySelector('summary').textContent;});
-      var x=window.scrollX,y=window.scrollY,drawer=UI_DRAWER;
-      UI_REQUEST++;UI_CACHE={};UI_PENDING={};DATA=next;PAGE_VERSION=status.data_version;
+      var x=window.scrollX,y=window.scrollY;
+      var drawer=document.querySelector('#drawer.open #ss-detail')&&typeof SS_DETAIL==='string'
+        ?{kind:'stock',id:SS_DETAIL}:UI_DRAWER;
+      UI_REQUEST++;UI_CACHE={};UI_PENDING={};if(typeof SS_FULL!=='undefined')SS_FULL={};DATA=next;PAGE_VERSION=status.data_version;
       RENDERED={};renderOverview();RENDERED.overview=true;
       var render={stocks:renderStocks,radar:renderRadar,boards:renderBoards,themes:renderThemesPage,emotion:typeof renderEmotion==='function'?renderEmotion:null,hold:renderHold}[STATE.pane];
       if(render){render();RENDERED[STATE.pane]=true;}renderFresh();

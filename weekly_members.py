@@ -45,8 +45,15 @@ def outside_market(now):
     return now.weekday() >= 5 or now.hour*60+now.minute >= 15*60+15
 
 
-@config.single_writer
 def run_if_due(scan_lock, now=None, updater=None):
+    now = now or datetime.now()
+    if not outside_market(now) or not status(now.timestamp())['due']:
+        return False
+    return _run_if_due(scan_lock, now, updater)
+
+
+@config.single_writer
+def _run_if_due(scan_lock, now=None, updater=None):
     global _RUNNING
     now = now or datetime.now()
     if not outside_market(now) or not status(now.timestamp())['due']:
@@ -87,4 +94,4 @@ def loop(scan_lock):
             run_if_due(scan_lock)
         except Exception as exc:
             print(f'[MEMBERS] 周更检查失败：{exc}')
-        time.sleep(300)
+        time.sleep(60)

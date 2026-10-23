@@ -147,7 +147,7 @@ def valid_frame(quotes, at, session, formal=False):
     return result
 
 
-def archive_frames(now,codes,directory=None,anchor=None,formal=False):
+def archive_frames(now,codes,directory=None,anchor=None,formal=False,since=None):
     folders=([Path(directory)] if directory is not None else
              [intraday.HISTORY_DIR/'acquisitions',config.CACHE_DIR/'stock_activity_samples'/'acquisitions'])
     result=[]
@@ -158,7 +158,7 @@ def archive_frames(now,codes,directory=None,anchor=None,formal=False):
             with gzip.open(path,'rt',encoding='utf8') as stream:
                 for line in stream:
                     record=json.loads(line);at=stamp(record.get('captured_at'))
-                    if not at or at>now or at.date()!=now.date():continue
+                    if not at or at>now or at.date()!=now.date() or since is not None and at<since:continue
                     fields=record['fields']
                     quotes={r[0]:dict(zip(fields[1:],r[1:])) for r in record['rows'] if r[0] in codes}
                     frame=valid_frame(quotes,at,record.get('session','连续竞价'),formal)

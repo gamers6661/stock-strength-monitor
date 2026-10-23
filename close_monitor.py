@@ -18,6 +18,9 @@ import datafeed as df
 VERSION = "收盘进攻名单与趋势监控2"
 CLOSE_DIR = config.CACHE_DIR / "close_strong_attack_v6"
 MINUTE_DIR = config.CACHE_DIR / "trend_monitor_minutes"
+_MINUTE_ATTEMPT = {"day": None, "at": {}}
+_MINUTE_POOL = None
+_MINUTE_PENDING = {}
 LIVE_DIR = config.CACHE_DIR / "intraday_new_strength"
 TREND_DIR = config.CACHE_DIR / "trend_ma5_observation"
 TREND_DIRS = {5: TREND_DIR, 10: config.CACHE_DIR / "trend_ma10_observation",
@@ -341,52 +344,126 @@ def _minute_coverage(bars, day, target):
                     for a,b,previous,current in zip(times,times[1:],points,points[1:])))
 
 
-def _get_minutes(codes, day, quote_times, request_stats=None):
-    started=time.monotonic()
+def _minute_needs_refresh(code, day, target, by_code, fetched):
+    bars = by_code.get(code) or []
+    last = bars[-1]["at"] if bars else ""
+    return (not last or not target or last < target[:16]
+            or last == target[:16] and fetched.get(code, '') < target
+            or not _minute_coverage(bars, day, target)
+            or any(bar.get("price_basis") != "raw"
+                   or bar.get("price_basis_source") not in intraday._RAW_MINUTE_SOURCES
+                   for bar in bars))
+
+
+def _start_minutes(codes, day, prioritize=False):
+    """Share bounded requests between consumers; keep late running results."""
+    global _MINUTE_POOL
+    scope = (str(MINUTE_DIR), day)
+    for key, future in list(_MINUTE_PENDING.items()):
+        if key[:2] != scope or future.cancelled():
+            future.cancel()
+            del _MINUTE_PENDING[key]
+    if _MINUTE_ATTEMPT["day"] != day:
+        _MINUTE_ATTEMPT.update(day=day, at={})
+    attempts = _MINUTE_ATTEMPT["at"]
+    ordered = list(dict.fromkeys(codes))
+    if prioritize:
+        # Speculative queued work must not block this consumer's selected codes.
+        for key, future in list(_MINUTE_PENDING.items()):
+            if key[:2] == scope and key[2] not in ordered and future.cancel():
+                del _MINUTE_PENDING[key]
+    order = {code: i for i, code in enumerate(ordered)}
+    ordered.sort(key=lambda code: (attempts.get(code, 0.0), order[code]))
+    if _MINUTE_POOL is None:
+        _MINUTE_POOL = ThreadPoolExecutor(max_workers=config.MA_TREND["minute_fetch_workers"])
+    def fetch(code):
+        attempts[code] = time.monotonic()
+        return _minute_bars(code, day), str(datetime.now())
+    futures = {}
+    for code in ordered:
+        key = scope + (code,)
+        future = _MINUTE_PENDING.get(key)
+        if future is None:
+            future = _MINUTE_POOL.submit(fetch, code)
+            _MINUTE_PENDING[key] = future
+        futures[future] = code
+    return futures
+
+
+def prefetch_minutes(codes, day, quote_times):
+    """Start raw evidence only; consumers still apply their own quote cutoff."""
     cache = _load_minute_cache(day)
-    by_code = cache.get("stocks") or {}
-    fetched=cache.get('fetched_at') or {};need=[]
-    for code in dict.fromkeys(codes):
-        bars = by_code.get(code) or []
-        last = bars[-1]["at"] if bars else ""
-        target = quote_times.get(code) or ""
-        if (not last or not target or last < target[:16]
-                or last == target[:16] and fetched.get(code,'') < target
-                or not _minute_coverage(bars,day,target)
-                or any(bar.get("price_basis") != "raw"
-                       or bar.get("price_basis_source") not in intraday._RAW_MINUTE_SOURCES
-                       for bar in bars)):
-            need.append(code)
-    stats=dict(requested=len(need),completed=0,empty=0,errors=0,timeout=0,cache_reused=len(set(codes))-len(need))
-    if not need:
-        if request_stats is not None:request_stats.update(stats,seconds=round(time.monotonic()-started,3))
-        return by_code
-    # Every required stock is queued in this scan. A bounded pool replaces the
-    # 24-stock rotation which left tails stale for several complete scan cycles.
+    by_code, fetched = cache.get("stocks") or {}, cache.get("fetched_at") or {}
+    need = [code for code in dict.fromkeys(codes)
+            if _minute_needs_refresh(code, day, quote_times.get(code) or "", by_code, fetched)]
     if need:
-        pool = ThreadPoolExecutor(max_workers=config.MA_TREND['minute_fetch_workers'])
-        futures = {pool.submit(_minute_bars, code, day): code for code in need}
+        _start_minutes(need, day)
+
+
+def _get_minutes(codes, day, quote_times, request_stats=None):
+    started = time.monotonic()
+    codes = list(dict.fromkeys(codes))
+    cache = _load_minute_cache(day)
+    by_code, fetched = cache.get("stocks") or {}, cache.get("fetched_at") or {}
+    stats = dict(requested=0, completed=0, empty=0, errors=0, timeout=0, cache_reused=0)
+    # Harvest completed prefetch/late work before deciding whether a new quote
+    # needs a new request. A previous round's late result cannot satisfy a later
+    # quote just because its Future is still present.
+    attempted = set()
+    harvested = set()
+    changed = False
+    for code in codes:
+        key = (str(MINUTE_DIR), day, code)
+        future = _MINUTE_PENDING.get(key)
+        if future is not None and future.done() and not future.cancelled():
+            del _MINUTE_PENDING[key]
+            harvested.add(code)
+            try:
+                fresh, completed_at = future.result()
+                by_code[code] = _merge_minutes(by_code.get(code), fresh, day)
+                changed = True
+                stats["completed"] += 1
+                if fresh:
+                    fetched[code] = completed_at
+                else:
+                    stats["empty"] += 1
+                if completed_at >= (quote_times.get(code) or ""):
+                    attempted.add(code)
+            except (OSError, ValueError, RuntimeError):
+                stats["errors"] += 1
+    need = [code for code in codes if code not in attempted
+            and _minute_needs_refresh(code, day, quote_times.get(code) or "", by_code, fetched)]
+    stats["requested"] = len(set(need) | harvested)
+    stats["cache_reused"] = len(codes)-stats["requested"]
+    if need:
+        futures = _start_minutes(need, day, prioritize=True)
         try:
-            for future in as_completed(futures, timeout=config.MA_TREND['minute_fetch_seconds']):
+            for future in as_completed(futures, timeout=config.MA_TREND["minute_fetch_seconds"]):
                 code = futures[future]
+                _MINUTE_PENDING.pop((str(MINUTE_DIR), day, code), None)
                 try:
-                    fresh=future.result();by_code[code]=_merge_minutes(by_code.get(code),fresh,day)
-                    stats['completed']+=1
-                    if fresh:fetched[code]=str(datetime.now())
-                    else:stats['empty']+=1
+                    fresh, completed_at = future.result()
+                    by_code[code] = _merge_minutes(by_code.get(code), fresh, day)
+                    stats["completed"] += 1
+                    if fresh:
+                        fetched[code] = completed_at
+                    else:
+                        stats["empty"] += 1
                 except (OSError, ValueError, RuntimeError):
-                    stats['errors']+=1
+                    stats["errors"] += 1
         except TimeoutError:
-            stats['timeout']=len(need)-stats['completed']-stats['errors']
+            stats["timeout"] = sum(not f.done() for f in futures)
         finally:
-            for future in futures:
-                if not future.done():
-                    future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
-    MINUTE_DIR.mkdir(parents=True, exist_ok=True)
-    config.atomic_write_text(MINUTE_DIR / (day + ".json"),
-                             json.dumps({"day": day, "stocks": by_code,"fetched_at":fetched}, ensure_ascii=False, separators=(",", ":")))
-    if request_stats is not None:request_stats.update(stats,seconds=round(time.monotonic()-started,3))
+            for future, code in futures.items():
+                if future.cancel():
+                    _MINUTE_PENDING.pop((str(MINUTE_DIR), day, code), None)
+    if need or changed:
+        MINUTE_DIR.mkdir(parents=True, exist_ok=True)
+        config.atomic_write_text(MINUTE_DIR / (day + ".json"),
+                                 json.dumps({"day": day, "stocks": by_code, "fetched_at": fetched},
+                                            ensure_ascii=False, separators=(",", ":")))
+    if request_stats is not None:
+        request_stats.update(stats, seconds=round(time.monotonic()-started, 3))
     return by_code
 
 

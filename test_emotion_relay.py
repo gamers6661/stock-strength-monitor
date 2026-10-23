@@ -34,6 +34,20 @@ def run(f,previous=None):
     return {r['code']:r['emotion_relay'] for r in s['stocks']}
 
 class RelayRules(unittest.TestCase):
+    def test_rankings_and_lists_use_roles_assigned_by_cycle_and_boards(self):
+        f=sample();target=list(f[1])[3];attach_cycles=E.C.attach
+        def with_cycle_role(*args,**kwargs):
+            result=attach_cycles(*args,**kwargs)
+            args[1][target]['roles'].append('周期最高标')
+            return result
+        with patch.object(E.C,'attach',side_effect=with_cycle_role):
+            models=run(f)
+        for ranking in f[0]['emotion_relay']['rankings'].values():
+            eligible=[c for c in ranking['emotion'] if (models[c]['valid'] or models[c]['suspended_current']) and models[c]['eligible']]
+            self.assertEqual(ranking['emotion'][:len(eligible)],sorted(eligible,key=lambda c:E.order_key(models[c])))
+        leaders=f[0]['emotion_relay']['lists']['leaders']
+        self.assertEqual(leaders,sorted(leaders,key=lambda c:E.order_key(models[c])))
+
     def test_latest_cap_break_and_reseal_update_current_height_without_mutating_history(self):
         f=sample();c=next(iter(f[1]));first=run(f)[c];prior=first['prior_height']
         self.assertEqual(first['height'],prior+1)
@@ -214,5 +228,19 @@ class Acquisition(unittest.TestCase):
                 D.write(D.root()/'pools'/(day+'.json'),pool);D.write(D.root()/'raw'/'600001.json',raw)
                 result=D.load([day],fetch=False)
                 self.assertEqual(result['pools'][day]['date_verified'],expected)
+
+class HistoryFileCache(unittest.TestCase):
+    def test_reuses_parsed_file_and_invalidates_after_write(self):
+        from relay_history import _cached_read,_FILE_CACHE
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'raw.json'
+            path.write_text(json.dumps({'bars':[1]}),encoding='utf-8')
+            first=_cached_read(path);second=_cached_read(path)
+            self.assertEqual(first,second)
+            path.write_text(json.dumps({'bars':[1,2]}),encoding='utf-8')
+            third=_cached_read(path)
+            self.assertEqual(third,{'bars':[1,2]})
+            _FILE_CACHE.pop(str(path),None)
+
 
 if __name__=='__main__':unittest.main()

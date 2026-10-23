@@ -8,7 +8,7 @@ echo   ==========================================
 echo.
 echo   全量重建约需 3-5 分钟（重建K线缓存与全部映射），请勿关闭窗口...
 echo.
-python daily.py --full
+call "%~dp0run_python.bat" daily.py --full
 if errorlevel 1 goto fail
 echo.
 echo   ==========================================
