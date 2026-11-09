@@ -412,20 +412,101 @@ def definition_for(board, definitions):
     return definitions.get(board['name']) or dict(text=None, source=None, status='missing')
 
 
-def strong_evidence(board, day, reliable, auction):
-    value = board.get('market_strength') or {}
-    trend = bool(value.get('trend_strong') and str(value.get('trend_at') or '')[:10] == day)
-    emotion = bool(value.get('emotion_strong') and str(value.get('emotion_at') or '')[:10] == day)
+def strong_evidence(board, day, reliable, auction, daily_asof=None):
+    """Board-page eligibility follows the existing chronological index trend."""
+    current = board.get('index_current') or {}
+    daily = board.get('index_trend') or {}
+    target = str(daily_asof or daily.get('expected_asof') or '')[:10]
+    live = bool(current.get('ready') and current.get('asof') == day
+                and current.get('mode') in ('current', 'close'))
+    completed = bool(daily.get('ready') and target and daily.get('asof') == target
+                     and target <= day)
+    index = current if live else daily if completed else {}
     broad = board['type'] == 'theme' and board['name'] in BROAD_THEMES
-    eligible = bool(reliable and not auction and not broad and (trend or emotion))
-    return dict(eligible=eligible, trend=trend, emotion=emotion, broad=broad,
-                label='趋势与情绪共振' if trend and emotion else '趋势强势' if trend else '情绪强势' if emotion else '未确认强势',
-                trend_score=value.get('trend_score'), emotion_score=value.get('emotion_score'),
-                phase=value.get('phase'), reasons=value.get('reasons') or [],
-                member_strength=value.get('member_strength') or {},
-                risks=value.get('risks') or [], at=value.get('emotion_at') or value.get('trend_at'),
-                membership_warning=board.get('membership_disagreements'),
-                rule='沿用现有趋势/情绪强势判断；同日有效、覆盖合格；宽泛标签仅供查询')
+    online = bool(index.get('trend_online'))
+    startup = bool(index.get('startup'))
+    holding = bool(index.get('priority_observation') and (online or startup))
+    support = bool(index.get('support_observation'))
+    stage = index.get('state') or '趋势数据待补全'
+    priority = (0 if index.get('strong_advance') else 1 if online else
+                2 if startup else 3 if support else 8 if index else 9)
+    reasons = []
+    if index:
+        reasons.append('同花顺指数趋势：' + stage)
+        if index.get('episode_start'):
+            reasons.append('本轮趋势起点 ' + index['episode_start'])
+        if not live:
+            reasons.append('完成日线截至 ' + index['asof'])
+        if index.get('risk_reason'):
+            reasons.append(index['risk_reason'])
+    else:
+        reasons.append('最新指数趋势数据未对齐')
+    return dict(basis='index-trend', rule_version='board-trend-select-20261028.2',
+                eligible=bool(holding and not broad and not auction), tracked=bool(holding and not broad and not auction),
+                trend=online, startup=startup, support=support,
+                label=stage, phase=stage, priority=priority,
+                at=index.get('quote_at') if live else (index.get('asof') + ' 15:00:00' if index else None),
+                asof=index.get('asof'), live=live, episode_start=index.get('episode_start'),
+                source=index.get('source'), code=index.get('code'),
+                ret5=index.get('ret5'), ret20=index.get('ret20'),
+                completed_asof=daily.get('asof') if completed else None,
+                completed_episode_start=daily.get('episode_start') if completed else None,
+                completed_trend=bool(completed and daily.get('trend_online')),
+                ma10_previous=index.get('ma10_prev'),
+                close=index.get('close'), ma5=index.get('ma5'), ma10=index.get('ma10'), ma20=index.get('ma20'),
+                ma20_support_established=index.get('ma20_support_established'),
+                first_ma10_break=index.get('first_ma10_break'), buffer_days_left=index.get('buffer_days_left'),
+                exit_date=index.get('exit_date'), risk_reason=index.get('risk_reason'),
+                reasons=reasons, member_coverage_ready=reliable,
+                trigger='指数沿上行MA5、MA10推进；回踩后观察收复与继续抬高。',
+                invalidate='已建立的MA20支撑收盘失守则退出；MA10失守超过1ATR或第三个交易日仍未收复则降级或退出。',
+                rule='按同花顺指数连续趋势跟踪：启动、推进、回踩、修复、转弱；当日涨幅和情绪分不决定入选。')
+
+
+def refine_strengths(boards, calendar):
+    """Separate established relative leaders from the wider trend watch list."""
+    from bisect import bisect_left, bisect_right
+    groups = {}
+    for b in boards.values():
+        st = b['strength']
+        if st.get('asof') and numeric(st.get('ret5')):
+            groups.setdefault((b['type'], st['asof']), []).append(st['ret5'])
+    for values in groups.values():
+        values.sort()
+    for b in boards.values():
+        st = b['strength']
+        start, end = st.get('completed_episode_start'), st.get('completed_asof')
+        days = sum(start <= d <= end for d in calendar) if start and end else 0
+        values = groups.get((b['type'], st.get('asof')), [])
+        value = st.get('ret5')
+        rank = (100 * (bisect_left(values, value) + (bisect_right(values, value)-bisect_left(values, value)-1)/2)
+                / (len(values)-1)) if len(values) > 1 and numeric(value) else None
+        checks = dict(
+            completed_trend=bool(st.get('completed_trend')),
+            completed_days=days >= 2,
+            positive_5d=numeric(value) and value > 0,
+            relative_leader=rank is not None and rank >= 70,
+            above_ma10=numeric(st.get('close')) and numeric(st.get('ma10')) and st['close'] >= st['ma10'],
+            ma10_rising=numeric(st.get('ma10')) and numeric(st.get('ma10_previous')) and st['ma10'] > st['ma10_previous'])
+        st.update(completed_days=days, relative5_rank=round(rank, 2) if rank is not None else None,
+                  relative5_population=len(values), selection_checks=checks,
+                  eligible=bool(st.get('tracked') and all(checks.values())),
+                  selection_rule='至少2个完成交易日的趋势跟踪；5日涨幅为正且同类前30%；MA10上行，指数守住MA10。')
+        if st.get('tracked') and not st['eligible']:
+            if not checks['completed_trend'] or not checks['completed_days']:
+                st['index_stage'] = st['label']
+                st.update(label='启动观察', phase='启动观察', priority=2)
+                b.update(status='启动观察', lane='watch', priority=2)
+            else:
+                b['lane'] = 'waiting'
+            labels = dict(completed_trend='尚无完成日趋势基础', completed_days='完成日跟踪不足2日',
+                          positive_5d='5日表现尚未转正', relative_leader='5日表现尚未进入同类前30%',
+                          above_ma10='指数暂未收回MA10', ma10_rising='MA10尚未向上')
+            b['reasons'].append('保留趋势跟踪：' + '、'.join(labels[k] for k, passed in checks.items() if not passed))
+        elif st['eligible']:
+            b['reasons'].append('完成日跟踪%d日；5日表现同类前%.1f%%；MA10向上且支撑有效' % (days, 100-rank))
+        if b.get('timeline') and b['timeline'][-1].get('at') == st.get('at'):
+            b['timeline'][-1].update(status=b['status'], lane=b['lane'])
 
 
 def role_candidates(rows, auction=False):
@@ -475,7 +556,8 @@ def build(snap, persist=True, fetch_news=True):
     auction = snap.get('session') in ('盘前', '集合竞价', '竞价结束')
     current_stocks = {str(s['code']): stock(s, day, auction) for key in ('stocks', 'coverage_catalog') for s in snap.get(key) or []}
     catalog = snap.get('board_catalog') or []
-    priorities = [b['name'] for b in catalog if (b.get('market_strength') or {}).get('trend_strong') or (b.get('market_strength') or {}).get('emotion_strong')]
+    daily_asof = (snap.get('strength_model') or {}).get('asof') or snap.get('daily_asof')
+    priorities = [b['name'] for b in catalog if strong_evidence(b, day, True, auction, daily_asof)['eligible']]
     definitions = refresh_definitions(priorities + ['人形机器人', '机器人概念', '比亚迪概念', '一带一路']) if fetch_news else read(ROOT / 'definitions.json.gz', {}) or {}
     dynamics = (snap.get('board_dynamics') or {}).get('by_id') or {}
     prior = read(ROOT / 'days' / (day + '.json.gz'), {}) or {}
@@ -516,8 +598,13 @@ def build(snap, persist=True, fetch_news=True):
                           up_pct=auction_quote.get('up_pct') if auction_quote.get('ready') else None)
         coverage = len(relay_valid) * 100 / len(members) if members else None
         reliable = len(relay_valid) >= 6 and (coverage or 0) >= 80
-        lane = d.get('lane') or ('ordinary' if reliable else 'pending')
-        status = '竞价参考' if auction else d.get('status') or ('平稳观察' if reliable else '数据待核验')
+        strength = strong_evidence(b, day, reliable, auction, daily_asof)
+        lane = ('priority' if strength['eligible'] and strength['priority'] == 0 else
+                'waiting' if strength['eligible'] and strength['trend'] else
+                'watch' if strength['eligible'] else
+                'cooling' if strength['support'] or strength.get('risk_reason') else
+                'ordinary' if strength.get('asof') else 'pending')
+        status = '竞价参考' if auction else strength['label']
         previous = old_boards.get(identity) or {}
         if same_quote:
             changes = previous.get('changes') or {}
@@ -533,7 +620,7 @@ def build(snap, persist=True, fetch_news=True):
         # Old releases persisted post-close acquisition times as market times.
         # Normalize only the derived timeline; retained source evidence is untouched.
         timeline_by_at = {}
-        for entry in previous.get('timeline') or []:
+        for entry in (previous.get('timeline') or []) if (previous.get('strength') or {}).get('basis') == 'index-trend' else []:
             at = str(entry.get('at') or '')
             if len(at) < 19:
                 continue
@@ -543,7 +630,7 @@ def build(snap, persist=True, fetch_news=True):
             elif not ('09:30:00' <= entry_time <= '11:30:00' or '13:00:00' <= entry_time <= '15:00:00'):
                 continue
             timeline_by_at[at] = dict(entry, at=at)
-        current_at = d.get('source_at') or source_at
+        current_at = strength.get('at') or source_at
         if current_at and str(current_at)[11:19] >= '15:00:00':
             current_at = str(current_at)[:10] + ' 15:00:00'
         earlier = [at for at in timeline_by_at if current_at and at <= current_at]
@@ -560,12 +647,12 @@ def build(snap, persist=True, fetch_news=True):
         broken = [s['code'] for s in relay_valid if s['prior_sealed'] and (s['prior_height'] or 0) >= 2 and not s['sealed']]
         previous_state = (previous_day.get('boards', {}).get(identity) or {}).get('status')
         boards[identity] = dict(id=identity, name=b['name'], type=b['type'], members=members,
-            status=status, lane=lane, tags=d.get('tags') or [], priority=d.get('priority', 9),
-            definition=definition_for(b, definitions), strength=strong_evidence(b, day, reliable, auction),
+            status=status, lane=lane, tags=[] if not strength.get('asof') else ['盘中趋势' if strength['live'] else '完成日趋势'], priority=strength['priority'],
+            definition=definition_for(b, definitions), strength=strength,
             broad=b['type']=='theme' and b['name'] in BROAD_THEMES, size_wide=bool(b.get('wide')),
             role_candidates=role_candidates(rows, auction),
-            reasons=d.get('reasons') or [b.get('ranking_reason') or '按已覆盖主板成员观察，尚无动态确认'],
-            trigger=d.get('trigger') or '等待有效报价与连续观察', invalidate=d.get('invalidate') or '覆盖不足时停止当前判断',
+            reasons=strength['reasons'],
+            trigger=strength['trigger'], invalidate=strength['invalidate'],
             current=metric, change=w, trend_score=(b.get('market_strength') or {}).get('trend_score'),
             return_pct=metric.get('return_pct', b.get('member_today')),
             auction=auction_quote if auction else None,
@@ -580,20 +667,20 @@ def build(snap, persist=True, fetch_news=True):
             logic=links[0]['title'] if links else '暂无可核验的相关快讯；成员表现按行情单独观察。',
             membership_basis=b.get('source_basis') or '同花顺成员归属', membership_at=b.get('source_checked_at'),
             membership_stale=b.get('membership_stale'), index_pct=(b.get('index_current') or {}).get('change_pct'))
+    refine_strengths(boards, (snap.get('board_trend_model') or {}).get('calendar') or [])
     order = sorted(boards, key=lambda identity: (boards[identity]['priority'],
-                   -(boards[identity]['change'].get('excess_pp15') or 0),
-                   -(boards[identity]['change'].get('strong_delta_pp') or 0),
-                   -(boards[identity]['change'].get('speed_pp15') or 0), boards[identity]['name']))
+                   -(boards[identity]['strength'].get('ret5') or 0),
+                   -(boards[identity]['strength'].get('ret20') or 0), boards[identity]['name']))
     counts = dict(Counter(b['lane'] for b in boards.values()))
     journal = dict(version=VERSION, date=day, source_at=source_at, observed_at=observed, mode=mode, formal=formal,
                    boards=boards, stocks=current_stocks, order=order, counts=counts,
                    news={k: news.get(k) for k in ('checked_at', 'last_success_at', 'latest_published_at', 'status', 'errors', 'batch_count', 'scope')},
                    relay_coverage=(snap.get('emotion_relay') or {}).get('coverage') or {},
                    summary=[
-                       dict(label='推进与共振', ids=[i for i in order if boards[i]['lane'] == 'priority'][:4]),
-                       dict(label='转强与局部观察', ids=[i for i in order if boards[i]['lane'] == 'watch'][:4]),
-                       dict(label='整理等待', ids=[i for i in order if boards[i]['lane'] == 'waiting'][:4]),
-                       dict(label='退潮观察', ids=[i for i in order if boards[i]['lane'] == 'cooling'][:4])])
+                       dict(label='趋势推进', ids=[i for i in order if boards[i]['lane'] == 'priority'][:4]),
+                       dict(label='启动观察', ids=[i for i in order if boards[i]['lane'] == 'watch'][:4]),
+                       dict(label='回踩跟踪', ids=[i for i in order if boards[i]['lane'] == 'waiting'][:4]),
+                       dict(label='趋势降级', ids=[i for i in order if boards[i]['lane'] == 'cooling'][:4])])
     if persist and day == now.date().isoformat():
         # Never replace an already verified close with a weaker or older observation.
         if not (prior.get('formal') and not formal) and (not prior or str(source_at) >= str(prior.get('source_at') or '')):
@@ -601,6 +688,6 @@ def build(snap, persist=True, fetch_news=True):
     matrix = {}
     for date, saved in sorted(dict(archives, **{day: journal}).items()):
         matrix[date] = dict(mode=saved['mode'], source_at=saved['source_at'], boards={
-            identity: {k: b.get(k) for k in ('status', 'lane', 'highest', 'limit_count', 'return_pct', 'reliable')}
+            identity: {k: b.get(k) for k in ('status', 'lane', 'highest', 'limit_count', 'return_pct', 'reliable', 'strength')}
             for identity, b in saved['boards'].items()})
     return dict(version=VERSION, current=journal, dates=sorted(matrix, reverse=True), matrix=matrix, archives=archives)

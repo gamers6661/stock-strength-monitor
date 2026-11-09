@@ -29,7 +29,7 @@ assert(card.includes('候选'));
 console.log('PASS: existing strong gate, broad exclusion/search override, exact membership dedup, event classification, complete brief structure');
 
 let exported='';c.bjDownload=(text)=>exported=text;c.BJ_VIEW.q='电机';c.bjCSV();
-assert(exported.includes('龙头候选')&&exported.includes('催化')&&exported.includes('鸣志电器'));
+assert(exported.includes('龙头候选')&&exported.includes('催化')&&exported.includes('鸣志电器')&&exported.includes('趋势起点'));
 console.log('PASS: CSV carries role, definition, event and review fields');
 
 c.BJ_VIEW.q='PCB概念';const pcb=c.bjRows().find(b=>b.name==='PCB概念');
@@ -74,3 +74,31 @@ assert(!c.bjState({status:'比较不足',return_pct:3.39,reliable:true},'收盘�
 for(const s of Object.values(context.stocks))s.quote_at='2026-10-22 15:01:00';
 assert.equal(c.bjMarketLogic(target,context).length,0);
 console.log('PASS: close status uses available close values and excludes future quotes');
+
+const trendBoard=Object.assign({},b,{strength:{basis:'index-trend',eligible:true,trend:true,label:'趋势回踩',priority:1,live:true,episode_start:'2026-10-23',ret5:2},status:'趋势回踩'});
+const trendState=c.bjState(trendBoard,'盘中观察'),review=c.bjReview(trendBoard).join('');
+assert(trendState.includes('趋势回踩')&&!trendState.includes('情绪'));
+assert(review.includes('本轮起点2026-10-23')&&!review.includes('短线情绪'));
+const hotOnly=Object.assign({},b,{strength:{basis:'index-trend',eligible:false,label:'暂未入选',priority:8},return_pct:10});
+assert(c.bjCompare(trendBoard,hotOnly)<0);
+assert(c.bjOverview(c.bjModel()).indexOf('情绪强势')<0);
+console.log('PASS: trend stage, episode start and trend-only eligibility drive board presentation');
+
+const chartInput={code:'886069',bars:[
+ {date:'2026-10-23',open:10,high:12,low:9,close:11,volume:100},
+ {date:'2026-10-28',open:12,high:14,low:11,close:13,volume:200},
+ {date:'2026-10-29',open:13,high:15,low:12,close:14,volume:300}],current_price:13,current_at:'2026-10-28 11:30:00'};
+const frozenChart=c.bjIndexChartData(chartInput,'2026-10-23','2026-10-23 15:00:00',true);
+assert.equal(frozenChart.bars.length,1);assert.equal(frozenChart.asof,'2026-10-23');assert.equal(frozenChart.current_price,null);
+assert.equal(chartInput.bars.length,3);
+assert.equal(c.bjIndexChartData(chartInput,'2026-10-28','2026-10-28 11:20:00',false).current_price,null);
+assert.equal(c.bjIndexChartData(chartInput,'2026-10-28','2026-10-28 11:30:00',false).current_price,13);
+c.bjModel=()=>({});assert(c.bjFilter({strength:{tracked:true,eligible:false}},'tracking'));
+console.log('PASS: direct candle data respects historical date and source cutoff; tracking stays separate from strong selection');
+
+const liveChart={source:'日线源',current_source:'当日OHLC',display_captured_at:'2026-10-28 12:10:00',
+bars:[{date:'2026-10-27',open:10,high:12,low:9,close:11,volume:100},{date:'2026-10-28',open:11,high:13,low:10,close:12,volume:120,partial:true,source_at:'2026-10-28 11:30:00'}],current_at:'2026-10-28 11:30:00',current_price:12};
+assert.equal(c.bjIndexChartData(liveChart,'2026-10-28','2026-10-28 11:29:00',false).bars.length,2);
+const oldDay=c.bjIndexChartData(liveChart,'2026-10-27','2026-10-27 15:00:00',true);
+assert.equal(oldDay.bars.length,1);assert.equal(oldDay.current_source,null);assert.equal(oldDay.current_price,null);
+console.log('PASS: latest unfinished candle keeps source time; historical chart excludes current-day candle');

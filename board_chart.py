@@ -37,7 +37,7 @@ def same_value(left, right):
     return number(left) and number(right) and left > 0 and right > 0 and abs(left-right) <= max(.002, left*.00001)
 
 
-def project(board, bars, captured, calendar=None):
+def project(board, bars, captured, calendar=None, live=None):
     daily = board.get('index_trend') or {}
     code = str(daily.get('code') or '')
     out = dict(code=code, source=daily.get('source') or '同花顺指数', bars=[], current_price=None)
@@ -73,7 +73,23 @@ def project(board, bars, captured, calendar=None):
         out.update(current_price=quote['price'], current_at=quote['quote_at'])
     if selected and selected[-1]['date']<day and day in trading_days and captured.hour*60+captured.minute>=905:
         out.setdefault('reason','最新完成日K待源数据核验；当日指数报价或完整OHLC尚未对齐，暂保留此前完成日线')
-    if not selected:
+    out['completed_asof'] = out['asof']
+    entry = live or {}
+    live_bar = entry.get('bar') or {}
+    source_at, observed = timestamp(live_bar.get('source_at')), timestamp(live_bar.get('observed_at'))
+    if (entry.get('name') == board.get('name') and str(entry.get('code')) == code and valid(live_bar)
+            and live_bar['date'] == day and source_at and observed and source_at <= observed
+            and source_at.date() == captured.date() and observed.date() == captured.date()):
+        confirmed = bool(observed.hour*60+observed.minute >= 905 and source_at.hour >= 15
+                         and comparable and at.hour >= 15 and same_value(live_bar['close'], quote.get('price')))
+        candle = {k: live_bar[k] for k in ('date', 'open', 'high', 'low', 'close', 'volume')}
+        candle.update(partial=not confirmed, source_at=str(source_at))
+        out['bars'] = ([b for b in out['bars'] if b['date'] < day] + [candle])[-80:]
+        out.update(asof=day, completed_asof=day if confirmed else out['completed_asof'],
+                   current_price=None if confirmed else candle['close'], current_at=str(source_at),
+                   display_captured_at=str(observed), current_source='同花顺指数当日OHLC today.js')
+        out.pop('reason', None)
+    if not out['bars']:
         out.setdefault('reason', '暂无可用的同花顺指数OHLC历史')
     return out
 
@@ -165,12 +181,100 @@ def fetch_today(code, day):
     date=datetime.strptime(str(row.get('1')),'%Y%m%d').date().isoformat()
     if date!=day:raise ValueError('当日指数OHLC日期未对齐')
     bar=dict(date=date,open=float(row['7']),high=float(row['8']),low=float(row['9']),
-             close=float(row['11']),volume=float(row['13']),amount=float(row.get('19') or 0))
+             close=float(row['11']),volume=float(row['13']),amount=float(row.get('19') or 0),
+             source_clock=str(row.get('dt') or ''), observed_at=datetime.now().isoformat(sep=' ',timespec='seconds'))
     if not valid(bar):raise ValueError('当日指数完整OHLC校验未通过')
     return row.get('name'),bar
 
 
-def attach(full, path=None, refresh=False, cache_path=None):
+def market_time(at):
+    """Normalize a quote clock to its trading time, preserving idle-time boundaries."""
+    minute = at.hour*60 + at.minute
+    if minute < 570:
+        return None
+    if 690 < minute < 780:
+        return at.replace(hour=11, minute=30, second=0, microsecond=0)
+    if minute >= 900:
+        return at.replace(hour=15, minute=0, second=0, microsecond=0)
+    return at.replace(second=0, microsecond=0)
+
+
+def live_candles(boards, captured, fetch=False, cache_path=None, fetcher=None, now=None):
+    """Acquire real current-day OHLC once per publication, with a bounded fanout."""
+    now = now or datetime.now()
+    target = cache_path or config.CACHE_DIR/'board_chart_live.json'
+    meta = dict(attempted=0,available=0,failed=0,deferred=0)
+    day = captured.date().isoformat()
+    try:
+        cache = json.loads(target.read_text(encoding='utf-8'))
+    except (OSError,ValueError):
+        cache = {}
+    if cache.get('date') != day:
+        cache = dict(date=day,items={})
+    items = cache.setdefault('items', {})
+    expected = market_time(now) if now.date() == captured.date() else None
+    needed = []
+    for board in boards:
+        code = str((board.get('index_trend') or {}).get('code') or '')
+        if not code:
+            continue
+        entry = items.get(code) or {}
+        bar = entry.get('bar') or {}
+        source_at, observed = timestamp(bar.get('source_at')), timestamp(bar.get('observed_at'))
+        usable = (entry.get('name') == board['name'] and valid(bar) and bar.get('date') == day
+                  and source_at and observed and source_at <= observed <= now)
+        if not usable:
+            items.pop(code, None)
+        complete_recheck = bool(usable and expected and expected.hour == 15 and now.hour*60+now.minute >= 905
+                                and observed.hour*60+observed.minute < 905)
+        if fetch and expected and (not usable or source_at < expected or complete_recheck):
+            needed.append(board)
+    if needed:
+        needed.sort(key=lambda b:(not (b.get('index_current') or {}).get('strong_advance'), not (b.get('index_current') or {}).get('priority_observation'), b['name']))
+        acquire = fetcher or fetch_today
+        def work(board):
+            code = str(board['index_trend']['code'])
+            name, bar = acquire(code, day)
+            if name != board['name'] or not valid(bar) or bar.get('date') != day:
+                raise ValueError('当日指数代码、名称或OHLC未对齐')
+            observed = timestamp(bar.get('observed_at')) or now
+            clock = str(bar.get('source_clock') or '')
+            if not re.fullmatch(r'\d{4}', clock):
+                raise ValueError('当日OHLC缺少源时间')
+            raw_at = datetime.strptime(day+' '+clock, '%Y-%m-%d %H%M')
+            if raw_at > observed or observed > datetime.now() or observed.date() != captured.date():
+                raise ValueError('当日OHLC源时间超前或日期不一致')
+            source_at = market_time(raw_at)
+            if source_at is None:
+                raise ValueError('当日OHLC尚无交易时点')
+            return code,dict(name=name,code=code,bar=dict(bar,source_at=str(source_at),observed_at=str(observed)))
+        pool = ThreadPoolExecutor(max_workers=8)
+        futures = [pool.submit(work,b) for b in needed]
+        finished = 0
+        try:
+            for future in as_completed(futures, timeout=25):
+                finished += 1
+                meta['attempted'] += 1
+                try:
+                    code,entry = future.result()
+                    old = items.get(code) or {}
+                    if (entry['bar']['source_at'] >= (old.get('bar') or {}).get('source_at','')):
+                        items[code] = entry
+                except Exception:
+                    meta['failed'] += 1
+        except FuturesTimeoutError:
+            pass
+        finally:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=finished == len(futures))
+        meta['deferred'] = len(needed)-finished
+        config.atomic_write_text(target,json.dumps(cache,ensure_ascii=False,separators=(',',':')))
+    meta['available'] = len(items)
+    return items,meta
+
+
+def attach(full, path=None, refresh=False, cache_path=None, live_cache_path=None):
     """Freeze chart evidence into each detail, preserving all quantitative models."""
     captured = timestamp(full.get('quote_capture_at') or full.get('generated_at'))
     boards = full.get('board_catalog') or []
@@ -189,8 +293,10 @@ def attach(full, path=None, refresh=False, cache_path=None):
         except sqlite3.Error:
             pass
     repair=repair_completed(boards,histories,captured,cache_path,fetch=refresh and full.get('session')=='已收盘') if captured else {}
+    live, live_meta = live_candles(boards,captured,fetch=refresh,cache_path=live_cache_path) if captured else ({},{})
+    repair['live'] = live_meta
     result = dict(full)
     calendar = (full.get('board_trend_model') or {}).get('calendar') or []
-    result['board_catalog'] = [dict(b, index_chart=project(b, histories.get(str((b.get('index_trend') or {}).get('code')), []), captured, calendar)) for b in boards]
+    result['board_catalog'] = [dict(b, index_chart=project(b, histories.get(str((b.get('index_trend') or {}).get('code')), []), captured, calendar, live.get(str((b.get('index_trend') or {}).get('code'))))) for b in boards]
     result['board_chart_refresh']=repair
     return result

@@ -1,4 +1,4 @@
-import copy,unittest
+import copy,sqlite3,unittest
 from datetime import datetime
 from unittest.mock import patch
 import datafeed,intraday,ma_trend,make_dashboard,relay_relations,relay_history as H,emotion_relay as E
@@ -36,6 +36,30 @@ class ObservedHistory(unittest.TestCase):
         for key,value in [('price_basis_source','unknown'),('close',0)]:
             bars=history();cal=[b['date'] for b in bars];bars.pop(8);bars[-1][key]=value
             self.assertFalse(intraday.align_price_basis(quote(),bars,cal,'2026-09-28')['valid'])
+
+class ChartCoverage(unittest.TestCase):
+    def test_inline_limit_does_not_skip_latest_detail_candles(self):
+        bars=history();day=bars[-1]['date']
+        for limit in (0,1):
+            with self.subTest(inline_limit=limit),sqlite3.connect(':memory:') as conn:
+                conn.execute('CREATE TABLE kline(date TEXT)')
+                conn.execute('INSERT INTO kline VALUES(?)',(day,))
+                stocks=[dict(code=c,strength_history=copy.deepcopy(bars[:-1])) for c in ('a','b')]
+                coverage=[dict(code='c',strength_history=copy.deepcopy(bars[:-1]))]
+                snap=dict(stocks=stocks,coverage_catalog=coverage,quote_capture_at=day+' 16:00:00',
+                          strength_model=dict(asof=day))
+                with patch.object(datafeed,'load_kline',return_value=bars) as load:
+                    make_dashboard._attach_klines(snap,limit,conn)
+                self.assertEqual([call.args[3] for call in load.call_args_list],['a','b','c'])
+                for row in stocks+coverage:
+                    self.assertEqual(row['chart_history'][-1]['date'],day)
+                    self.assertEqual(row['chart_source'],'completed_daily_history')
+                self.assertEqual('k' in stocks[-1],False)
+
+    def test_display_history_still_stops_at_verified_completed_day(self):
+        bars=history();asof=bars[-2]['date'];row={}
+        self.assertTrue(make_dashboard.attach_completed_candles(row,bars,asof))
+        self.assertEqual(row['chart_history'][-1]['date'],asof)
 
 class MainBusinessRelations(unittest.TestCase):
     def test_incidental_concepts_do_not_link_ice_machine_to_media_or_feed(self):

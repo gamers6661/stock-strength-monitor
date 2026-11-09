@@ -78,6 +78,7 @@ INIT = {
 SNAPSHOT_META = {
     "snapshot_generated_at": None, "snapshot_scan_completed_at": None,
     "snapshot_quote_capture_at": None, "snapshot_daily_asof": None,
+    "snapshot_close_daily_pending": None,
     "snapshot_latest_valid_quote_at": None,
     "snapshot_latest_intraday_judgment_at": None, "snapshot_intraday_observation_quotes": None,
     "snapshot_intraday_valid_quotes": None, "snapshot_auction_quote_count": None,
@@ -164,6 +165,7 @@ def publish_outputs(snapshot=None, reuse_page=False):
                 "snapshot_scan_completed_at": snapshot.get("scan_completed_at"),
                 "snapshot_quote_capture_at": snapshot.get("quote_capture_at"),
                 "snapshot_daily_asof": (snapshot.get("strength_model") or {}).get("asof"),
+                "snapshot_close_daily_pending": (snapshot.get("close_daily_coverage") or {}).get("pending_count"),
                 "snapshot_close_board_asof": (snapshot.get('close_strong_board') or {}).get('asof'),
                 "snapshot_close_refresh_version": snapshot.get('close_refresh_version'),
                 "snapshot_close_daily_verified_at": snapshot.get('close_daily_verified_at'),
@@ -285,9 +287,43 @@ def pick_mode(now=None, snapshot=None):
     """收盘正式榜未完成时更新一次；完成后不重复拉全量历史。"""
     now = now or datetime.now()
     hm = now.hour * 60 + now.minute
-    if now.weekday() < 5 and hm >= 15 * 60 + 5 and not close_review_done(now, snapshot):
+    coverage = _close_daily_coverage(snapshot)
+    same_day_pending = (coverage is not None
+                        and coverage[0] == now.date().isoformat()
+                        and coverage[1] > 0)
+    if (now.weekday() < 5 and hm >= 15 * 60 + 5
+            and (not close_review_done(now, snapshot) or same_day_pending)):
         return "close"
     return "quick"
+
+
+def automatic_close_retry_allowed(now, mode, trading_evidence):
+    """Automatic close retries run at the existing cadence, with a 16-18 evidence gate."""
+    if mode != 'close' or now.hour >= 18:
+        return False
+    if now.hour >= 16:
+        return bool(trading_evidence)
+    return True
+
+
+def _close_daily_coverage(snapshot=None):
+    """Return same-snapshot daily coverage; None preserves legacy snapshot behavior."""
+    if snapshot is None:
+        pending = SNAPSHOT_META.get('snapshot_close_daily_pending')
+        asof = SNAPSHOT_META.get('snapshot_daily_asof')
+    else:
+        coverage = snapshot.get('close_daily_coverage') or {}
+        if 'pending_count' not in coverage:
+            return None
+        pending = coverage.get('pending_count')
+        asof = coverage.get('asof')
+    if pending is None or asof is None:
+        return None
+    try:
+        pending = int(pending)
+    except (TypeError, ValueError):
+        return None
+    return asof, pending
 
 
 @config.single_writer
@@ -306,6 +342,7 @@ def scan_and_publish(mode, **kwargs):
         scan_seconds = time.monotonic()-started
         scan_cache.PROGRESS.update(active=True, stage='页面发布')
         publish_outputs(snapshot)
+        INIT['last_scan_note'] = None
         quote_model=snapshot.get('intraday_model') or {}
         source_at = intraday.parse_quote_timestamp(quote_model.get('auction_latest_quote_at')
             if snapshot.get('session') in ('集合竞价','竞价结束') else
@@ -447,7 +484,11 @@ def refresh_loop(interval, always=False):
             mode = pick_mode()
             if not always and (now.hour, now.minute) in ((9, 15), (9, 20), (9, 25), (9, 30), (11, 30), (13, 0), (15, 0)):
                 continue  # 收市节点交给定点任务，避免与常规刷新重叠
-            if not trading and not always and (mode == "quick" or now.hour >= 16):
+            if (not always and mode == 'close' and not automatic_close_retry_allowed(
+                    now, mode, boundary_trading_evidence(now))):
+                print(f"[LOOP] {datetime.now():%H:%M:%S} 收盘补齐窗口关闭，跳过")
+                continue
+            if not trading and not always and mode == "quick":
                 print(f"[LOOP] {datetime.now():%H:%M:%S} 非交易时段，跳过")
                 continue
 
@@ -594,8 +635,7 @@ def init_worker():
                 matches = False
             INIT["needs_model_refresh"] = not matches
             now = datetime.now()
-            close_pending = (now.weekday() < 5 and now.hour*60+now.minute >= 15*60+5
-                             and not close_review_done(now, snapshot if matches else {}))
+            close_pending = pick_mode(now, snapshot) == 'close'
             if not matches or close_pending or scoring.df.session_label(now)=='盘前':
                 print("[INIT] 本地快照与已加载模型不一致，先完成一次新版扫描 ...")
                 scan_and_publish(mode=pick_mode(now, snapshot) if config.SNAPSHOT_JSON.exists() else "full")

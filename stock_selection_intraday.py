@@ -2,6 +2,7 @@
 import gzip
 import json
 import sqlite3
+import logging
 from datetime import datetime
 from statistics import median
 from pathlib import Path
@@ -21,6 +22,7 @@ def update_history(calendar,now=None):
     days=[d for d in calendar if d<str(now.date()) or d==str(now.date()) and now.hour>=16][-R['same_time_reference_days']:]
     folder=path();folder.parent.mkdir(parents=True,exist_ok=True)
     db=sqlite3.connect(folder)
+    db.execute('PRAGMA journal_mode=WAL')
     db.execute('CREATE TABLE IF NOT EXISTS volumes(day TEXT,second INTEGER,code TEXT,volume REAL,PRIMARY KEY(day,second,code))')
     db.execute('CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER,mtime INTEGER)')
     inserted=0;processed=[]
@@ -64,24 +66,33 @@ def attach(model,source,calendar):
             continue
         if live.get('available') and at and str(at.date())==day:
             targets[code]=at.hour*3600+at.minute*60+at.second
-    references={}
+    references={};history_error=None
     if targets and path().exists() and len(expected)==R['same_time_reference_days']:
-        con=sqlite3.connect('file:'+path().as_posix()+'?mode=ro',uri=True)
         try:
-            placeholders=','.join('?' for _ in expected);tolerance=R['same_time_tolerance_seconds']
-            query='SELECT day,second,code,volume FROM volumes WHERE day IN ('+placeholders+') AND second BETWEEN ? AND ?'
-            for d,second,code,volume in con.execute(query,expected+[min(targets.values())-tolerance,max(targets.values())+tolerance]):
-                target=targets.get(code)
-                if target is None or abs(second-target)>tolerance:continue
-                key=(code,d);order=(abs(second-target),second)
-                if key not in references or order<references[key][0]:references[key]=(order,volume,second)
-        finally:con.close()
+            con=sqlite3.connect('file:'+path().as_posix()+'?mode=ro',uri=True)
+            try:
+                placeholders=','.join('?' for _ in expected);tolerance=R['same_time_tolerance_seconds']
+                query='SELECT day,second,code,volume FROM volumes WHERE day IN ('+placeholders+') AND second BETWEEN ? AND ?'
+                for d,second,code,volume in con.execute(query,expected+[min(targets.values())-tolerance,max(targets.values())+tolerance]):
+                    target=targets.get(code)
+                    if target is None or abs(second-target)>tolerance:continue
+                    key=(code,d);order=(abs(second-target),second)
+                    if key not in references or order<references[key][0]:references[key]=(order,volume,second)
+            finally:con.close()
+        except sqlite3.Error as exc:
+            references={}
+            history_error=type(exc).__name__+': '+str(exc)[:160]
+            logging.warning('同时间成交量历史读取失败，仅暂停量比观察：%s',history_error)
+            model['same_time_volume_error']=history_error
     for code in targets:
         live=model['items'][code]['intraday']
         samples=[(d,references[(code,d)][1],references[(code,d)][2]) for d in expected if (code,d) in references]
         live['same_time_reference_days']=len(samples)
         live['same_time_reference_samples']=samples
         volume=rows[code].get('volume_shou')
+        if history_error:
+            live['same_time_volume_reason']='历史累计量暂不可用，暂停量比判断'
+            continue
         if len(samples)==R['same_time_reference_days'] and S.number(volume) and volume>0:
             base=median(v for _,v,_ in samples)
             live.update(volume_ratio_same_time=volume/base,same_time_reference_volume=base,

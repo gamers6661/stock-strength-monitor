@@ -151,6 +151,7 @@ def update(conn, codes, quotes, required_day=None, force=False, progress=True, b
     timed_out = False
     full_due = []
     got_all, adjustment_pending = {}, set()
+    cooldown_deferred = set()
     fetch_states = {}
     full_days=max(config.KLINE['days'],max((counts.get(c,0)+20 for c in selected_periodic),default=0))
     for batch, days in ((incremental, config.KLINE.get('increment_days', 20)),
@@ -163,6 +164,9 @@ def update(conn, codes, quotes, required_day=None, force=False, progress=True, b
         fetch_states.update(getattr(got, 'fetch_states', {}))
         timed_out = timed_out or truncated
         for code in batch:
+            if (fetch_states.get(code) or {}).get('kind') == 'source_cooldown':
+                cooldown_deferred.add(code)
+                continue
             rows = [b for b in (got.get(code) or []) if b['date'] < today or b['date'] == today and closed]
             old = df.load_kline(conn, 'kline', 'code', code)
             if not rows or not valid_source(rows) or (target and rows[-1]['date'] < target
@@ -191,6 +195,9 @@ def update(conn, codes, quotes, required_day=None, force=False, progress=True, b
         fetch_states.update(getattr(got, 'fetch_states', {}))
         timed_out = timed_out or truncated
         for code in full_due:
+            if (fetch_states.get(code) or {}).get('kind') == 'source_cooldown':
+                cooldown_deferred.add(code)
+                continue
             rows = [b for b in (got.get(code) or []) if b['date'] < today or b['date'] == today and closed]
             old = old_series[code]
             if (not rows or not valid_source(rows)
@@ -233,7 +240,9 @@ def update(conn, codes, quotes, required_day=None, force=False, progress=True, b
             (code, now, now+min(1800, 30*2**min(failures-1, 6)), failures, json.dumps(meta)))
     conn.commit()
     result = dict(version=VERSION, required_day=target, requested=requested, changed_rows=changed,
-                  failed=len(set(failed)), full_repairs=len(upgraded), deferred=pending,truncated=timed_out,
+                  failed=len(set(failed)), full_repairs=len(upgraded),
+                  deferred=pending+len(cooldown_deferred), source_cooldown=len(cooldown_deferred),
+                  truncated=timed_out,
                   integrity_pending=len((({c for c in codes if states.get(c,(0,0,0,{}))[3].get('integrity_pending')}
                                           |adjustment_pending)-set(got_all))))
     print('[KLINE] 增量：' + json.dumps(result, ensure_ascii=False))

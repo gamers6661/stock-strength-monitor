@@ -691,15 +691,22 @@ def rank_themes(theme_groups, min_members=5, max_members=None, top=30,
 # ─────────────────────────────────────────────────────
 # K线获取（缓存 + 实时覆盖）
 # ─────────────────────────────────────────────────────
-def validate_close_daily(klines, quotes, now):
+def validate_close_daily(klines, quotes, now, coverage=None):
     """正式榜发布前检查真实日线日期、OHLC和活跃股票覆盖，不采用报价合成K。"""
     if now.hour * 60 + now.minute < 15 * 60 + 5:
         raise DataNotReady('15:05前不能把当日日线判定为正式收盘')
     target = now.strftime('%Y-%m-%d')
     active_codes = [c for c, q in quotes.items()
                     if num(q.get('amount_wan')) > 0 or num(q.get('volume_shou')) > 0]
-    ready = sum(bool(klines.get(c)) and klines[c][-1]['date'] == target
-                and strength.valid_bars(klines[c][-1:]) for c in active_codes)
+    ready_codes = [c for c in active_codes
+                   if bool(klines.get(c)) and klines[c][-1]['date'] == target
+                   and strength.valid_bars(klines[c][-1:])]
+    ready = len(ready_codes)
+    if coverage is not None:
+        ready_set = set(ready_codes)
+        pending_codes = sorted(c for c in active_codes if c not in ready_set)
+        coverage.update(asof=target, active_count=len(active_codes), ready_count=ready,
+                        pending_count=len(pending_codes), pending_codes=pending_codes)
     if not active_codes or ready < len(active_codes) * 0.8:
         raise DataNotReady(f'正式收盘日线仅覆盖 {ready}/{len(active_codes)} 只，保留上一份收盘榜并稍后重试')
     return ready
@@ -1105,7 +1112,9 @@ def _run(mode, rebuild_pool, progress, boundary, resources, board_quote_future=N
     timer.mark("正式日线增量", "个股计算")
     snap['kline_acquisition'] = kline_telemetry
     if mode == "close":
-        validate_close_daily(klines, quotes, scan_started_at)
+        close_daily_coverage = {}
+        validate_close_daily(klines, quotes, scan_started_at, coverage=close_daily_coverage)
+        snap['close_daily_coverage'] = close_daily_coverage
         snap['close_daily_verified_at'] = datetime.now().isoformat(sep=' ', timespec='seconds')
 
     # 7. 个股因子（V3：先过 Risk Gate，再分别计算短线启动与波段模型）

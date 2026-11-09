@@ -17,7 +17,7 @@ function msRelations(code){
  return MS_REL[code]||[];
 }
 function msMatchDirections(r,key){var v=MS_VIEW[key||'stocks'],relations=msRelations(r.code).map(function(b){return b.id;});
- return (!v.industryIds.length||v.industryIds.some(function(id){return relations.indexOf(id)>=0;}))&&(!v.themeIds.length||v.themeIds.some(function(id){return relations.indexOf(id)>=0;}));
+ return v.industryIds.concat(v.themeIds).every(function(id){return relations.indexOf(id)>=0;});
 }
 function msRows(key,axis){
  if(key==='radar')return mtRows();
@@ -68,7 +68,7 @@ function msTools(key){if(key==='stocks'&&DATA.stock_board_ranking)return msRankT
  h+=msSelect('phase',[['','全部个性标签'],['新进入强势','新进入强势'],['突破','突破'],['再启动','再启动'],['趋势推进','趋势推进'],['回踩整理','回踩整理'],['情绪进攻','情绪进攻'],['明显回落','明显回落']],key,'个性标签')+'<input aria-label="强势搜索" placeholder="代码 / 名称" value="'+esc(v.q)+'" data-ms-search-key="'+key+'" data-ms-search-field="q" oninput="msSearchInput(event,this,\''+key+'\',\'q\')"><button class="btn" onclick="msCSV(\''+key+'\')">导出当前结果 CSV</button></div>';return h;
 }
 function msDirectionPicker(key){key=key||'stocks';var v=MS_VIEW[key],selected=v.industryIds.concat(v.themeIds),q=v.boardQuery||'';
- var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺官方板块 · 确认成员 · 同类多选取并集，行业与题材取交集</p></div><button class="btn ms-clear-button" onclick="msClearDirections(\''+key+'\')">清除方向</button></div><div class="ms-direction-search-wrap"><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" data-ms-search-key="'+key+'" data-ms-search-field="boardQuery" oninput="msSearchInput(event,this,\''+key+'\',\'boardQuery\')"></div>';
+ var h='<section class="card ms-direction-picker"><div class="ms-section-head"><div><h3>按板块 / 题材选股</h3><p class="ms-muted">同花顺官方板块 · 确认成员 · 多选取交集 · 股票须同时属于所有已选方向</p></div><button class="btn ms-clear-button" onclick="msClearDirections(\''+key+'\')">清除方向</button></div><div class="ms-direction-search-wrap"><input class="ms-direction-search" aria-label="搜索板块题材" placeholder="搜索行业或题材名称" value="'+esc(q)+'" data-ms-search-key="'+key+'" data-ms-search-field="boardQuery" oninput="msSearchInput(event,this,\''+key+'\',\'boardQuery\')"></div>';
  h+='<div class="ms-selected-directions">'+(selected.length?selected.map(function(id){var b=boardById(id);return '<button class="ms-chip selected" onclick="msToggleBoard(\''+jsq(id)+'\',\''+key+'\')">'+esc(b?b.name:id)+' ×</button>';}).join(''):'<span class="ms-muted">未选择方向 · 按当前筛选范围展示股票</span>')+'</div>';
  h+='<details class="ms-direction-browser" '+(q||v.browseOpen?'open':'')+'><summary onclick="MS_VIEW[\''+key+'\'].browseOpen=!this.parentNode.open">浏览行业 / 题材 <span>展开目录</span></summary><div class="ms-direction-browser-content">';
  ['industry','theme'].forEach(function(kind){var rows=msBoardCatalog().filter(function(b){return b.type===kind&&(!q||b.name.indexOf(q)>=0);}),rank=((msModel().boards||{}).sorts||{}).trend||[],order={};rank.forEach(function(id,i){order[id]=i;});rows.sort(function(a,b){return (order[a.id]==null?1e9:order[a.id])-(order[b.id]==null?1e9:order[b.id]);});

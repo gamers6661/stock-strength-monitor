@@ -74,3 +74,7 @@ Thumbs.db
 # Local source snapshots retained for rollback
 /research/perf_p0_20261020/before_p*/
 /research/stock_selection_optimize_20261022/before-publication-fix/
+
+# Local rollback snapshots from turning-model work
+/research/stock_turning_20261028/before-event-policy-fix.py
+/research/stock_turning_20261028/before-ui-simplification/

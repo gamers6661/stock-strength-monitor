@@ -13,12 +13,12 @@ import config
 import intraday
 import market_strength
 import stock_selection_data as amounts
-from stock_selection_rules import RULES as R, VERSION
+from stock_selection_rules import RULES as R, QUALITY, VERSION
 
 _LOCK=threading.RLock()
 _DAILY_METRICS = {}
 IMPLEMENTATION_HASH=hashlib.sha256(Path(__file__).read_bytes()+Path(amounts.__file__).read_bytes()+
-    Path(__file__).with_name('stock_selection_rules.py').read_bytes()+Path(__file__).with_name('stock_selection_rollout.py').read_bytes()+Path(__file__).with_name('stock_selection_intraday.py').read_bytes()+Path(__file__).with_name('stock_selection_factors.py').read_bytes()).hexdigest()[:20]
+    Path(__file__).with_name('stock_selection_rules.py').read_bytes()+Path(__file__).with_name('stock_selection_rollout.py').read_bytes()+Path(__file__).with_name('stock_selection_intraday.py').read_bytes()+Path(__file__).with_name('stock_selection_factors.py').read_bytes()+Path(__file__).with_name('stock_selection_turning.py').read_bytes()+Path(__file__).with_name('stock_selection_quality.py').read_bytes()).hexdigest()[:20]
 
 
 def number(v):
@@ -102,7 +102,11 @@ def base_metrics(bs,records):
                       for n,cut in zip(R['periods'],R['advance_min']))
     has_advance=prior_advance or any(returns[str(n)]>=cut for n,cut in zip(R['periods'],R['advance_min']))
     retention=100*(.5*(1-clip(dd/3.5))+.5*(1-retrace)) if has_advance else 0.
-    price=.50*advance+.25*persistence+.25*retention
+    from stock_selection_quality import assess
+    quality=assess(bs,atr,retention,has_advance,QUALITY)
+    quality["advance_before_quality"]=advance
+    advance*=quality["impulse_multiplier"];retention=quality["retention"]
+    price=(.50*advance+.25*persistence+.25*retention)*quality["damage_multiplier"]
     from stock_selection_factors import price_observations
     observed=price_observations(bs)
     volume_valid=all(number(b.get('volume')) and b['volume']>0 for b in bs[-26:])
@@ -110,22 +114,16 @@ def base_metrics(bs,records):
         return dict(returns=returns,atr=atr,advance=advance,persistence=persistence,retention=retention,
             price=price,volume=None,has_advance=has_advance,prior_advance=prior_advance,
             drawdown_atr=dd,retrace=retrace,effective_up_days=effective,close=last['close'],
-            median_amount=None,amount_days=0,amount_source=None,volume_valid=False,**observed)
+            median_amount=None,amount_days=0,amount_source=None,volume_valid=False,quality=quality,**observed)
     vbase=median(b['volume'] for b in bs[-21:-1]);vr=last['volume']/vbase
     pairs=list(zip(bs[-11:-1],bs[-10:]))
     up=[b['volume']/vbase for a,b in pairs if b['close']>a['close']]
     down=[b['volume']/vbase for a,b in pairs if b['close']<a['close']]
-    asym=100*clip((mean(up)/mean(down))/2) if up and down else None
-    # Without down-day comparison use actual up-volume participation, never full asymmetry credit.
-    participation=asym if asym is not None else scale(mean(up),2.) if up else 0.
-    volume_reference='涨跌量能对照' if asym is not None else '上涨量能相对历史中位数；无下跌日对照' if up else '无上涨量能确认'
+    participation=quality['volume_participation']
+    asym=None
+    volume_reference='量价方向：涨跌幅、开盘到收盘结果与收盘位置；近期加权'
     clv=lambda b:(b['close']-b['low'])/(b['high']-b['low']) if b['high']>b['low'] else .5
-    outcomes=[]
-    for a,b in pairs:
-        rv=b['volume']/vbase;move=(b['close']-a['close'])/atr
-        # 放量滞涨与收盘低落会降低结果分；没有放量不伪造主动买盘。
-        outcomes.append(100*clip(.5+.3*clip(move,-1,1)+.2*(2*clv(b)-1)-.2*max(0.,rv-1)*float(move<=.1)))
-    result=mean(outcomes)
+    result=quality['volume_result']
     contraction=mean(b['volume'] for b in bs[-5:])/mean(b['volume'] for b in bs[-10:-5])
     narrowing=mean(b['high']-b['low'] for b in bs[-5:])/max(mean(b['high']-b['low'] for b in bs[-20:-5]),1e-9)
     prior_support=min(b['low'] for b in prior[-5:])-R['support_buffer_atr']*atr
@@ -151,12 +149,12 @@ def base_metrics(bs,records):
         range_contraction=narrowing,volume_ratio=vr,clv=clv(last),drawdown_atr=dd,retrace=retrace,
         effective_up_days=effective,high20=peak,low20=low,close=last['close'],
         median_amount=median(verified) if complete else None,amount_days=sum(v is not None for v in verified),
-        amount_source=' / '.join(sorted(s for s in amount_sources if s)) if complete else None,**observed)
+        amount_source=' / '.join(sorted(s for s in amount_sources if s)) if complete else None,quality=quality,**observed)
 
 
 def daily_metrics(code, bars, records):
     # Full historical content and rules invalidate this pure completed-day cache.
-    key = hashlib.sha256(json.dumps([bars, records, R], sort_keys=True,
+    key = hashlib.sha256(json.dumps([bars, records, R, QUALITY], sort_keys=True,
         ensure_ascii=False, separators=(',', ':')).encode()).digest()
     cached = _DAILY_METRICS.get(code)
     if cached is None or cached[0] != key:
@@ -262,7 +260,7 @@ def live_status(row,bs,calendar,anchor,frames,now,formal=False,snap=None,complet
     out['held_seconds']=(at-tail[-1][0]).total_seconds() if tail else 0
     out['breakout_pending']=price>=threshold
     out['breakout_price']=threshold
-    out['state']=('价格突破待量价确认' if formal else '突破守稳待收盘' if out['held'] else '瞬时突破待确认') if out['breakout_pending'] else '转弱' if ret<=R['live_weak_pct'] and openret<0 else '分歧' if retreat>=2 else '增强' if ret>0 and openret>0 and retreat<1.5 else '整理' if ret<0 else '保持'
+    out['state']='转弱' if ret<=R['live_weak_pct'] else ('价格突破待量价确认' if formal else '突破守稳待收盘' if out['held'] else '瞬时突破待确认') if out['breakout_pending'] else '分歧' if retreat>=2 else '增强' if ret>0 and openret>0 and retreat<1.5 else '整理' if ret<0 else '保持'
     if formal and completed_breakout_confirmed and out['state']!='转弱':out['state']='突破收盘确认'
     out['completed_breakout_confirmed']=bool(formal and completed_breakout_confirmed and out['state']!='转弱')
     if proof:out['completed_daily_proof']=proof
@@ -289,6 +287,30 @@ def fund_summary(record,calendar,asof):
         out['label']='完成日净流入' if out['main_net']>0 else '完成日净流出' if out['main_net']<0 else '完成日净额为零'
         out['reason']=None
     return out
+
+
+def repair_observation(bs, metrics, excess, live, liquid, relative):
+    """Completed-day repair evidence; never upgrades current strong eligibility."""
+    last=bs[-1]; recent=bs[-5:]
+    up=sum(b['close']>a['close'] for a,b in zip(bs[-6:-1],recent))
+    local_high=max(b['high'] for b in bs[-6:-1])
+    local_drawdown=max(0.,max(b['high'] for b in recent)-last['close'])/metrics['atr']
+    support=min(b['low'] for b in recent)
+    checks=[dict(name='5日推进%',actual=metrics['returns']['5'],threshold=R['repair_return5'],passed=metrics['returns']['5']>=R['repair_return5']),
+        dict(name='5日市场超额百分点',actual=excess['5'],threshold=R['repair_excess5'],passed=relative is not None and excess['5']>=R['repair_excess5']),
+        dict(name='5日上涨天数',actual=up,threshold=R['repair_up_days'],passed=up>=R['repair_up_days']),
+        dict(name='完成日突破此前5日高点',actual=last['close'],threshold=local_high,passed=last['close']>local_high),
+        dict(name='完成日相对历史量',actual=metrics['volume_ratio'],threshold=R['repair_volume_ratio'],passed=metrics['volume_ratio']>=R['repair_volume_ratio']),
+        dict(name='完成日收盘位置',actual=metrics['clv'],threshold=R['repair_clv'],passed=metrics['clv']>=R['repair_clv']),
+        dict(name='短期高点回撤ATR上限',actual=local_drawdown,threshold=R['repair_drawdown_atr'],passed=local_drawdown<=R['repair_drawdown_atr']),
+        dict(name='长期结构仍待修复',passed=metrics['returns']['20']<=0 or metrics['drawdown_atr']>R['repair_drawdown_atr']),
+        dict(name='真实流动性',passed=liquid)]
+    historical=all(c['passed'] for c in checks)
+    # Current disagreement remains visible, but invalid quotes or broken support cannot enter.
+    available=live.get('available') is True
+    return dict(historical=historical,qualified=historical and available,
+        support=support,checks=checks,order=[round(excess['5'],4),round(metrics['returns']['5'],4),round(metrics['clv'],4)],
+        note='完成日短期修复证据；非确认强势，今日状态独立展示；研究初值未验证收益')
 
 
 def build(snap,histories,calendar,previous=None,amount_records=None,frames=None,now=None):
@@ -469,6 +491,18 @@ def build(snap,histories,calendar,previous=None,amount_records=None,frames=None,
             if m['list_name']!='excluded':m['list_name']='pending'
             m['data_status']='当前成交待核验'
             m['reasons'].append('当前报价或真实成交不可核验；保留完成日强度，暂停当前入选')
+        repair=repair_observation(bs,x,excess,m['intraday'],liquid,relative)
+        current_support=repair['support']*m['intraday'].get('basis_scale',1.)
+        repair['qualified']=bool(repair['qualified'] and number(row.get('price')) and row['price']>=current_support
+            and m['intraday'].get('state') not in ('结构失守','转弱') and not support_lost)
+        repair['current_support']=current_support
+        m['repair_observation']=repair
+        m['observation_only']=bool(repair['qualified'] and not m['eligible'])
+        m['startup_order']=repair['order']
+        if m['observation_only']:
+            m['list_name']='repair';m['pattern']='短期修复转强观察'
+            m['reasons']=[r for r in m['reasons'] if r!='未满足持续推进、突破或强势整理路径']
+            m['reasons'].append('短期修复路径通过；尚未满足原有强势路径，今日状态单独判断')
         from stock_selection_factors import pattern_order
         m['pattern_order']=pattern_order(m)
         if m['eligible']:m['reasons'].append(m['pattern']+'路径通过；价格、相对强度和量价分别可核验')
@@ -478,10 +512,10 @@ def build(snap,histories,calendar,previous=None,amount_records=None,frames=None,
                       last_strong_at=asof if sustained or breakout else last_strong)
     order=sorted(items,key=lambda c:(items[c]['score'] is None,-(items[c]['score'] or 0),c))
     for i,c in enumerate([c for c in order if items[c]['score'] is not None],1):items[c]['rank']=i+0
-    counts={k:sum(m['list_name']==k for m in items.values()) for k in ('strong','breakout','consolidation','watch','pending','excluded')}
+    counts={k:sum(m['list_name']==k for m in items.values()) for k in ('strong','breakout','consolidation','repair','watch','pending','excluded')}
     quote_times=sorted(str(r.get('quote_at') or r.get('ts')) for r in rows.values() if parse_at(r.get('quote_at') or r.get('ts')))
     model=dict(version=VERSION,implementation_hash=IMPLEMENTATION_HASH,day=day,daily_at=asof,source_at=quote_times[len(quote_times)//2] if quote_times else None,
-        captured_at=str(now),mode='收盘确认' if formal else '收盘待核验' if snap.get('session')=='已收盘' and now.hour>=15 else '盘中观察',close_finalized=formal,rules=copy.deepcopy(R),items=items,order=order,
+        captured_at=str(now),mode='收盘确认' if formal else '收盘待核验' if snap.get('session')=='已收盘' and now.hour>=15 else '盘中观察',close_finalized=formal,rules=dict(copy.deepcopy(R),quality=copy.deepcopy(QUALITY)),items=items,order=order,
         counts=counts,pool_count=len(rows),coverage=dict(daily=len(clean),market=round(coverage,4),amount_complete=sum(m['evidence'].get('amount_days')==20 for m in items.values()),fund_latest=sum(m['fund']['available'] for m in items.values()),fund20=sum(m['fund']['days']==20 for m in items.values())),
         _state=dict(version=VERSION,day=day,daily_at=asof,items=state))
     model['result_version']=hashlib.sha256(json.dumps(model,ensure_ascii=False,sort_keys=True).encode()).hexdigest()[:24]
@@ -621,6 +655,9 @@ def refresh_projection(snap=None,now=None,bootstrap=False,shared=False):
             model['refresh_policy'] = 'shared-round-5m-v1'
         import stock_selection_intraday
         stock_selection_intraday.attach(model,source,calendar)
+        import stock_selection_turning
+        stock_selection_turning.attach(model,source,histories,calendar,previous,frames,now=datetime.now())
+        stock_selection_turning.persist_events(model)
         model['result_version']=hashlib.sha256(json.dumps({k:v for k,v in model.items() if k!='result_version'},ensure_ascii=False,sort_keys=True).encode()).hexdigest()[:24]
         model=rollout.project(model,source,histories,calendar,records,frames,now,production_previous)
         model['catalog_revision'] = catalog_revision(source)

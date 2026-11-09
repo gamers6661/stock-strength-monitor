@@ -139,4 +139,62 @@ class BrokenWatch(unittest.TestCase):
         self.invoke(f);b=f[1][f[0]]['break_watch']
         self.assertTrue(b['pending']);self.assertEqual(b['date'],'2026-10-15');self.assertEqual(b['height'],3)
 
+    def test_intraday_twenty_percent_touch_waits_for_formal_close(self):
+        f=self.fixture();c=f[0];m=f[1][c];m['price']=7.2;f[3][c]['price']=7.2
+        result=self.invoke(f)
+        self.assertEqual(result['broken'],[c])
+        self.assertTrue(m['break_watch']['exit_pending'])
+        self.assertFalse(m['break_watch']['exited'])
+        m['mode']='正式收盘';m['roles']=[];m['eligible']=False
+        result=self.invoke(f);b=m['break_watch']
+        self.assertEqual(result['broken'],[]);self.assertEqual(result['broken_exited'],[c])
+        self.assertEqual(b['exit_at'],f[6]);self.assertEqual(b['exit_return_pct'],-20.)
+        self.assertNotIn('高标断板观察',m['roles'])
+
+    def test_exit_compares_exact_prices_before_rounding_display_return(self):
+        f=self.fixture();c=f[0];m=f[1][c];m.update(mode='正式收盘',price=987.65)
+        f[4]['raw'][c]['bars'][-1]['close']=1234.56
+        self.assertEqual(self.invoke(f)['broken'],[c])
+        self.assertEqual(m['break_watch']['since_break_pct'],-20.)
+        self.assertFalse(m['break_watch']['exited'])
+        m['price']=987.64
+        self.assertEqual(self.invoke(f)['broken_exited'],[c])
+
+    def test_confirmed_historical_exit_survives_rebound_or_missing_quote(self):
+        for valid in (True,False):
+            f=list(self.fixture());c=f[0];m=f[1][c]
+            f[2][c].append(dict(date='2026-10-15',sealed=False,height=0,exact=True,halted=False))
+            f[4]['raw'][c]['bars'].append(dict(date='2026-10-15',close=7.2))
+            f[5].append('2026-10-15');f[6]='2026-10-16';f[7]=f[7].replace(day=16)
+            m.update(price=9.5,valid=valid)
+            result=self.invoke(f);b=m['break_watch']
+            self.assertEqual(result['broken'],[]);self.assertEqual(result['broken_pending'],[])
+            self.assertEqual(result['broken_exited'],[c]);self.assertEqual(b['exit_at'],'2026-10-15')
+
+    def test_unknown_halted_and_corporate_action_prices_cannot_confirm_exit(self):
+        for variant in ('unknown','halted','corporate'):
+            f=list(self.fixture());c=f[0];m=f[1][c]
+            p=dict(date='2026-10-15',sealed=False,height=0,exact=True,halted=False)
+            if variant=='unknown':p['sealed']=None
+            if variant=='halted':p['halted']=True
+            f[2][c].append(p)
+            f[4]['raw'][c]['bars'].append(dict(date='2026-10-15',close=7.2,corporate_action=variant=='corporate'))
+            f[5].append('2026-10-15');f[6]='2026-10-16';f[7]=f[7].replace(day=16)
+            self.assertEqual(self.invoke(f)['broken_exited'],[])
+
+    def test_new_three_board_event_has_its_own_loss_baseline(self):
+        event=dict(date='2026-10-15',pending=False)
+        path=[dict(date='2026-10-14',sealed=False),dict(date='2026-10-15',sealed=False),
+              dict(date='2026-10-16',sealed=False)]
+        bars={'2026-10-14':dict(close=7.2),'2026-10-15':dict(close=10.),'2026-10-16':dict(close=9.)}
+        m=dict(valid=True,mode='盘中暂态',price=9.)
+        self.assertFalse(W.break_exit(event,path,bars,m,'2026-10-19',10.)['exited'])
+
+    def test_break_order_is_height_then_market_position_then_recent_date(self):
+        def row(code,height,highest,date):
+            return dict(code=code,break_watch=dict(height=height,was_market_highest=highest,date=date))
+        rows=[row('1',4,True,'2026-10-28'),row('2',5,False,'2026-10-13'),
+              row('3',5,True,'2026-10-12'),row('4',5,True,'2026-10-20')]
+        self.assertEqual([r['code'] for r in sorted(rows,key=W.break_key)],['4','3','2','1'])
+
 if __name__=='__main__':unittest.main()

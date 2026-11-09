@@ -308,8 +308,12 @@ def validate(snap):
         if '首板启动' in m['roles']:assert m['height_exact'] and m['height']==1
         if m['continuation']:assert m['valid'] and m['height_exact'] and all(n['first_board_date']==n['date'] for n in m['continuation'])
     assert meta['lists']['sealed']==sorted(meta['lists']['sealed'],key=lambda c:W.cap_key(rows[c]))
+    assert meta['lists']['broken']==sorted(meta['lists']['broken'],key=lambda c:W.break_key(rows[c]))
     for c in meta['lists']['broken']:
-        b=rows[c]['break_watch'];assert rows[c]['valid'] and b['height']>=P['broken_min_height']
+        b=rows[c]['break_watch'];assert rows[c]['valid'] and b['height']>=P['broken_min_height'] and not b['exited']
+    exited=meta['pools']['broken_exited']
+    assert not set(exited)&set(meta['lists']['broken'])
+    assert all(rows[c]['break_watch']['exited'] and rows[c]['break_watch']['exit_at'] for c in exited)
     for cohort in meta['promotion']:
         assert len(cohort['success_codes'])==cohort['sealed']
         assert all(rows[c]['prior_exact'] and rows[c]['prior_height']==cohort['height'] and rows[c]['sealed'] and rows[c]['valid'] for c in cohort['success_codes'])

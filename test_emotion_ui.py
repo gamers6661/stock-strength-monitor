@@ -65,5 +65,13 @@ class EmotionUI(unittest.TestCase):
         r=render(self.s,"document.getElementById('tags').innerHTML=msRankStyleTags(DATA.stocks[0],DATA.emotion_relay.rankings.all.items[DATA.stocks[0].code],'全池',false);")
         body=r['els']['tags']['innerHTML'];self.assertIn('>趋势观察<',body);self.assertNotIn('>接力观察<',body)
 
+    def test_break_pool_explains_close_confirmed_exit_and_requested_order(self):
+        meta=self.s['emotion_relay'];meta['pools']['broken_exited']=['600001','600002']
+        r=render(self.s,"renderEmotion();");body=r['els']['emotion-host']['innerHTML']
+        self.assertIn('原连板高度降序 → 断板前市场最高标优先 → 断板日期由近到远',body)
+        self.assertIn('盘中跌幅达20%提示待收盘',body)
+        self.assertIn('已退出 2只',body)
+        self.assertNotIn('第6天',body)
+
 
 if __name__=='__main__':unittest.main()

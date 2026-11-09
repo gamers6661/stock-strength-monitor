@@ -45,6 +45,9 @@ check(ctx.ssChartBars({...current,chart_at:'2026-10-21 11:30:00'},selection).len
 check(ctx.ssChartBars({...current,chart_history:[{...b,high:1}]},selection).length===0,'invalid OHLC rejected');
 
 check(ctx.ssChartBars({chart_source:'completed_daily_history',chart_history:[b]},{daily_at:'2026-10-21',quote:{at:'2026-10-22'}}).length===0,'unverified live candle rejected');
+for(const source of ['completed_daily_history','formal_daily']){
+ check(ctx.ssChartBars({chart_source:source,chart_at:'2026-10-22',chart_history:[b]},selection).at(-1)===b,'verified display day independent of scoring day: '+source);
+}
 result.checks=checks;
 if(process.argv[3])fs.writeFileSync(process.argv[3],JSON.stringify(result,null,2));
 console.log(JSON.stringify(result));

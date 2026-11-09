@@ -9,10 +9,10 @@
   var card=document.createElement('section');card.className='card';card.id='ms-board-chart';
   card.innerHTML='<div class="ms-card-head"><h3>60日指数K线</h3><span class="cd">'+esc(data.code||'')+'</span></div>'
    +(hasOHLC?'<canvas id="k-cv" class="chart detail-chart" style="height:310px"></canvas>':'<p class="ms-muted">'+esc(data.reason||'暂无可用指数K线')+'</p>')
-   +'<p class="ms-muted">'+esc(data.source||'同花顺指数')+(data.asof?' · 完成日线截至 '+esc(data.asof):'')
+   +'<p class="ms-muted">'+esc(data.current_source||data.source||'同花顺指数')+(data.asof?' · K线截至 '+esc(data.asof)+(bars.length&&bars[bars.length-1].partial?' · 当日未收盘 · 行情 '+esc(bars[bars.length-1].source_at):' · 已完成日线'):'')
    +(hasOHLC?' · MA5 / MA10 / MA20 · 成交量':'')+'</p>'
    +(hasOHLC&&data.reason?'<p class="ms-muted">'+esc(data.reason)+'</p>':'')
-   +(hasOHLC&&data.current_price?'<p class="ms-muted">虚线为指数报价 · '+esc(data.current_at)+'；未补成日K。</p>':'');
+   +(hasOHLC&&data.current_price?'<p class="ms-muted">虚线为指数报价 · '+esc(data.current_at)+'。</p>':'');
   var host=document.getElementById('dr-b');
   if(!host)return;
   host.insertBefore(card,host.firstChild);
@@ -25,7 +25,7 @@
    card.insertBefore(tools,cv);
    msDrawCandles(cv,bars,data.current_price,60);
    var latest=bars[bars.length-1],readout=card.querySelector('#k-readout');
-   if(readout)readout.textContent='最新日K '+latest.date+' · 开 '+fmt(latest.open,2)+' 高 '+fmt(latest.high,2)+' 低 '+fmt(latest.low,2)+' 收 '+fmt(latest.close,2)+' · 成交量 '+volumeWan(latest.volume);
+   if(readout)readout.textContent='最新日K '+latest.date+(latest.partial?'（未收盘）':'')+' · 开 '+fmt(latest.open,2)+' 高 '+fmt(latest.high,2)+' 低 '+fmt(latest.low,2)+' 收 '+fmt(latest.close,2)+' · 成交量 '+volumeWan(latest.volume);
   }
  };
 })();

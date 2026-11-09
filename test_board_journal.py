@@ -120,16 +120,67 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(rows[0]['id'],'event')
         self.assertEqual(rows[0]['catalyst']['kind'],'capacity')
 
-    def test_strong_gate_requires_existing_flags_same_day_and_excludes_broad(self):
-        board=dict(name='比亚迪概念',type='theme',market_strength=dict(trend_strong=True,trend_at='2026-10-22 10:00'))
-        self.assertFalse(J.strong_evidence(board,'2026-10-22',True,False)['eligible'])
-        board['name']='测试题材'
-        self.assertTrue(J.strong_evidence(board,'2026-10-22',True,False)['eligible'])
-        self.assertFalse(J.strong_evidence(board,'2026-10-23',True,False)['eligible'])
-        self.assertFalse(J.strong_evidence(board,'2026-10-22',False,False)['eligible'])
-        self.assertFalse(J.strong_evidence(board,'2026-10-22',True,True)['eligible'])
-        board['market_strength']={}
-        self.assertFalse(J.strong_evidence(board,'2026-10-22',True,False)['eligible'])
+    def test_trend_gate_uses_index_and_ignores_emotion_scores(self):
+        board=dict(name='测试题材',type='theme',
+                   market_strength=dict(trend_score=20,emotion_score=99,emotion_strong=True))
+        self.assertFalse(J.strong_evidence(board,'2026-10-28',True,False)['eligible'])
+        board['index_current']=dict(ready=True,asof='2026-10-28',mode='current',state='强势推进',
+            trend_online=True,priority_observation=True,strong_advance=True,episode_start='2026-10-23')
+        result=J.strong_evidence(board,'2026-10-28',True,False)
+        self.assertTrue(result['eligible']);self.assertEqual(result['episode_start'],'2026-10-23')
+        self.assertNotIn('emotion',result)
+        board['name']='比亚迪概念'
+        self.assertFalse(J.strong_evidence(board,'2026-10-28',True,False)['eligible'])
+
+    def test_pullback_stays_tracked_but_current_weakness_cannot_use_prior_strong(self):
+        b=dict(name='测试题材',type='theme',index_trend=dict(ready=True,asof='2026-10-27',
+            expected_asof='2026-10-27',state='趋势回踩',trend_online=True,priority_observation=True,
+            episode_start='2026-10-23'))
+        r=J.strong_evidence(b,'2026-10-28',False,False,'2026-10-27')
+        self.assertTrue(r['eligible']);self.assertFalse(r['live'])
+        b['index_current']=dict(ready=True,asof='2026-10-28',mode='current',state='趋势转弱',
+            trend_online=False,priority_observation=False,risk_reason='收盘支撑失效')
+        self.assertFalse(J.strong_evidence(b,'2026-10-28',True,False,'2026-10-27')['eligible'])
+        b.pop('index_current')
+        self.assertFalse(J.strong_evidence(b,'2026-10-28',True,False,'2026-10-28')['eligible'])
+        self.assertFalse(J.strong_evidence(b,'2026-10-28',True,True,'2026-10-27')['eligible'])
+
+    def test_cycle_cells_retain_index_stage_after_close(self):
+        snap=self.snap(at='15:10:00')
+        snap.update(session='已收盘',close_daily_verified_at='2026-10-22 15:10:00')
+        snap['board_catalog'][0]['index_trend']=dict(ready=True,asof='2026-10-22',
+            expected_asof='2026-10-22',state='趋势回踩',trend_online=True,priority_observation=True,episode_start='2026-10-20')
+        snap['board_trend_model']={'calendar':['2026-10-20','2026-10-21','2026-10-22']}
+        model=J.build(snap,persist=False,fetch_news=False)
+        cell=model['matrix']['2026-10-22']['boards']['theme:测试题材']
+        self.assertEqual(cell['strength']['basis'],'index-trend')
+        self.assertEqual(cell['strength']['label'],'趋势回踩')
+
+    def test_strong_selection_requires_persistence_relative_strength_and_support(self):
+        def candidate(name, **changes):
+            st=dict(tracked=True,eligible=True,asof='2026-10-28',label='强势推进',priority=0,
+                at='2026-10-28 11:30:00',ret5=4.,close=105.,ma10=102.,ma10_previous=101.,
+                completed_trend=True,completed_asof='2026-10-27',completed_episode_start='2026-10-23')
+            st.update(changes)
+            return dict(name=name,type='theme',status='强势推进',lane='priority',priority=0,strength=st,reasons=[],timeline=[])
+        boards={'good':candidate('持续趋势'),
+                'burst':candidate('盘中单日拉升',completed_trend=False,completed_episode_start=None,ret5=20),
+                'broken':candidate('支撑失守',close=100),
+                'slope':candidate('MA10下行',ma10_previous=103),
+                'weak':candidate('5日走弱',ret5=-1)}
+        for n in range(10):boards['peer'+str(n)]=candidate('同行'+str(n),ret5=-5+n*.2,tracked=False)
+        J.refine_strengths(boards,['2026-10-23','2026-10-26','2026-10-27','2026-10-28'])
+        self.assertTrue(boards['good']['strength']['eligible'])
+        self.assertEqual(boards['good']['strength']['completed_days'],3)
+        for key in ['burst','broken','slope','weak']:
+            self.assertFalse(boards[key]['strength']['eligible'])
+            self.assertTrue(boards[key]['strength']['tracked'])
+        self.assertEqual(boards['burst']['status'],'启动观察')
+
+    def test_future_index_cannot_enter_current_list(self):
+        b=dict(name='测试题材',type='theme',index_current=dict(ready=True,mode='current',
+            asof='2026-10-29',trend_online=True,priority_observation=True))
+        self.assertFalse(J.strong_evidence(b,'2026-10-28',True,False)['eligible'])
 
     def test_roles_disjoint_with_evidence_and_no_center_without_cap(self):
         snap=self.snap()

@@ -20,6 +20,46 @@ class BoardChartTests(unittest.TestCase):
                      dict(date='2026-10-13', open=100, high=103, low=99, close=102, volume=12000,
                           observed_at='2026-10-13T15:10:00')]
 
+    def live_entry(self, at='2026-10-13 11:30:00', observed='2026-10-13 12:10:00'):
+        return dict(code='881001',name='示例',bar=dict(self.bars[-1],source_at=at,observed_at=observed))
+
+    def test_real_intraday_ohlc_is_the_latest_unfinished_candle(self):
+        captured=datetime(2026,10,13,11,30)
+        self.board['index_quote']['quote_at']='2026-10-13 11:30:00'
+        live=self.live_entry()
+        p=board_chart.project(self.board,self.bars,captured,live=live)
+        self.assertEqual(p['asof'],'2026-10-13')
+        self.assertEqual(p['completed_asof'],'2026-10-12')
+        self.assertTrue(p['bars'][-1]['partial'])
+        self.assertEqual(p['bars'][-1]['high'],103)
+        self.assertEqual(p['current_at'],'2026-10-13 11:30:00')
+
+    def test_final_ohlc_requires_closing_quote_alignment(self):
+        p=board_chart.project(self.board,self.bars,self.clock,live=self.live_entry('2026-10-13 15:00:00','2026-10-13 16:10:00'))
+        self.assertFalse(p['bars'][-1]['partial'])
+        self.assertEqual(p['completed_asof'],'2026-10-13')
+
+    def test_live_quote_time_uses_trading_time_and_cache_does_not_go_backwards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'live.json'
+            now=datetime(2026,10,13,12,10)
+            def fetcher(code,day):
+                return '示例',dict(self.bars[-1],source_clock='1209',observed_at=str(now))
+            with patch.object(board_chart,'fetch_today',side_effect=fetcher):
+                data,meta=board_chart.live_candles([self.board],now,True,path,fetcher=fetcher,now=now)
+            self.assertEqual(data['881001']['bar']['source_at'],'2026-10-13 11:30:00')
+            self.assertEqual(meta['attempted'],1)
+            cached,meta=board_chart.live_candles([self.board],now,False,path,now=now)
+            self.assertEqual(cached,data);self.assertEqual(meta['attempted'],0)
+            bad=lambda code,day:('示例',dict(self.bars[-1],source_clock='1310',observed_at=str(now)))
+            _,meta=board_chart.live_candles([self.board],now,True,Path(folder)/'future.json',fetcher=bad,now=now)
+            self.assertEqual(meta['failed'],1);self.assertEqual(meta['available'],0)
+
+    def test_idle_clocks_do_not_create_after_close_trading_times(self):
+        for clock,expected in [(datetime(2026,10,13,12,50),'11:30'),(datetime(2026,10,13,16,15),'15:00')]:
+            self.assertEqual(board_chart.market_time(clock).strftime('%H:%M'),expected)
+        self.assertIsNone(board_chart.market_time(datetime(2026,10,13,9,20)))
+
     def test_completed_daily_matches_official_close(self):
         p = board_chart.project(self.board, self.bars, self.clock)
         self.assertEqual(p['asof'], '2026-10-13')

@@ -1,6 +1,7 @@
 """Current cap quality and dated >=3-board break feedback; no MA decisions."""
 import math
 from datetime import datetime
+from decimal import Decimal
 import config,intraday,relay_data as D
 
 P=config.EMOTION_RELAY
@@ -96,6 +97,33 @@ def break_event(path):
         else:active=None;event=None
     return event
 
+def break_key(m):
+    b=m['break_watch']
+    return (-b['height'],not b['was_market_highest'],-int(b['date'].replace('-','')),m['code'])
+
+def break_exit(event,path,bars,m,day,base):
+    """Replay the first verified closing loss; a rebound cannot reopen this event."""
+    out=dict(exited=False,exit_pending=False,exit_at=None,exit_price=None,exit_return_pct=None,
+             exit_threshold_pct=-P['broken_exit_loss_pct'])
+    if event.get('pending') or not num(base) or base<=0:return out
+    def hit(price):
+        return (num(price) and price>0 and
+                D.tick(price)*100<=D.tick(base)*(Decimal(100)-Decimal(str(P['broken_exit_loss_pct']))))
+    for p in path:
+        d=p['date']
+        if d<=event['date'] or p.get('halted'):continue
+        bar=bars.get(d) or {}
+        # A marked corporate action invalidates raw-price comparison from here.
+        if bar.get('corporate_action'):return out
+        if p.get('sealed') is None:continue
+        price=m.get('price') if d==day and m['valid'] and m['mode']=='正式收盘' else bar.get('close')
+        if hit(price):
+            out.update(exited=True,exit_at=d,exit_price=price,
+                       exit_return_pct=round(100*(price/base-1),2))
+            return out
+    out['exit_pending']=bool(m['valid'] and m['mode']!='正式收盘' and event['date']<day and hit(m.get('price')))
+    return out
+
 def attach(rows,models,paths,quotes,evidence,dates,day,now,fetch=True):
     formal=any(m['valid'] and m['mode']=='正式收盘' for m in models.values())
     pool=evidence.get('current_pool')
@@ -109,7 +137,7 @@ def attach(rows,models,paths,quotes,evidence,dates,day,now,fetch=True):
         completed[c]=path+extra
     lookup={c:{p['date']:p for p in path} for c,path in completed.items()}
     raw=evidence.get('_raw_index') or {c:{b['date']:b for b in r.get('bars',[])} for c,r in evidence.get('raw',{}).items()}
-    broken=[];pending=[];sealed=[]
+    broken=[];pending=[];sealed=[];exited=[]
     for c,m in models.items():
         if m['valid'] and m['sealed']:
             m['cap_strength']=strength(m,quotes[c],pool,day,now);sealed.append(c)
@@ -149,22 +177,26 @@ def attach(rows,models,paths,quotes,evidence,dates,day,now,fetch=True):
                 and num(repair) and repair>=P['broken_repair_pct'] and loc is not None and loc>=P['broken_close_position']):labels.append('弱后转强观察')
             elif num(change) and change>0:labels.append('反弹观察' if event['date']<day else '上涨未封观察')
             if not labels:labels.append('分歧延续观察')
-        state=dict(**event,pending=provisional,valid=valid,source_at=m['quote_at'],
+        exit_state=break_exit(dict(event,pending=provisional),completed[c],raw.get(c,{}),m,day,close)
+        if exit_state['exited']:labels.append('累计跌幅达20%·已退出')
+        elif exit_state['exit_pending']:labels.append('累计跌幅触线·待收盘')
+        state=dict(**event,**exit_state,pending=provisional,valid=valid,source_at=m['quote_at'],
             was_market_highest=bool(maximum and event['height']==maximum),market_highest_before=maximum,
             break_low=bottom,break_high=top,break_close=close,break_return_pct=break_return,
             sessions_since=position[day]-position[event['date']],since_break_pct=since,from_last_seal_pct=from_last,
             limit_down=limit_down,labels=labels or ['最新反馈待更新'],
-            basis='最近20个交易日内最后一轮≥3板的实际断板；再封1/2板保留反馈，新一轮正式达到3板后结束旧观察。停牌和未知不算断板。')
+            basis='最近20个交易日内最后一轮≥3板的实际断板；累计按断板日收盘价计算，盘中跌幅达20%待收盘，首次核验收盘累计跌幅达20%后结束本次观察，反弹不恢复。再封1/2板保留反馈，新一轮正式达到3板后结束旧观察。停牌和未知不算断板。')
         m['break_watch']=state
-        if valid:m['eligible']=True;m['roles'].append('高标断板观察');broken.append(c)
+        if state['exited']:exited.append(c)
+        elif valid:m['eligible']=True;m['roles'].append('高标断板观察');broken.append(c)
         else:pending.append(c)
     sealed.sort(key=lambda c:cap_key(models[c]));groups={}
     for c in sealed:
         m=models[c];key=str(m['height']) if m['height_exact'] else 'unknown';groups.setdefault(key,[]).append(c)
         m['cap_strength']['height_rank']=len(groups[key]) if m['cap_strength']['verified'] and m['height_exact'] else None
-    broken.sort(key=lambda c:(not models[c]['break_watch']['was_market_highest'],-models[c]['break_watch']['height'],
-        -position[models[c]['break_watch']['date']],-(models[c]['feedback_pct'] or 0),c))
-    return dict(sealed=sealed,broken=broken,broken_pending=pending,groups=groups,
+    broken.sort(key=lambda c:break_key(models[c]))
+    exited.sort(key=lambda c:break_key(models[c]))
+    return dict(sealed=sealed,broken=broken,broken_pending=pending,broken_exited=exited,groups=groups,
         strength_coverage=sum(models[c]['cap_strength']['verified'] for c in sealed),strength_expected=len(sealed),
         source_at=pool.get('fetched_at'),fetch_error=pool.get('fetch_error'),
         strength_basis='同板位：炸板次数升序 → 封板资金/当日成交额降序 → 最后封板时间、首次封板时间升序；明细不全单列，非成功概率。')

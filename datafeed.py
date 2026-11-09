@@ -713,6 +713,11 @@ def build_pool(force=False):
 _KLINE_HOST_IDX = 0
 _KLINE_HOST_LOCK = threading.Lock()
 _KLINE_HOST_COOLDOWN = {}
+_KLINE_HOST_FAILURES = {}
+
+
+class KlineHostCooling(RuntimeError):
+    """No K-line host is currently eligible, so this code made no request."""
 
 
 def _parse_stock_kline(value, symbol, code):
@@ -767,7 +772,7 @@ def fetch_kline(code, days=None, deadline_at=None):
         order = sorted((i for i in range(len(hosts)) if _KLINE_HOST_COOLDOWN.get(hosts[i],0)<=time.monotonic()),
                        key=lambda i:i!=_KLINE_HOST_IDX)
     if not order:
-        raise RuntimeError('K线主机冷却中，下一轮重试')
+        raise KlineHostCooling('K线主机冷却中，未发起请求')
     last_err = None;empty_count = 0
     empty_limit = 1+config.KLINE.get('empty_retries',1)
     for i in order:
@@ -783,13 +788,20 @@ def fetch_kline(code, days=None, deadline_at=None):
                     with _KLINE_HOST_LOCK:
                         changed = i != _KLINE_HOST_IDX
                         _KLINE_HOST_IDX = i
+                        _KLINE_HOST_FAILURES.pop(hosts[i], None)
+                        _KLINE_HOST_COOLDOWN.pop(hosts[i], None)
                     if changed:print(f"[KLINE] 主机故障转移 -> {url.split('/')[2]}（{last_err}）")
                     return out
                 empty_count += 1
             return []
         except Exception as exc:
             last_err = exc
-            with _KLINE_HOST_LOCK:_KLINE_HOST_COOLDOWN[hosts[i]] = time.monotonic()+60
+            with _KLINE_HOST_LOCK:
+                # One failed symbol/request must not disable this host for the entire pool.
+                failures = _KLINE_HOST_FAILURES.get(hosts[i], 0) + 1
+                _KLINE_HOST_FAILURES[hosts[i]] = failures
+                if failures >= 3:
+                    _KLINE_HOST_COOLDOWN[hosts[i]] = time.monotonic()+60
     raise last_err if last_err else RuntimeError('所有K线主机均不可用或采集预算到期')
 
 
@@ -820,9 +832,13 @@ def fetch_klines_bulk(codes, workers=None, progress=True, days=None, deadline_se
     def work(c):
         try:
             rows = fetch_kline(c, days=days, deadline_at=deadline_at)
-            return c, rows, 'ok' if rows else 'empty_after_retry'
-        except Exception:
-            return c, [], 'request_error'
+            return c, rows, {'kind': 'ok' if rows else 'empty_after_retry'}
+        except KlineHostCooling as exc:
+            return c, [], {'kind': 'source_cooldown', 'error_type': type(exc).__name__,
+                           'error_message': str(exc)[:160]}
+        except Exception as exc:
+            return c, [], {'kind': 'request_error', 'error_type': type(exc).__name__,
+                           'error_message': str(exc)[:160]}
 
     truncated = False
     ex = ThreadPoolExecutor(max_workers=workers)
@@ -830,8 +846,8 @@ def fetch_klines_bulk(codes, workers=None, progress=True, days=None, deadline_se
         futs = [ex.submit(work, c) for c in codes]
         try:
             for f in as_completed(futs, timeout=deadline):
-                c, k, kind = f.result()
-                result.fetch_states[c] = dict(kind=kind)
+                c, k, state = f.result()
+                result.fetch_states[c] = state
                 if k:
                     result[c] = k
                 done[0] += 1

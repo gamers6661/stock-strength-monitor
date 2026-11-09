@@ -1,0 +1,11 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const host={innerHTML:'',textContent:'',style:{},querySelector:()=>null};
+const model={items:{'001309':{observation_only:true,startup_order:[17,15,.75],quote:{change_pct:-.4},intraday:{state:'分歧'}}},order:['001309']};
+const ctx={DATA:{stocks:[{code:'001309',name:'德明利'}],coverage_catalog:[],ma_trend:{lists:{5:[],10:[],20:[]},current:[],repair:[],pending:[],boards:[],sorting:{},mode:'测试',version:'test'}},MS_VIEW:{radar:{scope:'all',phase:'',q:'',limit:100}},document:{activeElement:null,getElementById:()=>host,querySelector:()=>host},renderOverview(){},showStock(){},msDetail(){return '';},esc:String,jsq:String,fmt:String,pctHtml:String,msStamp:()=>'',ssModel:()=>model,ssFreshLive:()=>true,msMatchDirections:()=>true,ssState:x=>x.intraday.state,ssN:String,ssPct:String,msDirectionPicker:()=>'',msSelect:()=>'',msTipAttrs:()=>''};
+vm.createContext(ctx);vm.runInContext(fs.readFileSync('ma_trend_ui.js','utf8'),ctx);
+ctx.renderOverview();assert(host.innerHTML.includes('均线趋势三阶段'));assert(!host.innerHTML.includes('data-repair-observation'));
+ctx.MS_VIEW.radar.scope='short_repair';ctx.MS_VIEW.radar.phase='5';ctx.mtRender();
+assert.equal(ctx.MS_VIEW.radar.phase,'');assert(host.innerHTML.includes('德明利'));assert(host.innerHTML.includes('分歧'));assert(!host.innerHTML.includes('data-ma-section'));
+ctx.MS_VIEW.radar.q='不存在';ctx.mtRender();assert(!host.innerHTML.includes('data-repair-code='));
+ctx.MS_VIEW.radar.q='';ctx.ssFreshLive=()=>false;ctx.mtRender();assert(!host.innerHTML.includes('data-repair-code='));
+console.log('overview, radar scope, stage reset, search and stale quote checks passed');

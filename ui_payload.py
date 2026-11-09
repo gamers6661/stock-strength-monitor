@@ -104,7 +104,7 @@ def unpack(packet):
 
 def selection_summary(model):
     fields = ('code', 'name', 'score', 'rank', 'dimensions', 'eligible', 'list_name',
-              'pattern', 'daily_at', 'quote_at', 'quote', 'data_status', 'pattern_order')
+              'pattern', 'daily_at', 'quote_at', 'quote', 'data_status', 'pattern_order', 'observation_only', 'startup_order')
     result = {k: v for k, v in model.items() if k not in ('items', 'universe_exclusions')}
     result['details_deferred'] = True
     result['items'] = {}
@@ -113,6 +113,10 @@ def selection_summary(model):
         row['board'] = {k: item.get('board', {}).get(k) for k in ('label', 'industry')}
         row['fund'] = {k: item.get('fund', {}).get(k) for k in ('available', 'main_net', 'asof')}
         row['intraday'] = {k: item.get('intraday', {}).get(k) for k in ('state', 'available', 'at', 'return_pct')}
+        row['startup_observation'] = item.get('startup_observation', False)
+        turning = item.get('turning') or {}
+        row['turning'] = {k: turning.get(k) for k in ('available','active','stage','first_seen_at','since_first_pct','distance_atr')}
+        row['turning']['metrics'] = {k: (turning.get('metrics') or {}).get(k) for k in ('excess3','improvement3')}
         result['items'][code] = row
     return result
 

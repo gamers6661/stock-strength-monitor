@@ -32,7 +32,8 @@ def _attach_klines(snap, top_n, conn):
     import datafeed as df
     n_ok = 0
     scored = (snap.get("stocks") or [])[:top_n]
-    visible = scored + (snap.get("coverage_catalog") or [])
+    # top_n limits compact sparkline arrays only; every clickable stock needs current OHLC.
+    visible = (snap.get("stocks") or []) + (snap.get("coverage_catalog") or [])
     chart_codes = {s["code"] for s in scored}
     chart_codes.update(s["code"] for s in snap.get("coverage_catalog") or []
                        if s.get("trend_online"))

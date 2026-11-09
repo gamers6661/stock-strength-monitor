@@ -13,7 +13,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parent
 EMOTION_RELAY = {
-    'version': 'mainboard-relay-2026-10-16.1',
+    'version': 'mainboard-relay-2026-10-29.1',
     'history_days': 20, 'warmup_days': 10, 'raw_history_days': 65, 'workers': 6,
     'request_seconds': 8, 'fetch_budget_seconds': 55,
     'min_peer_count': 5, 'min_peer_coverage_pct': 80.,
@@ -28,7 +28,7 @@ EMOTION_RELAY = {
     'relation_max_members': 300,
     'pool_cache_seconds': 60, 'pool_quote_gap_seconds': 120,
     'pool_reopen_warning': 3,
-    'broken_min_height': 3, 'broken_watch_days': 20,
+    'broken_min_height': 3, 'broken_watch_days': 20, 'broken_exit_loss_pct': 20.,
     'broken_repair_pct': 3., 'broken_close_position': .7,
 }
 MA_TREND = {
@@ -437,7 +437,7 @@ KLINE = {
     # 所以从 70 根提到 160 根（覆盖 120 分位窗口 + MA60 + 缓冲）。
     # 代价：库体积约翻倍，全量重拉一次约 3-5 分钟。
     "days": 160,
-    "workers": 10,       # 保持原并发，失败退避，不假定数据源不会限流。
+    "workers": 4,       # 小批实测后降低并发，失败退避，减少共享主机故障扩散。
     "increment_days": 20,
     "empty_retries": 1,  # 单股有效空响应立即再取一次，沿用同一个请求预算。
     "repair_per_scan": 50,
@@ -457,6 +457,8 @@ KLINE = {
     # 当时没有备用主机，结果 5092 只里只有前 2505 只抓成功，
     # 其余全部走重试白等，日志里只表现为"卡在 KLINE 不动"。
     "hosts": [
+        "https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get",
+        "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
         "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
         "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
         "https://proxy.finance.qq.com/appstock/app/fqkline/get",
